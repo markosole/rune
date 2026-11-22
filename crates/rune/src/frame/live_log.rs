@@ -124,6 +124,8 @@ pub(crate) struct Frame {
     /// `RUNE_LOOP_CHECK=1`: the instances that differ from what the loop-only step would have
     /// drawn, and the largest difference.
     pub(crate) loop_check: Option<(usize, f32)>,
+    /// Correlated native resize generations completed or superseded by this frame.
+    pub(crate) resize: Option<serde_json::Value>,
 }
 
 pub(crate) fn frame(f: Frame) {
@@ -154,6 +156,18 @@ pub(crate) fn frame(f: Frame) {
     let (missed, reconfigured) = MISSED.replace(([0; 4], 0));
     if missed != [0; 4] || reconfigured > 0 { line["missed"] = serde_json::json!({ "occluded": missed[0], "timeout": missed[1], "outdated": missed[2], "unconfigured": missed[3], "reconfigured": reconfigured }); }
     line["loop_check"] = serde_json::json!(f.loop_check.map(|(n, d)| [n as f64, if d.is_finite() { f64::from(d) } else { -1.0 }]));
+    if let Some(resize) = f.resize { line["resize"] = resize; }
+    OUT.with_borrow_mut(|out| {
+        if let Some(Some(w)) = out.as_mut() {
+            writeln!(w, "{line}").ok();
+            w.flush().ok();
+        }
+    });
+}
+
+/// A GPU resize whose synchronous sizing-loop draw returned without submitting a frame.
+pub(crate) fn resize_pending(resize: serde_json::Value) {
+    let line = serde_json::json!({ "t": now_ns(), "resize_pending": resize });
     OUT.with_borrow_mut(|out| {
         if let Some(Some(w)) = out.as_mut() {
             writeln!(w, "{line}").ok();

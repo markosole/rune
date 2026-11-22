@@ -326,6 +326,8 @@ impl Host {
                     app.rt_mut().cancel_timer_frame();
                     self.idle = true; return;
                 }
+                #[cfg(feature = "frame-profile")]
+                let resize_at = crate::frame::live_log::now();
                 let origin_moved = sync_screen_origin_core(app.rt_mut(), &l.window);
                 // A frame Rune moved itself has its drawable and viewport already.
                 let resized = l.resize_surface(gpu, size);
@@ -334,8 +336,46 @@ impl Host {
                     if restored || origin_moved { l.request_redraw(); }
                     return;
                 }
+                #[cfg(feature = "frame-profile")]
+                #[cfg(target_os = "windows")]
+                let resize_enabled = crate::frame::live_log::on()
+                    && gpu.is_some()
+                    && l.surface.is_some()
+                    && !l.native.mode.cpu_draws();
+                #[cfg(feature = "frame-profile")]
+                #[cfg(not(target_os = "windows"))]
+                let resize_enabled = false;
+                #[cfg(feature = "frame-profile")]
+                let resize_generation = self.resize_log.begin(
+                    resize_enabled,
+                    [size.width, size.height],
+                    scale,
+                    resize_at,
+                );
+                #[cfg(feature = "frame-profile")]
+                if l.surface_ok && gpu.is_some() && let Some(surface) = l.surface.as_ref() {
+                    self.resize_log.configured(
+                        resize_generation,
+                        super::resize_log::Drawable {
+                            size: [l.config.width, l.config.height],
+                            surface_generation: crate::window::surface::configure::generation(surface),
+                            reconfigured: resized,
+                        },
+                        crate::frame::live_log::now(),
+                    );
+                }
                 let asked = FrameMove::take_jump(&mut self.frame_move, viewport);
                 if asked { app.rt_mut().step_viewport(viewport, scale) } else { app.rt_mut().set_viewport(viewport, scale) }
+                #[cfg(feature = "frame-profile")]
+                {
+                    let actual = app.rt().window_viewport();
+                    self.resize_log.viewport(
+                        resize_generation,
+                        [actual.0, actual.1],
+                        app.rt().window_scale(),
+                        crate::frame::live_log::now(),
+                    );
+                }
                 // The user is dragging the edge. AppKit commits the new size when this returns,
                 // and a frame drawn later would leave the old one stretched to it until then.
                 #[cfg(target_os = "macos")]
@@ -351,6 +391,10 @@ impl Host {
                 #[cfg(target_os = "windows")]
                 if crate::platform::win32::in_size_move(&l.window) {
                     self.draw(true);
+                    #[cfg(feature = "frame-profile")]
+                    if let Some(pending) = self.resize_log.pending_current() {
+                        crate::frame::live_log::resize_pending(pending);
+                    }
                     self.shell(event_loop);
                     return;
                 }

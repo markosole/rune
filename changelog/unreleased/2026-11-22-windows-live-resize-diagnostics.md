@@ -1,0 +1,1 @@
+- Rune's opt-in frame log correlates each post-handover GPU window resize with its current drawable, viewport, root layout, render, present submission, and superseded generations, and records a pending generation when the synchronous Windows sizing-loop draw submits no frame.

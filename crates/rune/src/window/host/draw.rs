@@ -317,6 +317,8 @@ impl FrameHost for WindowFrame<'_> {
         }
         if self.host.gpu.is_none() { return Gate::Skip; }
         self.state.profile.mark_entry();
+        #[cfg(feature = "frame-profile")]
+        { self.state.profile.resize_generation = self.host.resize_log.current(); }
         let (Some(l), Some((_, renderer))) = (self.host.win.as_mut(), self.host.gpu.as_ref()) else { return Gate::Skip };
         // Only the window's loops asked for this frame (`LoopFrame`): a step of them may stand
         // for the whole of it (`Runtime::loop_step`), drawn only where they draw (`arm_loop`).
@@ -491,6 +493,15 @@ impl FrameHost for WindowFrame<'_> {
             let compositing = self.host.app.compositor_animating();
             self.host.app.clock_advance(&mut self.host.clock, frame_time, compositing)
         };
+        #[cfg(feature = "frame-profile")]
+        {
+            let root = super::resize_log::root_size(self.host.app.rt());
+            self.host.resize_log.root(
+                self.state.profile.resize_generation,
+                root,
+                crate::frame::live_log::now(),
+            );
+        }
         // `RUNE_LOOP_CHECK=1`: how the loop-only step this frame stood in for compares with it.
         self.state.profile.take_loop_check(self.host.app.rt_mut());
         StepInfo { runtime_animating: animating, animating, dt, update_ms: 0.0, presents_at: self.state.target }
@@ -576,7 +587,20 @@ impl FrameHost for WindowFrame<'_> {
     }
 
     fn render(&mut self, prepared: &mut PreparedWindowFrame, info: &StepInfo) -> bool {
-        render_window_frame(self.host, prepared, self.state.corners, &mut self.state.profile, info)
+        #[cfg(feature = "frame-profile")]
+        self.host.resize_log.render_started(
+            self.state.profile.resize_generation,
+            [prepared.size.0, prepared.size.1],
+            crate::frame::live_log::now(),
+        );
+        let animating = render_window_frame(self.host, prepared, self.state.corners, &mut self.state.profile, info);
+        #[cfg(feature = "frame-profile")]
+        self.host.resize_log.render_finished(
+            self.state.profile.resize_generation,
+            [prepared.size.0, prepared.size.1],
+            crate::frame::live_log::now(),
+        );
+        animating
     }
 
     fn submit_and_present(&mut self, prepared: PreparedWindowFrame, info: &StepInfo) -> Instant {

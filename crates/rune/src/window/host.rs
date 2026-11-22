@@ -27,12 +27,17 @@ pub(in crate::window) mod draw;
 pub(in crate::window) mod events;
 pub(in crate::window) mod lifecycle;
 mod render;
+#[cfg(any(test, feature = "frame-profile"))]
+mod resize_log;
 pub(in crate::window) mod shell_requests;
 pub(in crate::window) mod stepping;
 
 #[cfg(test)]
 #[path = "host/frame_move_tests.rs"]
 mod frame_move_tests;
+#[cfg(test)]
+#[path = "host/resize_log_tests.rs"]
+mod resize_log_tests;
 
 pub(in crate::window) use app::{CompositorFrame, WindowApp};
 use app::TypedWindowApp;
@@ -63,6 +68,8 @@ pub(in crate::window) struct Host {
     pub(in crate::window) on_window: Option<crate::app::OnWindow>,
     pub(in crate::window) on_ready: Option<crate::app::OnWindow>,
     pub(in crate::window) frame_reports: crate::frame::encoded::FrameReports,
+    #[cfg(feature = "frame-profile")]
+    resize_log: resize_log::Trace,
     /// Shown, hidden or closed for good; `win` holds the window while it has one.
     pub(in crate::window) life: Life,
     /// False for windows `App::window` added: they live as long as the loop, never keep it.
@@ -370,6 +377,8 @@ impl Host {
             on_window,
             on_ready,
             frame_reports,
+            #[cfg(feature = "frame-profile")]
+            resize_log: Default::default(),
             life: Life::Unopened,
             keeps_loop,
             geometry,

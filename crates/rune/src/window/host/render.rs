@@ -36,6 +36,8 @@ pub(super) struct FrameProfile {
     #[cfg(feature = "frame-profile")]
     pub(super) forced_miss_checked: bool,
     #[cfg(feature = "frame-profile")]
+    pub(super) resize_generation: Option<u64>,
+    #[cfg(feature = "frame-profile")]
     pub(super) entry: Option<crate::frame::live_log::Stamp>,
     #[cfg(feature = "frame-profile")]
     pub(super) start: Option<crate::frame::live_log::Stamp>,
@@ -143,6 +145,7 @@ impl FrameProfile {
     ) {
         self.frame = match (self.start, self.acquired, self.built, self.uploaded, self.encoded, self.submitted) {
             (Some(start), Some(acquired), Some(built), Some(uploaded), Some(encoded), Some(submitted)) => {
+                let resize = host.resize_log.drain_through(self.resize_generation).map(|batch| batch.json());
                 let rt = host.app.rt_mut();
                 Some(crate::frame::live_log::Frame {
                     entry: self.entry.unwrap_or(start),
@@ -170,6 +173,7 @@ impl FrameProfile {
                     looped: looped.map(Vec::len),
                     loop_why: self.loop_why,
                     loop_check: self.loop_check.take(),
+                    resize,
                 })
             }
             _ => None,
@@ -375,6 +379,19 @@ pub(super) fn submit_and_present_window(
     }
     #[cfg(not(target_os = "macos"))]
     gpu.queue.present(prepared.frame);
+    #[cfg(all(target_os = "windows", feature = "frame-profile"))]
+    {
+        let surface_generation = l.surface.as_ref().map_or(0, crate::window::surface::configure::generation);
+        host.resize_log.present_submitted(
+            profile.resize_generation,
+            super::resize_log::Drawable {
+                size: [prepared.size.0, prepared.size.1],
+                surface_generation,
+                reconfigured: false,
+            },
+            crate::frame::live_log::now(),
+        );
+    }
     #[cfg(target_os = "windows")]
     if let Some(surface) = l.surface.as_ref() {
         l.native.slot.presented_surface(surface);
