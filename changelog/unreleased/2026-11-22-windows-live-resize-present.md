@@ -1,0 +1,1 @@
+- Windows live resizing now waits for the newly submitted swap-chain frame to reach DWM before its native sizing turn continues, preventing the client from exposing an old-size or unpainted remainder.

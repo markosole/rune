@@ -14,6 +14,7 @@ pub(super) struct Timed<T> {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Client {
+    pub(super) event_size: [u32; 2],
     pub(super) size: [u32; 2],
     pub(super) scale: f32,
 }
@@ -35,6 +36,7 @@ pub(super) struct Record {
     pub(super) render_started: Option<Timed<[u32; 2]>>,
     pub(super) render_finished: Option<Timed<[u32; 2]>>,
     pub(super) present_submitted: Option<Timed<Drawable>>,
+    pub(super) present_completed: Option<Timed<Drawable>>,
     pub(super) superseded: Option<Timed<u64>>,
 }
 
@@ -50,6 +52,7 @@ impl Record {
             "generation": self.generation,
             "client": timed(self.client.at, serde_json::json!({
                 "physical": self.client.value.size,
+                "event_physical": self.client.value.event_size,
                 "scale": self.client.value.scale,
             })),
             "drawable": self.drawable.map(|v| timed(v.at, serde_json::json!({
@@ -65,6 +68,11 @@ impl Record {
             "render_started": self.render_started.map(|v| timed(v.at, serde_json::json!(v.value))),
             "render_finished": self.render_finished.map(|v| timed(v.at, serde_json::json!(v.value))),
             "present_submitted": self.present_submitted.map(|v| timed(v.at, serde_json::json!({
+                "physical": v.value.size,
+                "surface_generation": v.value.surface_generation,
+                "reconfigured": v.value.reconfigured,
+            }))),
+            "present_completed": self.present_completed.map(|v| timed(v.at, serde_json::json!({
                 "physical": v.value.size,
                 "surface_generation": v.value.surface_generation,
                 "reconfigured": v.value.reconfigured,
@@ -167,7 +175,8 @@ impl Trace {
     pub(super) fn begin(
         &mut self,
         enabled: bool,
-        size: [u32; 2],
+        event_size: [u32; 2],
+        client_size: [u32; 2],
         scale: f32,
         at: u64,
     ) -> Option<u64> {
@@ -185,7 +194,11 @@ impl Trace {
                         generation,
                         client: Timed {
                             at,
-                            value: Client { size, scale },
+                            value: Client {
+                                event_size,
+                                size: client_size,
+                                scale,
+                            },
                         },
                         drawable: None,
                         viewport: None,
@@ -193,6 +206,7 @@ impl Trace {
                         render_started: None,
                         render_finished: None,
                         present_submitted: None,
+                        present_completed: None,
                         superseded: None,
                     });
                     began = Some(generation);
@@ -253,6 +267,12 @@ impl Trace {
             record.present_submitted = Some(Timed { at, value });
         }
         let _ = step(&mut self.state, Event::PresentSubmitted(generation));
+    }
+
+    pub(super) fn present_completed(&mut self, generation: Option<u64>, value: Drawable, at: u64) {
+        if let Some(record) = generation.and_then(|generation| self.record_mut(generation)) {
+            record.present_completed = Some(Timed { at, value });
+        }
     }
 
     /// The latest generation when the synchronous resize draw returned without submitting it.

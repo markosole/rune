@@ -6,7 +6,12 @@ pub(in crate::window) mod covered_draw;
 pub(in crate::window) mod cpu_frame;
 pub(in crate::window) mod damage;
 pub(in crate::window) mod handover;
+pub(in crate::window) mod live_resize;
 pub(in crate::window) mod look;
 pub(in crate::window) mod post_frame;
 pub(crate) mod slot;
 pub(in crate::window) mod video_layer;
+
+#[cfg(test)]
+#[path = "win32/live_resize_tests.rs"]
+mod live_resize_tests;

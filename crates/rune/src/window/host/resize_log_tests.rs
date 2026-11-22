@@ -3,7 +3,7 @@ use super::resize_log::{Drawable, MAX_RECORDS, Trace};
 #[test]
 fn generations_supersede_unpresented_work_and_drain_in_order() {
     let mut trace = Trace::default();
-    let first = trace.begin(true, [1600, 900], 1.5, 10).unwrap();
+    let first = trace.begin(true, [1600, 900], [1600, 900], 1.5, 10).unwrap();
     trace.configured(
         Some(first),
         Drawable {
@@ -14,7 +14,7 @@ fn generations_supersede_unpresented_work_and_drain_in_order() {
         11,
     );
     trace.viewport(Some(first), [1066.667, 600.0], 1.5, 12);
-    let second = trace.begin(true, [960, 640], 1.5, 20).unwrap();
+    let second = trace.begin(true, [960, 640], [960, 640], 1.5, 20).unwrap();
     trace.configured(
         Some(second),
         Drawable {
@@ -37,6 +37,15 @@ fn generations_supersede_unpresented_work_and_drain_in_order() {
         },
         26,
     );
+    trace.present_completed(
+        Some(second),
+        Drawable {
+            size: [960, 640],
+            surface_generation: 8,
+            reconfigured: false,
+        },
+        27,
+    );
 
     assert_eq!(first, 1);
     assert_eq!(second, 2);
@@ -46,6 +55,7 @@ fn generations_supersede_unpresented_work_and_drain_in_order() {
     assert_eq!(batch.records.len(), 2);
     assert_eq!(batch.records[0].superseded.unwrap().value, second);
     assert_eq!(batch.records[1].present_submitted.unwrap().value.size, [960, 640]);
+    assert_eq!(batch.records[1].present_completed.unwrap().value.size, [960, 640]);
 }
 
 #[test]
@@ -54,7 +64,13 @@ fn resize_records_are_hard_bounded_and_report_drops() {
     let mut latest = 0;
     for i in 0..MAX_RECORDS + 5 {
         latest = trace
-            .begin(true, [800 + i as u32, 560], 1.0, i as u64)
+            .begin(
+                true,
+                [800 + i as u32, 560],
+                [800 + i as u32, 560],
+                1.0,
+                i as u64,
+            )
             .unwrap();
     }
     assert_eq!(trace.records().len(), MAX_RECORDS);
@@ -76,7 +92,7 @@ fn resize_records_are_hard_bounded_and_report_drops() {
 #[test]
 fn disabled_trace_keeps_no_generation_or_storage() {
     let mut trace = Trace::default();
-    assert_eq!(trace.begin(false, [800, 560], 1.0, 1), None);
+    assert_eq!(trace.begin(false, [800, 560], [800, 560], 1.0, 1), None);
     assert_eq!(trace.current(), None);
     assert!(trace.records().is_empty());
 }
@@ -84,8 +100,8 @@ fn disabled_trace_keeps_no_generation_or_storage() {
 #[test]
 fn unavailable_gpu_event_does_not_extend_an_enabled_trace() {
     let mut trace = Trace::default();
-    let generation = trace.begin(true, [1600, 900], 1.0, 1).unwrap();
-    assert_eq!(trace.begin(false, [1200, 800], 1.0, 2), None);
+    let generation = trace.begin(true, [1600, 900], [1600, 900], 1.0, 1).unwrap();
+    assert_eq!(trace.begin(false, [1200, 800], [1200, 800], 1.0, 2), None);
     assert_eq!(trace.current(), Some(generation));
     assert_eq!(trace.records().len(), 1);
     assert_eq!(trace.records()[0].client.value.size, [1600, 900]);
@@ -94,7 +110,7 @@ fn unavailable_gpu_event_does_not_extend_an_enabled_trace() {
 #[test]
 fn json_keeps_every_boundary_and_timestamp() {
     let mut trace = Trace::default();
-    let generation = trace.begin(true, [1200, 800], 2.0, 1).unwrap();
+    let generation = trace.begin(true, [1200, 800], [1198, 798], 2.0, 1).unwrap();
     trace.configured(
         Some(generation),
         Drawable {
@@ -117,21 +133,33 @@ fn json_keeps_every_boundary_and_timestamp() {
         },
         7,
     );
+    trace.present_completed(
+        Some(generation),
+        Drawable {
+            size: [1200, 800],
+            surface_generation: 4,
+            reconfigured: false,
+        },
+        8,
+    );
     let json = trace.drain_through(Some(generation)).unwrap().json();
     let record = &json["records"][0];
     assert_eq!(record["client"]["at"], 1);
+    assert_eq!(record["client"]["value"]["event_physical"], serde_json::json!([1200, 800]));
+    assert_eq!(record["client"]["value"]["physical"], serde_json::json!([1198, 798]));
     assert_eq!(record["drawable"]["at"], 2);
     assert_eq!(record["viewport"]["at"], 3);
     assert_eq!(record["root"]["at"], 4);
     assert_eq!(record["render_started"]["at"], 5);
     assert_eq!(record["render_finished"]["at"], 6);
     assert_eq!(record["present_submitted"]["at"], 7);
+    assert_eq!(record["present_completed"]["at"], 8);
 }
 
 #[test]
 fn final_generation_without_present_has_a_pending_snapshot() {
     let mut trace = Trace::default();
-    let generation = trace.begin(true, [1280, 720], 1.0, 10).unwrap();
+    let generation = trace.begin(true, [1280, 720], [1280, 720], 1.0, 10).unwrap();
     trace.configured(
         Some(generation),
         Drawable {

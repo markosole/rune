@@ -352,6 +352,7 @@ pub(super) fn render_window_frame(
 pub(super) fn submit_and_present_window(
     host: &mut Host,
     prepared: PreparedWindowFrame,
+    resizing: bool,
     looped: Option<&Vec<u32>>,
     profile: &mut FrameProfile,
     encoded: &mut Option<Instant>,
@@ -392,18 +393,43 @@ pub(super) fn submit_and_present_window(
             crate::frame::live_log::now(),
         );
     }
+    #[cfg(not(target_os = "windows"))]
+    let _ = resizing;
     #[cfg(target_os = "windows")]
     if let Some(surface) = l.surface.as_ref() {
         l.native.slot.presented_surface(surface);
     }
-    // A swap chain made again on a handed-over window's visual takes over now (`cpu_frame`).
     #[cfg(target_os = "windows")]
-    if matches!(l.native.mode, handover::SurfaceMode::Rebinding { .. }) {
-        rune_gpu::health::poll(&gpu.device, wgpu::PollType::wait_indefinitely()).ok();
-        if let handover::SurfaceMode::Rebinding { handover } = std::mem::take(&mut l.native.mode) {
-            if let Err(error) = handover.commit() { eprintln!("rune: the window's new swap chain couldn't take over: {error}"); }
-            l.native.mode = handover::SurfaceMode::Handed { handover };
+    let present_completed = crate::window::win32::live_resize::complete_present_after(resizing, || {
+        // A swap chain made again on a handed-over window's visual takes over now (`cpu_frame`).
+        if matches!(l.native.mode, handover::SurfaceMode::Rebinding { .. }) {
+            rune_gpu::health::poll(&gpu.device, wgpu::PollType::wait_indefinitely()).ok();
+            if let handover::SurfaceMode::Rebinding { handover } = std::mem::take(&mut l.native.mode) {
+                let committed = match handover.commit() {
+                    Ok(()) => true,
+                    Err(error) => {
+                        eprintln!("rune: the window's new swap chain couldn't take over: {error}");
+                        false
+                    }
+                };
+                l.native.mode = handover::SurfaceMode::Handed { handover };
+                return committed;
+            }
         }
+        true
+    });
+    #[cfg(all(target_os = "windows", feature = "frame-profile"))]
+    if present_completed {
+        let surface_generation = l.surface.as_ref().map_or(0, crate::window::surface::configure::generation);
+        host.resize_log.present_completed(
+            profile.resize_generation,
+            super::resize_log::Drawable {
+                size: [prepared.size.0, prepared.size.1],
+                surface_generation,
+                reconfigured: false,
+            },
+            crate::frame::live_log::now(),
+        );
     }
     #[cfg(target_os = "windows")]
     l.native.video_layers.drawn(|key| renderer.surface_drew_isolated(key));

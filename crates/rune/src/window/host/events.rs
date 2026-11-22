@@ -328,6 +328,8 @@ impl Host {
                 }
                 #[cfg(feature = "frame-profile")]
                 let resize_at = crate::frame::live_log::now();
+                #[cfg(feature = "frame-profile")]
+                let native_client = l.window.inner_size();
                 let origin_moved = sync_screen_origin_core(app.rt_mut(), &l.window);
                 // A frame Rune moved itself has its drawable and viewport already.
                 let resized = l.resize_surface(gpu, size);
@@ -349,6 +351,7 @@ impl Host {
                 let resize_generation = self.resize_log.begin(
                     resize_enabled,
                     [size.width, size.height],
+                    [native_client.width, native_client.height],
                     scale,
                     resize_at,
                 );

@@ -604,7 +604,15 @@ impl FrameHost for WindowFrame<'_> {
     }
 
     fn submit_and_present(&mut self, prepared: PreparedWindowFrame, info: &StepInfo) -> Instant {
-        submit_and_present_window(self.host, prepared, self.state.looped.as_ref(), &mut self.state.profile, &mut self.state.encoded, info)
+        submit_and_present_window(
+            self.host,
+            prepared,
+            self.resizing,
+            self.state.looped.as_ref(),
+            &mut self.state.profile,
+            &mut self.state.encoded,
+            info,
+        )
     }
 
     fn present_targets(&mut self) -> (Option<&mut FrameClock>, &mut RuntimeCore) {
