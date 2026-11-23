@@ -11,6 +11,8 @@ pub(crate) struct HostState {
     pub(in crate::runtime) titlebar: titlebar::Titlebar,
     pub(in crate::runtime) titlebar_inset: f32,
     pub(in crate::runtime) system_reduced_motion: bool,
+    /// The OS text-only scale, independent of display DPI and [`Cx::zoom`](crate::Cx::zoom).
+    pub(in crate::runtime) system_text_scale: f32,
     pub(in crate::runtime) system_accent: crate::SystemAccent,
     /// What [`Cx::system_contrast`] reports.
     pub(in crate::runtime) system_contrast: Option<crate::SystemContrast>,
@@ -70,6 +72,7 @@ impl HostState {
             titlebar: Default::default(),
             titlebar_inset: 0.0,
             system_reduced_motion: false,
+            system_text_scale: 1.0,
             system_accent: crate::SystemAccent::DEFAULT,
             system_contrast: None,
             system_increased_contrast: false,

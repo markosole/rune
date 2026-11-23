@@ -539,6 +539,7 @@ pub(crate) fn refresh_focus_preferences(
     scroll_bars_override: Option<crate::platform::scroll_bars::ScrollBars>,
 ) {
     rt.set_system_reduced_motion(crate::platform::preferences::reduced_motion());
+    rt.set_system_text_scale(crate::platform::preferences::text_scale());
     rt.set_system_contrast(crate::platform::preferences::contrast());
     rt.set_system_increased_contrast(crate::platform::preferences::increased_contrast());
     rt.set_full_keyboard_access(crate::platform::preferences::full_keyboard_access());

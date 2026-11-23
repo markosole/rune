@@ -54,8 +54,8 @@ unsafe extern "system" fn subclass(hwnd: windows_sys::Win32::Foundation::HWND, m
             });
             if let Some(result) = result { return result.0; }
         }
-        // Reduced motion, a contrast theme or the system colours changed: the runtime reads them
-        // again, without waiting for the window's next activation.
+        // Reduced motion, text size, a contrast theme or the system colours changed: the runtime
+        // reads them again, without waiting for the window's next activation.
         WM_SETTINGCHANGE | WM_SYSCOLORCHANGE | WM_THEMECHANGED => {
             if let Ok(s) = state.try_borrow() { s.activation.0.push(|i| i.settings = true); }
         }

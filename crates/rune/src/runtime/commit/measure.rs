@@ -55,6 +55,7 @@ impl RuntimeCore {
             viewport: self.viewport,
             fit_height: self.host.fit_height,
             system_reduced_motion: self.host.system_reduced_motion,
+            system_text_scale: self.host.system_text_scale,
             // The window's controls are in its points; the view's are over the zoom.
             titlebar_inset: self.host.titlebar_inset / self.host.zoom.k,
             chrome: self.host.titlebar.insets.zoomed(self.host.zoom.k),
@@ -460,6 +461,7 @@ impl Measurement<'_> {
             system_increased_contrast: this.system_increased_contrast,
             system_scroll_bars: this.system_scroll_bars,
             system_reduced_motion: this.system_reduced_motion,
+            system_text_scale: this.system_text_scale,
             reduced_motion: this.system_reduced_motion,
             time_scale: this.time_scale,
             zoom: 1.0,
@@ -472,7 +474,7 @@ impl Measurement<'_> {
         let cx = fresh_cx(self);
         #[cfg(feature = "hot")]
         let emptied = self.memo.emptied();
-        let memo = crate::memo::enter(std::mem::take(self.memo), self.env, self.system_accent, self.system_reduced_motion, crate::theme::blends_srgb(), self.chrome_bits(), cx.caret.clone(), cx.layout.clone());
+        let memo = crate::memo::enter(std::mem::take(self.memo), self.env, self.system_accent, self.system_reduced_motion, self.system_text_scale, crate::theme::blends_srgb(), self.chrome_bits(), cx.caret.clone(), cx.layout.clone());
         let view_time = crate::frame::profile::Scope::new(crate::frame::profile::Phase::View);
         // The view and the rows it builds measure text with the window's own text system.
         #[cfg(not(feature = "hot"))]
@@ -497,7 +499,7 @@ impl Measurement<'_> {
                     self.virtual_culled.clear();
                     self.virtual_inputs.clear();
                     let cx = fresh_cx(self);
-                    let memo = crate::memo::enter(emptied, self.env, self.system_accent, self.system_reduced_motion, crate::theme::blends_srgb(), self.chrome_bits(), cx.caret.clone(), cx.layout.clone());
+                    let memo = crate::memo::enter(emptied, self.env, self.system_accent, self.system_reduced_motion, self.system_text_scale, crate::theme::blends_srgb(), self.chrome_bits(), cx.caret.clone(), cx.layout.clone());
                     let (root, cx) = crate::hot::original_only(|| self.root_view(cx));
                     (crate::hot::original_only(|| self.build_tree(root, tx, force_all)), cx, memo)
                 }

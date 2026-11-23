@@ -349,6 +349,7 @@ pub(super) struct Measurement<'a> {
     pub(super) viewport: (f32, f32),
     pub(super) fit_height: bool,
     pub(super) system_reduced_motion: bool,
+    pub(super) system_text_scale: f32,
     pub(super) titlebar_inset: f32,
     pub(super) chrome: crate::ChromeInsets,
     /// Caption buttons drawn over the view's root.

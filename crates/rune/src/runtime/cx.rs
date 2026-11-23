@@ -63,6 +63,7 @@ pub(crate) struct CxCore {
     pub(super) system_increased_contrast: bool,
     pub(super) system_scroll_bars: crate::platform::scroll_bars::SystemScrollBars,
     pub(super) system_reduced_motion: bool,
+    pub(super) system_text_scale: f32,
     pub(super) reduced_motion: bool,
     pub(super) time_scale: f32,
     /// [`Cx::zoom`], read once the view returns.
@@ -143,6 +144,7 @@ impl CxCore {
     pub(crate) fn system_contrast(&self) -> Option<crate::SystemContrast> { self.system_contrast }
     pub(crate) fn system_increased_contrast(&self) -> bool { self.system_increased_contrast }
     pub(crate) fn system_reduced_motion(&self) -> bool { self.system_reduced_motion }
+    pub(crate) fn system_text_scale(&self) -> f32 { self.system_text_scale }
     pub(crate) fn scroll_bars(&self) -> crate::ScrollBars { self.system_scroll_bars.bars }
     pub(crate) fn overlay_scroll_bars(&self) -> bool { self.system_scroll_bars.is_overlay() }
     pub(crate) fn is_reduced_motion(&self) -> bool { self.reduced_motion }
@@ -315,6 +317,12 @@ impl<S> Cx<S> {
     /// The host's OS accessibility preference, independent of this commit's override.
     #[inline(always)]
     pub fn system_reduced_motion(&self) -> bool { self.core.system_reduced_motion() }
+    /// The OS text-only scale: Windows' Accessibility > Text size, independent of display DPI
+    /// and [`Self::zoom`]. It is 1 on unsupported platforms and in a new headless runtime. A
+    /// change re-runs the view and its memos so responsive layouts can hide secondary labels
+    /// before primary controls clip.
+    #[inline(always)]
+    pub fn system_text_scale(&self) -> f32 { self.core.system_text_scale() }
     /// The user's "Show scroll bars" preference (System Settings › Appearance on macOS;
     /// [`ScrollBars::WhenScrolling`](crate::ScrollBars::WhenScrolling) elsewhere and headless).
     /// The view and its memos re-run when it changes.

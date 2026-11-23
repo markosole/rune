@@ -222,6 +222,13 @@ impl<S: 'static> Runtime<S> {
     pub fn set_system_reduced_motion(&mut self, reduced: bool) { self.core_mut().set_system_reduced_motion(reduced); }
     #[inline(always)]
     pub fn system_reduced_motion(&self) -> bool { self.core().host.system_reduced_motion() }
+    /// Sets the system text-only scale reported to the view. Native hosts set this themselves;
+    /// headless tooling can set deterministic accessibility fixtures with it.
+    #[inline(always)]
+    pub fn set_system_text_scale(&mut self, scale: f32) { self.core_mut().set_system_text_scale(scale); }
+    /// The normalized system text-only scale, 1 in a new headless runtime.
+    #[inline(always)]
+    pub fn system_text_scale(&self) -> f32 { self.core().host.system_text_scale() }
     #[inline(always)]
     pub(crate) fn system_scroll_bars_state(&self) -> crate::platform::scroll_bars::SystemScrollBars { self.core().system_scroll_bars_state() }
     #[inline(always)]

@@ -1,6 +1,6 @@
 //! Native accessibility and appearance preferences, sampled when a host is created or focused
-//! (appearance also on each redraw, which a change asks for).
-//! Headless runtimes use their explicit Env instead.
+//! (and on the platform's settings-change signal).
+//! Headless runtimes keep deterministic defaults unless tooling sets a runtime preference.
 
 #![allow(unsafe_code)]
 
@@ -75,6 +75,20 @@ unsafe fn gnome_animations() -> Option<bool> {
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 pub(crate) fn reduced_motion() -> bool { false }
+
+/// The system's text-only scale. Windows' Accessibility > Text size exposes it independently of
+/// display DPI. Hosts sample rather than retain `UISettings`: creation, focus and the existing
+/// `WM_SETTINGCHANGE` wake all run on the host thread, leaving no WinRT callback lifetime. Other
+/// platforms and an unavailable Windows Runtime API keep text unscaled.
+#[cfg(target_os = "windows")]
+pub(crate) fn text_scale() -> f32 {
+    windows::UI::ViewManagement::UISettings::new()
+        .and_then(|settings| settings.TextScaleFactor())
+        .map_or(1.0, |scale| scale as f32)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn text_scale() -> f32 { 1.0 }
 
 /// `RUNE_INCREASE_CONTRAST=1`: [`increased_contrast`] on, for captures and checks.
 pub(crate) fn increased_contrast_preset() -> bool {

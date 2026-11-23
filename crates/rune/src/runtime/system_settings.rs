@@ -1,5 +1,5 @@
-//! The host's system settings: appearance, accent, scroll bars, titlebar inset, keyboard access
-//! and reduced motion.
+//! The host's system settings: appearance, accent, scroll bars, titlebar inset, keyboard access,
+//! text size and reduced motion.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -69,6 +69,19 @@ impl window_requests::HostState {
     #[inline]
     pub(crate) fn system_reduced_motion(&self) -> bool {
         self.system_reduced_motion
+    }
+
+    #[inline]
+    pub(crate) fn system_text_scale(&self) -> f32 {
+        self.system_text_scale
+    }
+
+    #[inline]
+    pub(super) fn set_system_text_scale(&mut self, scale: f32) -> bool {
+        let scale = if scale.is_finite() { scale.clamp(1.0, 4.0) } else { 1.0 };
+        if self.system_text_scale == scale { return false; }
+        self.system_text_scale = scale;
+        true
     }
 
     #[inline]
@@ -182,6 +195,13 @@ impl RuntimeCore {
     #[inline]
     pub fn set_system_reduced_motion(&mut self, reduced: bool) {
         if self.host.set_system_reduced_motion(reduced) { self.commit.dirty = true; }
+    }
+    /// What [`Cx::system_text_scale`] reports: the OS text-size preference, normalized to 1–4.
+    /// Native Windows hosts sample it when they open, gain focus and receive a settings change;
+    /// headless and other native hosts default to 1. A change re-runs the view and its memos.
+    #[inline]
+    pub fn set_system_text_scale(&mut self, scale: f32) {
+        if self.host.set_system_text_scale(scale) { self.commit.dirty = true; }
     }
 
     #[inline]

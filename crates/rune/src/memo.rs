@@ -214,6 +214,7 @@ pub(crate) fn enter(
     env: crate::Env,
     accent: crate::SystemAccent,
     reduced_motion: bool,
+    system_text_scale: f32,
     srgb_blend: bool,
     chrome: [u32; 4],
     caret: Option<(String, [f32; 4])>,
@@ -224,10 +225,11 @@ pub(crate) fn enter(
     let accent = [accent.accent(env.system_dark), accent.focus(env.system_dark)].map(|c| [c.r, c.g, c.b, c.a].map(f32::to_bits));
     let scale = env.scale;
     // Theme colours resolve per blend mode (`theme::blends_srgb`), so a switch rebuilds memos.
-    // So does a change to what the window's controls take (`Cx::chrome_insets`), and to the icon
-    // swap, whose icons can take another size (`text::set_icon_swap_size`).
+    // So do changes to what the window's controls take (`Cx::chrome_insets`), the system text
+    // scale a responsive control can read, and the icon swap, whose icons can take another size
+    // (`text::set_icon_swap_size`).
     let icons = crate::text::icon::swap_state();
-    let env = hash_of(&(env.system_dark, scale.to_bits(), reduced_motion, accent, crate::platform::scroll_bars::scoped(), srgb_blend, chrome, icons));
+    let env = hash_of(&(env.system_dark, scale.to_bits(), reduced_motion, system_text_scale.to_bits(), accent, crate::platform::scroll_bars::scoped(), srgb_blend, chrome, icons));
     let scope = Scope {
         cache,
         env,
@@ -282,6 +284,7 @@ pub(crate) fn enter_partial(
     env: crate::Env,
     accent: crate::SystemAccent,
     reduced_motion: bool,
+    system_text_scale: f32,
     srgb_blend: bool,
     chrome: [u32; 4],
     caret: Option<(String, [f32; 4])>,
@@ -300,7 +303,7 @@ pub(crate) fn enter_partial(
         keep_nested_rows(&mut cache, &mut nested, next);
     }
     cache.nested_scratch = nested;
-    enter(cache, env, accent, reduced_motion, srgb_blend, chrome, caret, layout)
+    enter(cache, env, accent, reduced_motion, system_text_scale, srgb_blend, chrome, caret, layout)
 }
 
 /// Ends the view build [`enter`] began; dropped without [`Guard::finish`] (a panicking view),

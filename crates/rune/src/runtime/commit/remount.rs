@@ -254,6 +254,7 @@ impl Measurement<'_> {
             self.env,
             self.system_accent,
             self.system_reduced_motion,
+            self.system_text_scale,
             crate::theme::blends_srgb(),
             self.chrome_bits(),
             self.caret.clone(),

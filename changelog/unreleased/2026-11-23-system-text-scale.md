@@ -1,0 +1,1 @@
+- Expose Windows' system text-size preference to responsive views and headless accessibility tests.
