@@ -52,6 +52,7 @@ fn the_shell_reads_its_landmarks_sections_rows_and_grip() {
     let grip = node(&tree, "sidebar-grip");
     assert_eq!(said(grip), ("splitter", "Resize sidebar"));
     assert_eq!(grip["range"], serde_json::json!([240.0, 180.0, 420.0, 8.0]));
+    assert_eq!(grip["orientation"], "vertical");
     assert!(can(grip, "increment") && can(grip, "set-value") && !can(grip, "focus"), "a reader resizes the pane; Tab skips the grip");
     let toggle = node(&tree, "sidebar-toggle");
     assert_eq!(said(toggle), ("button", "Hide sidebar"));

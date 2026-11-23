@@ -54,6 +54,12 @@ impl Tree<'_> {
         if let Some(x) = n.numeric_value() {
             v["range"] = json!([x, n.min_numeric_value(), n.max_numeric_value(), n.numeric_value_step()]);
         }
+        if let Some(orientation) = n.orientation() {
+            v["orientation"] = match orientation {
+                accesskit::Orientation::Horizontal => "horizontal",
+                accesskit::Orientation::Vertical => "vertical",
+            }.into();
+        }
         if let Some(l) = n.level() { v["level"] = (l + 1).into(); }
         if let Some(p) = n.position_in_set() { v["position"] = (p + 1).into(); }
         if let Some(s) = n.size_of_set() { v["setSize"] = s.into(); }

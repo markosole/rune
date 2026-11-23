@@ -33,6 +33,7 @@ struct Form {
     presses: u32,
     on: bool,
     open: bool,
+    vertical: bool,
     level: i32,
     name: TextEdit,
     menu: u32,
@@ -53,6 +54,11 @@ fn form(s: &Form, _: &mut Cx<Form>) -> El {
         .child(crate::el().key("volume").role("slider").range_value(f64::from(s.level), 0.0, 10.0).range_step(1.0)
             .label("Volume").size(100.0, 12.0)
             .on_step(|s: &mut Form, d, _| s.level = (s.level + d).clamp(0, 10)))
+        .child(crate::el().key("splitter").role("separator").label("Resize inspector")
+            .size(6.0, 100.0).range_value(240.0, 180.0, 420.0).range_step(8.0)
+            .a11y_orientation(if s.vertical { accesskit::Orientation::Vertical } else { accesskit::Orientation::Horizontal })
+            .on_drag(|_: &mut Form, _, _| {})
+            .on_step(|_: &mut Form, _, _| {}))
         .child(text_input(&s.name, crate::tok::type_::BODY).key("name").single_line().w(200.0)
             .on_edit(|s: &mut Form| &mut s.name))
         .child(row().key("off").role("button").disabled(true).child(text("Unavailable")))
@@ -87,6 +93,8 @@ fn controls_report_role_name_value_states_and_actions() {
     assert_eq!(volume["role"], "slider");
     assert_eq!(volume["range"], serde_json::json!([0.0, 0.0, 10.0, 1.0]));
     assert!(actions(volume).contains(&"increment"));
+    let splitter = find(&tree, "splitter").unwrap();
+    assert_eq!((splitter["role"].as_str(), splitter["orientation"].as_str()), (Some("splitter"), Some("horizontal")));
     let name = find(&tree, "name").unwrap();
     assert_eq!(name["role"], "text-input");
     assert!(actions(name).contains(&"set-value"));
@@ -97,6 +105,21 @@ fn controls_report_role_name_value_states_and_actions() {
     assert!(find(&tree, "deco").is_none(), "a11y_hidden leaves the tree");
     let b = save["bounds"].as_array().unwrap();
     assert!(b[2].as_f64().unwrap() > 0.0 && b[3].as_f64().unwrap() > 0.0, "bounds in points: {b:?}");
+}
+
+#[test]
+fn orientation_changes_emit_an_accessibility_update() {
+    let mut rt = form_rt();
+    rt.a11y_activate("Form");
+    rt.a11y_update().expect("initial tree");
+    rt.update(|s, _| s.vertical = true);
+    rt.frame(0.0);
+    assert_eq!(find(&rt.accessibility_json(), "splitter").unwrap()["orientation"], "vertical");
+    let update = rt.a11y_update().expect("orientation changed");
+    let splitter = update.nodes.iter().find(|(_, node)| node.author_id() == Some("splitter"))
+        .map(|(_, node)| node).unwrap_or_else(|| panic!("splitter updated: {:?}",
+            update.nodes.iter().map(|(_, node)| (node.role(), node.author_id(), node.orientation())).collect::<Vec<_>>()));
+    assert_eq!(splitter.orientation(), Some(accesskit::Orientation::Vertical));
 }
 
 #[test]

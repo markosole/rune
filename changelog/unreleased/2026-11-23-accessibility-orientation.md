@@ -1,0 +1,1 @@
+- Let controls report their horizontal or vertical orientation to assistive technology.

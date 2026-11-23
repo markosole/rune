@@ -58,7 +58,7 @@ impl RuntimeCore {
         n.a11y.disabled.hash(&mut h);
         n.a11y.live.hash(&mut h);
         if let Some(m) = n.a11y.more.as_deref() {
-            (&m.description, &m.value, &m.set, &m.shortcut, m.invalid, m.read_only, m.sorted, m.busy).hash(&mut h);
+            (&m.description, &m.value, &m.set, &m.shortcut, m.orientation, m.invalid, m.read_only, m.sorted, m.busy).hash(&mut h);
             [m.labelled_by.as_deref(), m.described_by.as_deref()].map(|k| k.and_then(|k| self.a11y_keyed(i, k)).map(|j| self.a11y_words(j))).hash(&mut h);
             if let Some(r) = m.range { [r.value, r.min, r.max, r.step.unwrap_or(f64::NAN)].map(f64::to_bits).hash(&mut h); }
             self.a11y_active_descendant(i).map(|j| self.tree.nodes[j].id.0).hash(&mut h);
@@ -199,6 +199,7 @@ impl RuntimeCore {
             }
             if let Some(j) = self.a11y_active_descendant(i) { node.set_active_descendant(element_id(self.tree.nodes[j].id)); }
             if m.busy { node.set_busy(); }
+            if let Some(orientation) = m.orientation { node.set_orientation(orientation); }
         }
         if let Some(v) = more.and_then(|m| m.value.as_deref()) { node.set_value(v); }
         if let Some(r) = more.and_then(|m| m.range) {

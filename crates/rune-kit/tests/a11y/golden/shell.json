@@ -167,6 +167,7 @@
                   ],
                   "key": "sidebar-grip",
                   "name": "Resize sidebar",
+                  "orientation": "vertical",
                   "range": [
                     240.0,
                     180.0,

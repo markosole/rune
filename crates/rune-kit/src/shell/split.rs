@@ -625,6 +625,7 @@ fn dock(d: &Dock, key: &str, p: Pane, leading: bool, content: Contents) -> El {
             // Its value is the pane's width; a reader's increment and decrement step it.
             .range_value(f64::from(s.width()), f64::from(s.min_width()), f64::from(s.max_width()))
             .range_step(f64::from(GRIP_STEP))
+            .a11y_orientation(rune::accesskit::Orientation::Vertical)
             .w(GRIP)
             .cursor(Cursor::ResizeColumn)
             .fill(Color::TRANSPARENT)

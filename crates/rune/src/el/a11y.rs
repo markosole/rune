@@ -41,6 +41,8 @@ pub(crate) struct A11yMore {
     pub description: Option<Cow<'static, str>>,
     pub value: Option<String>,
     pub range: Option<Range>,
+    /// `El::a11y_orientation`.
+    pub orientation: Option<accesskit::Orientation>,
     /// 1-based position and the set's size.
     pub set: Option<(usize, usize)>,
     pub shortcut: Option<String>,
@@ -193,6 +195,12 @@ impl El {
         let more = self.cold_mut().a11y.more();
         let range = more.range.get_or_insert(Range { value: 0.0, min: 0.0, max: 0.0, step: None });
         range.step = Some(step);
+        self
+    }
+    /// A control's axis for assistive technology (ARIA `aria-orientation`). A vertical pane
+    /// divider, for example, reports [`accesskit::Orientation::Vertical`].
+    pub fn a11y_orientation(mut self, orientation: accesskit::Orientation) -> Self {
+        self.cold_mut().a11y.more().orientation = Some(orientation);
         self
     }
     /// Whether a checkbox, switch, radio button or toggle button is on (ARIA `aria-checked`
