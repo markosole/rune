@@ -401,22 +401,22 @@ index fdb63bc..5f64a80 100644
 +    }
 +}
 diff --git a/src/dx12/mod.rs b/src/dx12/mod.rs
-index 285d635..2fb4210 100644
+index 285d6356..935c6093 100644
 --- a/src/dx12/mod.rs
 +++ b/src/dx12/mod.rs
 @@ -92,7 +92,7 @@ mod suballocation;
  mod types;
  mod view;
- 
+
 -use alloc::{borrow::ToOwned as _, string::String, sync::Arc, vec::Vec};
 +use alloc::{borrow::ToOwned as _, collections::VecDeque, string::String, sync::Arc, vec::Vec};
  use core::{ffi, fmt, mem, ops::Deref, sync::atomic::AtomicU64};
- 
+
  use arrayvec::ArrayVec;
 @@ -134,6 +134,22 @@ impl DynLib {
          unsafe { libloading::Library::new(filename) }.map(|inner| Self { inner })
      }
- 
+
 +    // Rune: load Windows system DLLs from System32 only, not the app directory or CWD.
 +    unsafe fn new_system<P>(filename: P) -> Result<Self, libloading::Error>
 +    where
@@ -437,36 +437,38 @@ index 285d635..2fb4210 100644
          &self,
          symbol: &[u8],
 @@ -164,7 +180,7 @@ pub enum CreateDeviceError {
- 
+
  impl D3D12Lib {
      fn new() -> Result<Self, libloading::Error> {
 -        unsafe { DynLib::new("d3d12.dll").map(|lib| Self { lib }) }
 +        unsafe { DynLib::new_system("d3d12.dll").map(|lib| Self { lib }) }
      }
- 
+
      fn create_device(
 @@ -328,7 +344,7 @@ pub(super) struct DxgiLib {
- 
+
  impl DxgiLib {
      pub fn new() -> Result<Self, libloading::Error> {
 -        unsafe { DynLib::new("dxgi.dll").map(|lib| Self { lib }) }
 +        unsafe { DynLib::new_system("dxgi.dll").map(|lib| Self { lib }) }
      }
- 
+
      /// Will error with crate::DeviceError::Unexpected if DXGI 1.3 is not available.
-@@ -615,6 +631,8 @@ struct SwapChain {
+@@ -615,6 +631,10 @@ struct SwapChain {
      present_mode: wgt::PresentMode,
      format: wgt::TextureFormat,
      size: wgt::Extent3d,
 +    /// Rune: what the next present changed (Surface::set_present_rects); empty is all of it.
 +    dirty: Vec<Foundation::RECT>,
++    /// Rune: this resize present can replace earlier queued frames, without allowing tearing.
++    prefer_latest: bool,
  }
- 
+
  enum SurfaceTarget {
-@@ -651,6 +669,15 @@ impl Surface {
+@@ -651,6 +671,22 @@ impl Surface {
          Some(self.swap_chain.read().as_ref()?.raw.clone())
      }
- 
+
 +    /// Rune: the only rectangles the next present changed, in the swap chain's pixels; the rest of
 +    /// the buffer holds what the frame before showed. Cleared by the present.
 +    pub fn set_present_rects(&self, rects: &[Foundation::RECT]) {
@@ -476,13 +478,20 @@ index 285d635..2fb4210 100644
 +        }
 +    }
 +
++    /// Rune: use DXGI's zero sync interval for the next flip, leaving tearing disabled.
++    pub fn prefer_latest_present_once(&self) {
++        if let Some(sc) = self.swap_chain.write().as_mut() {
++            sc.prefer_latest = true;
++        }
++    }
++
      /// Returns the waitable handle associated with this swap chain, if any.
      /// Handle is only valid while the swap chain is alive.
      pub unsafe fn waitable_handle(&self) -> Option<Foundation::HANDLE> {
-@@ -741,6 +768,279 @@ struct Idler {
+@@ -741,6 +777,279 @@ struct Idler {
      fence: Direct3D12::ID3D12Fence,
  }
- 
+
 +/// Rune: GPU-written drain markers on software adapters (WARP) so releasing a removed device
 +/// waits for any queued command lists its CPU worker threads are still executing. After
 +/// `RemoveDevice`, D3D12 sets every fence to `u64::MAX` and rejects `Queue::Signal`, so fences
@@ -759,24 +768,24 @@ index 285d635..2fb4210 100644
  #[derive(Debug, Clone)]
  struct CommandSignatures {
      draw: Direct3D12::ID3D12CommandSignature,
-@@ -756,6 +1056,7 @@ struct DeviceShared {
+@@ -756,6 +1065,7 @@ struct DeviceShared {
      heap_views: descriptor::GeneralHeap,
      sampler_heap: sampler::SamplerHeap,
      private_caps: PrivateCapabilities,
 +    drain: Arc<DrainTracker>,
  }
- 
+
  unsafe impl Send for DeviceShared {}
-@@ -810,6 +1111,7 @@ pub struct Queue {
+@@ -810,6 +1120,7 @@ pub struct Queue {
      idle_fence_value: AtomicU64,
      pending_waits: Mutex<Vec<(Direct3D12::ID3D12Fence, u64)>>,
      pending_signals: Mutex<Vec<(Direct3D12::ID3D12Fence, u64)>>,
 +    drain: Arc<DrainTracker>,
  }
- 
+
  impl Queue {
-@@ -992,7 +1294,11 @@ pub struct CommandEncoder {
- 
+@@ -992,7 +1303,11 @@ pub struct CommandEncoder {
+
      null_rtv_handle: descriptor::Handle,
      list: Option<Direct3D12::ID3D12GraphicsCommandList>,
 -    free_lists: Vec<Direct3D12::ID3D12GraphicsCommandList>,
@@ -787,26 +796,26 @@ index 285d635..2fb4210 100644
 +    )>,
      pass: PassState,
      temp: Temp,
- 
-@@ -1018,6 +1324,8 @@ impl fmt::Debug for CommandEncoder {
+
+@@ -1018,6 +1333,8 @@ impl fmt::Debug for CommandEncoder {
  #[derive(Debug)]
  pub struct CommandBuffer {
      raw: Direct3D12::ID3D12GraphicsCommandList,
 +    list2: Option<Direct3D12::ID3D12GraphicsCommandList2>,
 +    marker: Option<(u32, u32)>,
  }
- 
+
  impl crate::DynCommandBuffer for CommandBuffer {}
-@@ -1209,6 +1517,8 @@ unsafe impl Sync for QuerySet {}
+@@ -1209,6 +1526,8 @@ unsafe impl Sync for QuerySet {}
  #[derive(Debug)]
  pub struct Fence {
      raw: Direct3D12::ID3D12Fence,
 +    /// Rune: the highest value read from it (`Device::reached`).
 +    reached: AtomicU64,
  }
- 
+
  impl crate::DynFence for Fence {}
-@@ -1535,7 +1845,9 @@ impl crate::Surface for Surface {
+@@ -1535,7 +1854,9 @@ impl crate::Surface for Surface {
                      BufferUsage: Dxgi::DXGI_USAGE_RENDER_TARGET_OUTPUT,
                      BufferCount: swap_chain_buffer,
                      Scaling: Dxgi::DXGI_SCALING_STRETCH,
@@ -817,18 +826,19 @@ index 285d635..2fb4210 100644
                      Flags: flags.0 as u32,
                  };
                  let swap_chain1 = match self.target {
-@@ -1702,6 +2014,7 @@ impl crate::Surface for Surface {
+@@ -1702,6 +2023,8 @@ impl crate::Surface for Surface {
              present_mode: config.present_mode,
              format: config.format,
              size: config.extent,
 +            dirty: Vec::new(),
++            prefer_latest: false,
          });
- 
+
          Ok(())
-@@ -1768,6 +2081,14 @@ impl crate::Surface for Surface {
+@@ -1768,6 +2091,14 @@ impl crate::Surface for Surface {
      }
  }
- 
+
 +impl Queue {
 +    fn device_removed(&self) -> bool {
 +        let mut device: Option<Direct3D12::ID3D12Device> = None;
@@ -839,8 +849,8 @@ index 285d635..2fb4210 100644
 +
  impl crate::Queue for Queue {
      type A = Api;
- 
-@@ -1777,6 +2098,18 @@ impl crate::Queue for Queue {
+
+@@ -1777,6 +2108,18 @@ impl crate::Queue for Queue {
          _surface_textures: &[&Texture],
          (signal_fence, signal_value): (&Fence, crate::FenceValue),
      ) -> Result<(), crate::DeviceError> {
@@ -859,7 +869,7 @@ index 285d635..2fb4210 100644
          let mut temp_lists = self.temp_lists.lock();
          temp_lists.clear();
          for cmd_buf in command_buffers {
-@@ -1790,25 +2123,48 @@ impl crate::Queue for Queue {
+@@ -1790,25 +2133,48 @@ impl crate::Queue for Queue {
          {
              let mut waits = self.pending_waits.lock();
              for (fence, value) in waits.drain(..) {
@@ -874,7 +884,7 @@ index 285d635..2fb4210 100644
 +                }
              }
          }
- 
+
 +        if !command_buffers.is_empty() && !self.drain.track_submitted(command_buffers) {
 +            return Err(crate::DeviceError::Lost);
 +        }
@@ -883,7 +893,7 @@ index 285d635..2fb4210 100644
              profiling::scope!("ID3D12CommandQueue::ExecuteCommandLists");
              unsafe { self.raw.ExecuteCommandLists(&temp_lists) }
          }
- 
+
 -        unsafe { self.raw.Signal(&signal_fence.raw, signal_value) }
 -            .into_device_result("Signal fence")?;
 +        if let Err(err) =
@@ -894,7 +904,7 @@ index 285d635..2fb4210 100644
 +            }
 +            return Err(err);
 +        }
- 
+
          // Drain caller-staged signals after our own Signal so each
          // additional fence value publishes once the submit completes.
          {
@@ -912,10 +922,29 @@ index 285d635..2fb4210 100644
 +                }
              }
          }
- 
-@@ -1838,9 +2194,22 @@ impl crate::Queue for Queue {
+
+@@ -1829,18 +2195,35 @@ impl crate::Queue for Queue {
+         let sc = swapchain.as_mut().unwrap();
+         sc.acquired_count -= 1;
+
+-        let (interval, flags) = match sc.present_mode {
+-            // We only allow immediate if ALLOW_TEARING is valid.
+-            wgt::PresentMode::Immediate => (0, Dxgi::DXGI_PRESENT_ALLOW_TEARING),
+-            wgt::PresentMode::Mailbox => (0, Dxgi::DXGI_PRESENT::default()),
+-            wgt::PresentMode::Fifo => (1, Dxgi::DXGI_PRESENT::default()),
+-            m => unreachable!("Cannot make surface with present mode {m:?}"),
++        let (interval, flags) = if mem::take(&mut sc.prefer_latest) {
++            (0, Dxgi::DXGI_PRESENT::default())
++        } else {
++            match sc.present_mode {
++                // We only allow immediate if ALLOW_TEARING is valid.
++                wgt::PresentMode::Immediate => (0, Dxgi::DXGI_PRESENT_ALLOW_TEARING),
++                wgt::PresentMode::Mailbox => (0, Dxgi::DXGI_PRESENT::default()),
++                wgt::PresentMode::Fifo => (1, Dxgi::DXGI_PRESENT::default()),
++                m => unreachable!("Cannot make surface with present mode {m:?}"),
++            }
          };
- 
+
          profiling::scope!("IDXGISwapchain3::Present");
 -        unsafe { sc.raw.Present(interval, flags) }
 -            .ok()
@@ -936,12 +965,12 @@ index 285d635..2fb4210 100644
 +                .ok()
 +                .into_device_result("Present1")?;
 +        }
- 
+
          Ok(())
      }
-@@ -1851,18 +2220,51 @@ impl crate::Queue for Queue {
+@@ -1851,18 +2234,51 @@ impl crate::Queue for Queue {
      }
- 
+
      unsafe fn wait_for_idle(&self) -> Result<(), crate::DeviceError> {
 +        let on_removed = || {
 +            self.drain.mark_removed();

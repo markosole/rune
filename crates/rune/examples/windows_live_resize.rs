@@ -15,7 +15,8 @@ mod windows {
     };
 
     use rune::*;
-    use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, GetDC, GetPixel, ReleaseDC};
     use windows_sys::Win32::System::Threading::{
         AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId,
     };
@@ -218,7 +219,14 @@ mod windows {
         // The actual pointer press enters the system's sizing loop. Sending an additional
         // WM_NCLBUTTONDOWN can enter a second loop after the first button release.
         let mut sizes = move_sizing_cursor(hwnd as usize, x, bottom, initial)?;
-        std::thread::sleep(Duration::from_millis(1000));
+        if fast_drag() {
+            let deadline = rune::time::now() + Duration::from_millis(250);
+            while client_size(hwnd)? != initial && rune::time::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(1000));
+        }
         let final_size = client_size(hwnd)?;
         sizes.insert(final_size);
         if fast_drag() && (final_size != initial || sizes.iter().any(|&(w, h)| {
@@ -242,6 +250,51 @@ mod windows {
             sizes.len(),
         );
         Ok(sizes.len())
+    }
+
+    fn top_toolbar_pixel(hwnd: HWND, offset: (i32, i32), sample: usize) -> Result<(), String> {
+        let mut pixel = POINT { x: offset.0, y: offset.1 };
+        let mut outside = POINT { x: offset.0, y: 125 };
+        // SAFETY: the live fixture window owns both writable client points.
+        checked(unsafe { ClientToScreen(hwnd, &mut pixel) }, "ClientToScreen(toolbar)")?;
+        checked(unsafe { ClientToScreen(hwnd, &mut outside) }, "ClientToScreen(neutral point)")?;
+        // SAFETY: this reads one desktop pixel of the verified foreground fixture.
+        checked(unsafe { SetCursorPos(outside.x, outside.y) }, "SetCursorPos(neutral)")?;
+        std::thread::sleep(Duration::from_millis(60));
+        let dc = unsafe { GetDC(std::ptr::null_mut()) };
+        if dc.is_null() { return Err("could not read toolbar pixel".into()); }
+        let result = (|| {
+            let color = || unsafe { GetPixel(dc, pixel.x, pixel.y) };
+            let baseline = color();
+            if baseline == u32::MAX { return Err("invalid desktop toolbar pixel".into()); }
+            let started = rune::time::now();
+            checked(unsafe { SetCursorPos(pixel.x, pixel.y) }, "SetCursorPos(toolbar)")?;
+            let limit = Duration::from_millis(350);
+            while started.elapsed() < limit {
+                let hovered = color();
+                if hovered != baseline && hovered != u32::MAX {
+                    eprintln!("LIVE_HOVER sample={sample} ms={:.2} before={baseline:06x} after={hovered:06x}", started.elapsed().as_secs_f64() * 1000.0);
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(format!("toolbar pixel {offset:?} did not change in {}ms (baseline {baseline:06x})", limit.as_millis()))
+        })();
+        // SAFETY: release the desktop DC exactly once even when the probe fails.
+        unsafe { ReleaseDC(std::ptr::null_mut(), dc); }
+        result
+    }
+
+    fn repeat_resize_and_hover(hwnd: HWND, point: (i32, i32)) -> Result<(), String> {
+        focus_window(hwnd)?;
+        top_toolbar_pixel(hwnd, point, 0)?;
+        for sample in 1..=3 {
+            let count = drag_bottom_edge(hwnd)?;
+            eprintln!("LIVE_RESIZE_OK sample={sample} distinct_client_sizes={count}");
+            top_toolbar_pixel(hwnd, point, sample)?;
+            std::thread::sleep(Duration::from_millis(600));
+        }
+        Ok(())
     }
 
     fn drag_bottom_edge(hwnd: HWND) -> Result<usize, String> {
@@ -298,10 +351,21 @@ mod windows {
             return;
         }
         if let Some(value) = std::env::args().nth(1) && let Some(pid) = value.strip_prefix("--target-pid=") {
-            let result = pid.parse::<u32>().map_err(|error| error.to_string())
-                .and_then(find_process_window).and_then(drag_bottom_edge);
+            let result = pid.parse::<u32>().map_err(|error| error.to_string()).and_then(find_process_window);
+            let result = result.and_then(|hwnd| {
+                if let Some(probe) = std::env::args().nth(2).and_then(|arg| arg.strip_prefix("--hover=").map(str::to_owned)) {
+                    let (x, y) = probe.split_once(',').ok_or("use --hover=client_x,client_y")?;
+                    let point = (x.parse().map_err(|_| "invalid x")?, y.parse().map_err(|_| "invalid y")?);
+                    repeat_resize_and_hover(hwnd, point)?;
+                    Ok(())
+                } else {
+                    let count = drag_bottom_edge(hwnd)?;
+                    eprintln!("LIVE_RESIZE_OK distinct_client_sizes={count}");
+                    Ok(())
+                }
+            });
             match result {
-                Ok(count) => eprintln!("LIVE_RESIZE_OK distinct_client_sizes={count}"),
+                Ok(()) => {}
                 Err(error) => { eprintln!("LIVE_RESIZE_FAILED {error}"); std::process::exit(1); }
             }
             return;
