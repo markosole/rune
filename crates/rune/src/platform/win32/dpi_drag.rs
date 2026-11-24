@@ -15,6 +15,7 @@
 use std::cell::RefCell;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     IsWindow, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_NCDESTROY,
@@ -44,13 +45,34 @@ fn moving(hwnd: HWND) -> bool {
     MOVING.with(|m| m.borrow().contains(&(hwnd as usize)))
 }
 
+/// Finishes the last composition before Windows starts changing the client rectangle. The first
+/// live-resize `Surface::configure` otherwise has to drain a swap chain whose last buffer can
+/// still belong to DWM; on a busy DirectComposition window that wait can hold the window thread
+/// for hundreds of milliseconds while the native sizing loop keeps exposing new client area.
+fn enter_size_move(hwnd: HWND) {
+    enter_size_move_with(hwnd as usize, || {
+        // SAFETY: DwmFlush has no pointer arguments or ownership transfer. WM_ENTERSIZEMOVE runs
+        // on the window thread before the modal sizing loop can change the client rectangle.
+        unsafe { DwmFlush() }
+    });
+}
+
+fn enter_size_move_with(hwnd: usize, flush: impl FnOnce() -> i32) -> bool {
+    MOVING.with(|m| {
+        let mut m = m.borrow_mut();
+        if !m.contains(&hwnd) { m.push(hwnd); }
+    });
+    flush() >= 0
+}
+
+fn exit_size_move(hwnd: HWND) {
+    MOVING.with(|m| m.borrow_mut().retain(|&h| h != hwnd as usize));
+}
+
 unsafe extern "system" fn subclass(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM, _: usize, _: usize) -> LRESULT {
     match message {
-        WM_ENTERSIZEMOVE => MOVING.with(|m| {
-            let mut m = m.borrow_mut();
-            if !m.contains(&(hwnd as usize)) { m.push(hwnd as usize); }
-        }),
-        WM_EXITSIZEMOVE => MOVING.with(|m| m.borrow_mut().retain(|&h| h != hwnd as usize)),
+        WM_ENTERSIZEMOVE => enter_size_move(hwnd),
+        WM_EXITSIZEMOVE => exit_size_move(hwnd),
         // SAFETY: WM_DPICHANGED's lparam points to the suggested RECT.
         WM_DPICHANGED if moving(hwnd) && !super::frame::installed(hwnd) => unsafe {
             let suggested = *(lparam as *const RECT);
@@ -70,4 +92,33 @@ unsafe extern "system" fn subclass(hwnd: HWND, message: u32, wparam: WPARAM, lpa
     }
     // SAFETY: forwards to the next window procedure.
     unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn entering_tracks_window_before_flushing_and_exit_forgets_it() {
+        let hwnd = 0x5255_4e44usize;
+        let flushed_while_moving = Cell::new(false);
+        assert!(enter_size_move_with(hwnd, || {
+            flushed_while_moving.set(MOVING.with(|m| m.borrow().contains(&hwnd)));
+            0
+        }));
+        assert!(flushed_while_moving.get());
+        assert!(MOVING.with(|m| m.borrow().contains(&hwnd)));
+        exit_size_move(hwnd as HWND);
+        assert!(!MOVING.with(|m| m.borrow().contains(&hwnd)));
+    }
+
+    #[test]
+    fn entering_keeps_tracking_when_dwm_flush_fails() {
+        let hwnd = 0x5255_4e45usize;
+        assert!(!enter_size_move_with(hwnd, || -1));
+        assert!(MOVING.with(|m| m.borrow().contains(&hwnd)));
+        exit_size_move(hwnd as HWND);
+    }
 }
