@@ -7,6 +7,11 @@
 
 #[cfg(target_os = "windows")]
 #[allow(unsafe_code)]
+#[path = "windows_live_resize/hover.rs"]
+mod hover;
+
+#[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
 mod windows {
     use std::{
         collections::BTreeSet,
@@ -72,7 +77,7 @@ mod windows {
         }
     }
 
-    fn rect(hwnd: HWND, client: bool) -> Result<RECT, String> {
+    pub(super) fn rect(hwnd: HWND, client: bool) -> Result<RECT, String> {
         let mut rect = RECT::default();
         // SAFETY: the window remains alive while the application handle keeps the example open.
         let ok = unsafe {
@@ -92,12 +97,12 @@ mod windows {
         }
     }
 
-    fn client_size(hwnd: HWND) -> Result<(i32, i32), String> {
+    pub(super) fn client_size(hwnd: HWND) -> Result<(i32, i32), String> {
         let rect = rect(hwnd, true)?;
         Ok((rect.right - rect.left, rect.bottom - rect.top))
     }
 
-    fn checked(ok: BOOL, operation: &str) -> Result<(), String> {
+    pub(super) fn checked(ok: BOOL, operation: &str) -> Result<(), String> {
         if ok == 0 { Err(format!("{operation} failed")) } else { Ok(()) }
     }
 
@@ -106,7 +111,7 @@ mod windows {
         unsafe { GetAsyncKeyState(VK_LBUTTON as i32) < 0 }
     }
 
-    fn set_left_button(down: bool) -> Result<(), String> {
+    pub(super) fn set_left_button(down: bool) -> Result<(), String> {
         // SAFETY: the fixture injects one bounded left-button transition and verifies its state.
         unsafe {
             mouse_event(
@@ -128,7 +133,7 @@ mod windows {
         ))
     }
 
-    fn focus_window(hwnd: HWND) -> Result<(), String> {
+    pub(super) fn focus_window(hwnd: HWND) -> Result<(), String> {
         // Foreground-lock rules permit a thread attached to the current foreground input queue to
         // activate the fixture. Detach before injecting any mouse input.
         // SAFETY: this reads the process-wide foreground window without taking ownership.
@@ -357,7 +362,11 @@ mod windows {
         if let Some(value) = std::env::args().nth(1) && let Some(pid) = value.strip_prefix("--target-pid=") {
             let result = pid.parse::<u32>().map_err(|error| error.to_string()).and_then(find_process_window);
             let result = result.and_then(|hwnd| {
-                if let Some(probe) = std::env::args().nth(2).and_then(|arg| arg.strip_prefix("--hover=").map(str::to_owned)) {
+                let mode = std::env::args().nth(2);
+                if let Some(sweep) = mode.as_deref().and_then(|arg| arg.strip_prefix("--sweep=")) {
+                    super::hover::run(hwnd, sweep)?;
+                    Ok(())
+                } else if let Some(probe) = mode.as_deref().and_then(|arg| arg.strip_prefix("--hover=")) {
                     let (x, y) = probe.split_once(',').ok_or("use --hover=client_x,client_y")?;
                     let point = (x.parse().map_err(|_| "invalid x")?, y.parse().map_err(|_| "invalid y")?);
                     repeat_resize_and_hover(hwnd, point)?;
