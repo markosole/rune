@@ -309,9 +309,9 @@ fn an_empty_frame_leaves_the_state_untouched() {
     assert!(!lane.take());
     assert_eq!(lane.state, LiveWake::Pending);
 
-    // No bound sources is dev's early return, before any transition.
+    // Only the local request is spent when the window has no bound sources.
     assert!(!lane.latch_begin(true, false));
-    assert_eq!(lane.state, LiveWake::Pending);
+    assert_eq!(lane.state, LiveWake::Idle);
 }
 
 /// A live-only event without a commit keeps the frame due, and a commit that samples a value
