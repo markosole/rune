@@ -3,6 +3,29 @@
 use super::*;
 use crate::{Cx, El, Env, Key, Live, Mods, PhysicalInput, PhysicalKeyCode, el, text};
 
+#[test]
+fn source_less_live_only_layout_can_rest_after_each_resize() {
+    let mut rt = Runtime::new(0usize, |_, _| {
+        el().w_full().h_full().key("root").on_layout_tx(|calls: &mut usize, _, tx| {
+            *calls += 1;
+            tx.live_only();
+        })
+    }, (800.0, 560.0), Env::new(true, 1.0));
+    rt.check_live_only(false);
+    rt.frame(0.0);
+    rt.frame(0.0);
+
+    let mut previous_calls = rt.state;
+    for height in [680.0, 560.0, 900.0] {
+        rt.set_viewport((800.0, height), 1.0);
+        rt.frame(0.0);
+        rt.frame(0.0);
+        assert!(rt.state > previous_calls, "the resize must deliver a layout callback");
+        previous_calls = rt.state;
+        assert!(!rt.live_pending(), "a source-less layout callback cannot leave a frame owed");
+    }
+}
+
 struct S {
     /// Read by the view.
     count: u32,

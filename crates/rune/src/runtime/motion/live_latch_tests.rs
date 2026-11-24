@@ -7,6 +7,20 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+#[test]
+fn source_less_latch_keeps_a_publication_that_landed_after_take() {
+    let mut lane = LiveLane::new(Arc::new(|| {}));
+    lane.set();
+    assert!(!lane.take());
+    lane.publish();
+    assert!(!lane.latch_begin(true, false));
+    assert!(!lane.dirty());
+    assert!(lane.pending());
+    assert!(lane.take());
+    assert!(!lane.latch_begin(true, false));
+    assert!(!lane.pending());
+}
+
 /// Origin/dev's shared wake: `pending` set by a publisher, `visible` by the host, and a callback
 /// that fires once when a hidden host with a wake shows.
 struct DevWake {

@@ -1,0 +1,1 @@
+- Let windows rest after a `Tx::live_only` handler runs without any live bindings. A concurrently published wake still reaches its next frame.

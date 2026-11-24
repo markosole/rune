@@ -288,13 +288,17 @@ mod windows {
     fn repeat_resize_and_hover(hwnd: HWND, point: (i32, i32)) -> Result<(), String> {
         focus_window(hwnd)?;
         top_toolbar_pixel(hwnd, point, 0)?;
+        let mut failures = Vec::new();
         for sample in 1..=3 {
             let count = drag_bottom_edge(hwnd)?;
             eprintln!("LIVE_RESIZE_OK sample={sample} distinct_client_sizes={count}");
-            top_toolbar_pixel(hwnd, point, sample)?;
+            if let Err(error) = top_toolbar_pixel(hwnd, point, sample) {
+                eprintln!("LIVE_HOVER_TIMEOUT sample={sample} {error}");
+                failures.push(sample);
+            }
             std::thread::sleep(Duration::from_millis(600));
         }
-        Ok(())
+        if failures.is_empty() { Ok(()) } else { Err(format!("hover timed out after gestures {failures:?}")) }
     }
 
     fn drag_bottom_edge(hwnd: HWND) -> Result<usize, String> {

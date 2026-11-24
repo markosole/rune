@@ -144,10 +144,17 @@ impl LiveLane {
         self.wake.take_visible()
     }
 
-    /// Whether the frame should read its sources now. The hidden, source-less and clean cases
-    /// return before any transition, as an unpending frame always did.
+    /// Whether the frame should read its sources now. Hidden lanes retain their wake, and
+    /// source-less lanes consume a local request without sampling anything.
     pub(crate) fn latch_begin(&mut self, can: bool, has_subs: bool) -> bool {
-        if !self.visible() || !has_subs || (!can && !self.state.dirty()) { return false; }
+        if !self.visible() { return false; }
+        if !has_subs {
+            // A live-only handler can skip a rebuild without bindings. This frame consumes its
+            // local wake. A publication after `take` still lives in the shared atomic.
+            if self.dirty() { self.pruned(false); }
+            return false;
+        }
+        if !can && !self.dirty() { return false; }
         self.apply1(LiveEvent::LatchBegin)
     }
 
