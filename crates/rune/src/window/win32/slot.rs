@@ -5,12 +5,13 @@
 //! built from the input that came before the wait, and the input that came during it would wait a
 //! frame more. Instead a surface that wants a frame while the swap chain is full asks a
 //! thread-pool wait to wake the loop when it isn't; the loop then handles every input that came
-//! meanwhile, and the frame is built from all of it. Nothing waits, and no thread runs, while the
-//! surface draws nothing.
+//! meanwhile, and the frame is built from all of it. Claim the first permit too, including after
+//! DXGI resizes a reused swap chain. Skipping it can leave extra permits that allow later FIFO
+//! frames to pile up. Nothing waits, and no thread runs, while the surface draws nothing.
 
 #![allow(unsafe_code)]
 
-use std::ffi::c_void;
+use std::{ffi::c_void, sync::atomic::{AtomicBool, Ordering}};
 
 use windows_sys::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Threading::{
@@ -24,15 +25,13 @@ const GIVE_UP_MS: u32 = 100;
 /// One surface's swap chain, as the next frame sees it: an app window's or an overlay's.
 #[derive(Default)]
 pub(crate) enum Slot {
-    /// No frame of ours is queued (none yet, or the swap chain was made again).
+    /// This frame has not claimed a permit.
     #[default]
-    Free,
-    /// A frame was presented on swap chain `generation`: the next one waits until the object says
-    /// the queue has room.
-    Owed { generation: u64 },
-    /// Owed on `generation` and `source`, and the wait that asks for the next frame is registered
-    /// (dropping it unregisters it).
-    Waiting { #[allow(dead_code)] wait: Wait, generation: u64, source: usize },
+    Unclaimed,
+    /// Can draw or retry this frame until the host actually presents it.
+    Ready { generation: u64, source: usize },
+    /// The wait that asks for the next frame is registered (dropping it unregisters it).
+    Waiting { wait: Wait, generation: u64, source: usize },
 }
 
 /// What the surface's next frame does (`Slot::take`).
@@ -53,68 +52,60 @@ impl Slot {
     /// Takes room on `surface`'s swap chain, using its configure generation and DX12 waitable
     /// handle so any reconfiguration or replacement automatically invalidates stale state.
     pub(crate) fn take_surface(&mut self, surface: &wgpu::Surface, wake: impl Fn() + Send + 'static) -> Take {
-        let generation = crate::window::surface::configure::generation(surface);
-        // SAFETY: the object is the live swap chain's; `Slot` waits on its own duplicated copy.
-        let waitable = unsafe { surface.as_hal::<wgpu::hal::api::Dx12>().and_then(|h| h.waitable_handle()) };
-        self.take(generation, waitable.map(|h| h.0), wake)
+        let (generation, waitable) = surface_slot(surface);
+        self.take(generation, waitable, Some(wake))
+    }
+
+    /// Claim a ready permit for a synchronous frame, such as a size-matched native resize. Those
+    /// frames can draw within the current message even if the compositor still owns the permit.
+    pub(crate) fn take_without_wait(&mut self, surface: &wgpu::Surface) {
+        let (generation, waitable) = surface_slot(surface);
+        self.take(generation, waitable, None::<fn()>);
     }
 
     /// The frame about to draw takes the swap chain's room, or waits for it. `generation` is the
     /// surface's last successful configure number; `waitable` is the swap chain's object; `wake`
-    /// asks the loop for the frame from the thread-pool thread.
-    pub(crate) fn take(&mut self, generation: u64, waitable: Option<HANDLE>, wake: impl Fn() + Send + 'static) -> Take {
+    /// asks the loop for the frame from the thread-pool thread. `None` draws synchronously.
+    fn take(&mut self, generation: u64, waitable: Option<HANDLE>, wake: Option<impl Fn() + Send + 'static>) -> Take {
+        let Some(object) = waitable else { self.reset(); return Take::Draw; };
+        let source = object as usize;
+        self.came_back();
         match *self {
-            Slot::Free => Take::Draw,
-            Slot::Waiting { generation: waited, source, .. } => {
-                if waited == generation && waitable.is_some_and(|h| h as usize == source) {
-                    Take::Later
-                } else {
-                    // The swap chain was reconfigured, replaced, or lost since the wait started.
-                    *self = Slot::Free;
-                    Take::Draw
-                }
-            }
-            Slot::Owed { generation: owed } => {
-                if owed != generation {
-                    *self = Slot::Free;
-                    return Take::Draw;
-                }
-                let Some(object) = waitable else { *self = Slot::Free; return Take::Draw };
-                // SAFETY: the swap chain's live object; a zero timeout only polls it (and takes its
-                // count when it's signalled).
-                if unsafe { WaitForSingleObject(object, 0) } == WAIT_OBJECT_0 {
-                    *self = Slot::Free;
-                    return Take::Draw;
-                }
-                match Wait::register(object, Box::new(wake)) {
-                    Some(wait) => {
-                        *self = Slot::Waiting { wait, generation, source: object as usize };
-                        Take::Later
-                    }
-                    // No thread-pool wait: draw, and let `acquire` find what it finds.
-                    None => { *self = Slot::Free; Take::Draw }
-                }
-            }
+            Slot::Ready { generation: g, source: s } if g == generation && s == source => return Take::Draw,
+            Slot::Waiting { generation: g, source: s, .. } if g == generation && s == source && wake.is_some() => return Take::Later,
+            _ => self.reset(),
         }
+        // SAFETY: zero-timeout wait on a live swap-chain handle claims one available permit.
+        let claimed = unsafe { WaitForSingleObject(object, 0) } == WAIT_OBJECT_0;
+        if !claimed && let Some(wake) = wake && let Some(wait) = Wait::register(object, Box::new(wake)) {
+            *self = Slot::Waiting { wait, generation, source };
+            return Take::Later;
+        }
+        *self = Slot::Ready { generation, source };
+        Take::Draw
     }
 
-    /// The registered wait came back: the swap chain has room (its count is ours now).
-    pub(crate) fn came_back(&mut self) {
-        if matches!(self, Slot::Waiting { .. }) { *self = Slot::Free; }
+    /// Use this wait's completion. A queued wake from a replaced swap chain cannot grant room.
+    pub(crate) fn came_back(&mut self) -> bool {
+        if let Slot::Waiting { wait, generation, source } = self && wait.completed() {
+            *self = Slot::Ready { generation: *generation, source: *source };
+            return true;
+        }
+        false
     }
 
     /// A frame was presented on `surface`.
-    pub(crate) fn presented_surface(&mut self, surface: &wgpu::Surface) {
-        self.presented(crate::window::surface::configure::generation(surface));
-    }
+    pub(crate) fn presented(&mut self) { self.reset(); }
 
-    /// A frame was presented on swap chain `generation`.
-    pub(crate) fn presented(&mut self, generation: u64) {
-        *self = Slot::Owed { generation };
-    }
+    /// Discard the old frame's reservation and cancel any outstanding wait.
+    pub(crate) fn reset(&mut self) { *self = Slot::Unclaimed; }
+}
 
-    /// The swap chain was configured again or replaced: nothing of ours is queued on it.
-    pub(crate) fn reset(&mut self) { *self = Slot::Free; }
+fn surface_slot(surface: &wgpu::Surface) -> (u64, Option<HANDLE>) {
+    let generation = crate::window::surface::configure::generation(surface);
+    // SAFETY: the live swap chain's object, used here or duplicated before registering a wait.
+    let waitable = unsafe { surface.as_hal::<wgpu::hal::api::Dx12>().and_then(|h| h.waitable_handle()) };
+    (generation, waitable.map(|h| h.0).filter(|h| !h.is_null()))
 }
 
 /// A one-shot thread-pool wait on a copy of the swap chain's object, so wgpu closing its handle
@@ -122,7 +113,12 @@ impl Slot {
 pub(crate) struct Wait {
     wait: HANDLE,
     object: HANDLE,
-    wake: *mut Box<dyn Fn() + Send>,
+    callback: *mut Callback,
+}
+
+struct Callback {
+    wake: Box<dyn Fn() + Send>,
+    done: AtomicBool,
 }
 
 impl Wait {
@@ -131,35 +127,43 @@ impl Wait {
         // SAFETY: duplicates a live handle of this process into this process.
         let ok = unsafe { DuplicateHandle(GetCurrentProcess(), object, GetCurrentProcess(), &mut copy, 0, 0, DUPLICATE_SAME_ACCESS) };
         if ok == 0 { return None; }
-        let wake = Box::into_raw(Box::new(wake));
+        let callback = Box::into_raw(Box::new(Callback { wake, done: AtomicBool::new(false) }));
         let mut wait: HANDLE = std::ptr::null_mut();
-        // SAFETY: `wake` lives until `drop` has unregistered the wait and its callback is done;
-        // the callback only calls it.
-        let ok = unsafe { RegisterWaitForSingleObject(&mut wait, copy, Some(came), wake.cast(), GIVE_UP_MS, WT_EXECUTEONLYONCE | WT_EXECUTEINWAITTHREAD) };
+        // SAFETY: `callback` stays at this address through registration and unregistration.
+        let ok = unsafe { RegisterWaitForSingleObject(&mut wait, copy, Some(came), callback.cast(), GIVE_UP_MS, WT_EXECUTEONLYONCE | WT_EXECUTEINWAITTHREAD) };
         if ok == 0 {
             // SAFETY: both are ours and unused.
-            unsafe { drop(Box::from_raw(wake)); CloseHandle(copy); }
+            unsafe {
+                drop(Box::from_raw(callback));
+                CloseHandle(copy);
+            }
             return None;
         }
-        Some(Wait { wait, object: copy, wake })
+        Some(Wait { wait, object: copy, callback })
+    }
+
+    fn completed(&self) -> bool {
+        // SAFETY: this wait owns the context, and the callback shares only atomic state here.
+        unsafe { (*self.callback).done.load(Ordering::Acquire) }
     }
 }
 
 impl Drop for Wait {
     fn drop(&mut self) {
-        // SAFETY: waits for a running callback to finish, so `wake` is no longer in use.
+        // SAFETY: waits for a running callback to finish before dropping its context.
         unsafe {
             UnregisterWaitEx(self.wait, INVALID_HANDLE_VALUE);
-            drop(Box::from_raw(self.wake));
+            drop(Box::from_raw(self.callback));
             CloseHandle(self.object);
         }
     }
 }
 
 unsafe extern "system" fn came(context: *mut c_void, _timed_out: bool) {
-    // SAFETY: the `Box` `register` made, alive until the wait is unregistered.
-    let wake = unsafe { &*(context as *const Box<dyn Fn() + Send>) };
-    wake();
+    // SAFETY: the callback context stays alive until this wait has been unregistered.
+    let callback = unsafe { &*context.cast::<Callback>() };
+    callback.done.store(true, Ordering::Release);
+    (callback.wake)();
 }
 
 #[cfg(test)]

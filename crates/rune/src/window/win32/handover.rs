@@ -245,6 +245,7 @@ impl Host {
         }
         let SurfaceMode::HandingOver { done, readback, paused: false, .. } = &mut l.native.mode else { return };
         let Some(surface) = l.surface.as_ref() else { return };
+        l.native.slot.take_without_wait(surface);
         let Ok(frame) = acquire(surface, gpu, &l.config, l.surface_ok, 1, &mut self.meter) else { return };
         let target_format = if self.app.rt().srgb_blend() { l.config.format.remove_srgb_suffix() } else { l.config.format };
         debug_assert_eq!(renderer.format(), target_format);
@@ -290,9 +291,7 @@ impl Host {
         });
         renderer.submit(&gpu.queue, enc);
         gpu.queue.present(frame);
-        if let Some(surface) = l.surface.as_ref() {
-            l.native.slot.presented_surface(surface);
-        }
+        l.native.slot.presented();
         let flag = Arc::new(AtomicBool::new(false));
         let set = flag.clone();
         gpu.queue.on_submitted_work_done(move || set.store(true, Ordering::Release));

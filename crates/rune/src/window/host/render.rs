@@ -425,9 +425,7 @@ pub(super) fn present_window_frame(
     #[cfg(not(target_os = "windows"))]
     let _ = (resizing, renderer, prepared.size);
     #[cfg(target_os = "windows")]
-    if let Some(surface) = l.surface.as_ref() {
-        l.native.slot.presented_surface(surface);
-    }
+    l.native.slot.presented();
     #[cfg(target_os = "windows")]
     let present_completed = crate::window::win32::live_resize::complete_present_after(resizing, || {
         // A swap chain made again on a handed-over window's visual takes over now (`cpu_frame`).

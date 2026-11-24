@@ -1,0 +1,1 @@
+- Claim DXGI frame-latency permits after swap-chain resize so accumulated signals cannot enqueue a burst of stale Windows frames. Ignore wake events from replaced swap-chain waits.

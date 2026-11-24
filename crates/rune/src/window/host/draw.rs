@@ -265,9 +265,13 @@ impl FrameHost for WindowFrame<'_> {
         // The swap chain still holds a frame the compositor hasn't shown: this one draws when it
         // has room, built from the input that came by then (`slot`).
         #[cfg(target_os = "windows")]
-        if !hidden && let Some(l) = self.host.win.as_mut() && let Some(surface) = l.surface.as_ref() {
-            let handle = self.host.native_handle.clone();
-            if l.native.slot.take_surface(surface, move || handle.send(WakeEvent::FrameSlot)) == slot::Take::Later { return Gate::Skip; }
+        if let Some(l) = self.host.win.as_mut() && let Some(surface) = l.surface.as_ref() {
+            if self.resizing || hidden {
+                l.native.slot.take_without_wait(surface);
+            } else {
+                let handle = self.host.native_handle.clone();
+                if l.native.slot.take_surface(surface, move || handle.send(WakeEvent::FrameSlot)) == slot::Take::Later { return Gate::Skip; }
+            }
         }
         let Some(l) = self.host.win.as_mut() else { return Gate::Skip };
         #[cfg(target_os = "windows")]

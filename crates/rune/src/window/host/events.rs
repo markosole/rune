@@ -167,8 +167,7 @@ impl Host {
             WakeEvent::FrameSlot(_) => {
                 // The frame that waited for room in the swap chain draws now, after the input
                 // that came meanwhile.
-                if let Some(w) = &mut self.win && w.native.slot.waiting() {
-                    w.native.slot.came_back();
+                if let Some(w) = &mut self.win && w.native.slot.came_back() {
                     w.request_redraw();
                 }
             }

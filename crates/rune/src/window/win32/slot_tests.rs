@@ -1,7 +1,7 @@
 #![allow(unsafe_code)]
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-use windows_sys::Win32::System::Threading::CreateEventW;
+use windows_sys::Win32::System::Threading::{CreateEventW, CreateSemaphoreW, ReleaseSemaphore, SetEvent};
 
 use super::{Slot, Take};
 
@@ -14,6 +14,10 @@ impl Event {
         assert!(!handle.is_null());
         Self(handle)
     }
+}
+
+fn take(slot: &mut Slot, generation: u64, object: Option<HANDLE>) -> Take {
+    slot.take(generation, object, Some(|| {}))
 }
 
 impl Drop for Event {
@@ -29,22 +33,21 @@ fn slot_resets_when_swap_chain_waitable_changes_or_disappears() {
     let new_waitable = Event::new(true);
 
     let mut slot = Slot::default();
-    slot.presented(1);
-    assert_eq!(slot.take(1, Some(old_waitable.0), || {}), Take::Later, "unsignalled swap chain waits");
+    assert_eq!(take(&mut slot, 1, Some(old_waitable.0)), Take::Later, "even the first frame waits");
     assert!(slot.waiting());
 
     // Swap chain was reconfigured or replaced (new waitable object, or surface lost/none).
     assert_eq!(
-        slot.take(1, Some(new_waitable.0), || {}),
+        take(&mut slot, 1, Some(new_waitable.0)),
         Take::Draw,
         "a new swap chain must not stay blocked on the replaced swap chain's wait"
     );
     assert!(!slot.waiting());
 
-    slot.presented(2);
-    assert_eq!(slot.take(2, Some(old_waitable.0), || {}), Take::Later);
+    slot.presented();
+    assert_eq!(take(&mut slot, 2, Some(old_waitable.0)), Take::Later);
     assert_eq!(
-        slot.take(2, None, || {}),
+        take(&mut slot, 2, None),
         Take::Draw,
         "losing the waitable handle must clear the stale wait"
     );
@@ -54,26 +57,21 @@ fn slot_resets_when_swap_chain_waitable_changes_or_disappears() {
 #[test]
 fn slot_resets_when_surface_configure_generation_advances() {
     let waitable = Event::new(false);
+    let ready = Event::new(true);
     let mut slot = Slot::default();
 
     // Waiting on generation 1, then swap chain reconfigured (generation 2) with the same handle.
-    slot.presented(1);
-    assert_eq!(slot.take(1, Some(waitable.0), || {}), Take::Later);
+    assert_eq!(take(&mut slot, 1, Some(waitable.0)), Take::Later);
     assert!(slot.waiting());
-    assert_eq!(slot.take(2, Some(waitable.0), || {}), Take::Draw);
-    assert!(!slot.waiting());
+    assert_eq!(take(&mut slot, 2, Some(waitable.0)), Take::Later);
+    assert!(!slot.came_back(), "an old queued wake cannot release the replacement wait");
 
-    // Owed on generation 2, then swap chain reconfigured (generation 3) before next take.
-    slot.presented(2);
-    assert_eq!(slot.take(3, Some(waitable.0), || {}), Take::Draw);
-    assert!(!slot.waiting());
-
-    // Explicit reset clears both Owed and Waiting immediately.
-    slot.presented(3);
-    assert_eq!(slot.take(3, Some(waitable.0), || {}), Take::Later);
+    // A ready permit for generation 2 cannot be reused for generation 3.
+    assert_eq!(take(&mut slot, 2, Some(ready.0)), Take::Draw);
+    assert_eq!(take(&mut slot, 3, Some(waitable.0)), Take::Later);
     slot.reset();
     assert!(!slot.waiting());
-    assert_eq!(slot.take(3, Some(waitable.0), || {}), Take::Draw);
+    assert_eq!(take(&mut slot, 3, Some(waitable.0)), Take::Later);
 }
 
 #[test]
@@ -82,12 +80,34 @@ fn slot_draws_immediately_when_signalled_or_after_wait_completes() {
     let unsignalled = Event::new(false);
     let mut slot = Slot::default();
 
-    slot.presented(1);
-    assert_eq!(slot.take(1, Some(signalled.0), || {}), Take::Draw);
+    assert_eq!(take(&mut slot, 1, Some(signalled.0)), Take::Draw);
 
-    slot.presented(1);
-    assert_eq!(slot.take(1, Some(unsignalled.0), || {}), Take::Later);
-    slot.came_back();
+    slot.presented();
+    let (send, receive) = std::sync::mpsc::channel();
+    assert_eq!(slot.take(1, Some(unsignalled.0), Some(move || { let _ = send.send(()); })), Take::Later);
+    // SAFETY: this test owns the event for the duration of the wait.
+    assert_ne!(unsafe { SetEvent(unsignalled.0) }, 0);
+    receive.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+    assert!(slot.came_back());
     assert!(!slot.waiting());
-    assert_eq!(slot.take(1, Some(unsignalled.0), || {}), Take::Draw);
+    assert_eq!(take(&mut slot, 1, Some(unsignalled.0)), Take::Draw);
+}
+
+#[test]
+fn synchronous_resize_claims_each_generation_without_banking_permits() {
+    // SAFETY: the test owns an anonymous semaphore with one initial permit, like a DXGI chain.
+    let ready = Event(unsafe { CreateSemaphoreW(std::ptr::null(), 1, 64, std::ptr::null()) });
+    assert!(!ready.0.is_null());
+    let mut slot = Slot::default();
+    for generation in 1..=32 {
+        slot.reset();
+        assert_eq!(slot.take(generation, Some(ready.0), None::<fn()>), Take::Draw);
+        slot.presented();
+        // SAFETY: models the compositor replacing the permit when the frame is released.
+        assert_ne!(unsafe { ReleaseSemaphore(ready.0, 1, std::ptr::null_mut()) }, 0);
+    }
+    assert_eq!(take(&mut slot, 32, Some(ready.0)), Take::Draw);
+    assert_eq!(take(&mut slot, 32, Some(ready.0)), Take::Draw, "an acquire retry reuses the same permit");
+    slot.presented();
+    assert_eq!(take(&mut slot, 32, Some(ready.0)), Take::Later, "no spare permits may admit a burst");
 }
