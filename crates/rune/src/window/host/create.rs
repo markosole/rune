@@ -76,7 +76,7 @@ impl Host {
         let attrs = {
             use winit::platform::windows::WindowAttributesExtWindows;
             let propose = self.options.resizable && !self.options.transparent && !self.options.borderless
-                && self.titlebar.is_none() && crate::env::flag("RUNE_WIN32_STAGE_RESIZE");
+                && self.titlebar.is_none() && !crate::env::flag("RUNE_WIN32_DISABLE_STAGED_RESIZE");
             crate::platform::app_icon::with_icon(attrs.with_visible(false).with_active(false)
                 .with_drag_and_drop(false).with_resize_proposals(propose))
         };

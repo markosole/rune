@@ -89,9 +89,10 @@ impl Host {
             eprintln!("rune resize commit: t={} actual={actual:?}", crate::frame::live_log::now());
         }
         let mut frame = WindowFrame { host: self, resizing: true, stage_size: None, state };
-        let wait = !crate::env::flag("RUNE_WIN32_STAGE_NO_FLUSH");
-        submitted.prefer_latest = crate::env::flag("RUNE_WIN32_STAGE_LATEST_PRESENT");
-        let completed = present_window_frame(frame.host, submitted, wait, frame.state.looped.as_ref(), &mut frame.state.profile, &info);
+        // The new frame is already queued for the GPU. Let DXGI replace intermediate flips
+        // without making the native sizing loop wait for the compositor after each submit.
+        submitted.prefer_latest = true;
+        let completed = present_window_frame(frame.host, submitted, false, frame.state.looped.as_ref(), &mut frame.state.profile, &info);
         host_step::record_presented(&mut frame, completed, &info);
         frame.settle(completed, &info);
         true

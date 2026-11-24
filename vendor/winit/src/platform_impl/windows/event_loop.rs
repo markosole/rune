@@ -50,7 +50,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, GIDC_ARRIVAL, GIDC_REMOVAL, GWL_STYLE, GWL_USERDATA, HTCAPTION, HTCLIENT,
     MINMAXINFO, MNC_CLOSE, MSG, MWMO_INPUTAVAILABLE, NCCALCSIZE_PARAMS, PM_REMOVE, PT_PEN,
     PT_TOUCH, QS_ALLINPUT, RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL, SC_MINIMIZE, SC_RESTORE,
-    SIZE_MAXIMIZED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WHEEL_DELTA,
+    SIZE_MAXIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WHEEL_DELTA,
     WINDOWPOS,
     WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOP, WMSZ_TOPLEFT,
     WMSZ_TOPRIGHT, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED,
@@ -135,9 +135,9 @@ impl WindowData {
         self.window_state.lock().unwrap()
     }
 
-    fn propose_window_size(&self, window: HWND, position: WINDOWPOS) -> bool {
+    fn propose_window_size(&self, window: HWND, position: WINDOWPOS) {
         if position.flags & SWP_NOSIZE != 0 {
-            return false;
+            return;
         }
         {
             let state = self.window_state_lock();
@@ -147,17 +147,17 @@ impl WindowData {
                 )
                 || state.fullscreen.is_some()
             {
-                return false;
+                return;
             }
         }
         // A proposal is a synchronous opportunity. Never queue one behind a nested callback.
         if self.event_loop_runner.should_buffer() {
-            return false;
+            return;
         }
         let (Ok(previous), Ok(client)) = (
             util::WindowArea::Outer.get_rect(window),
             util::WindowArea::Inner.get_rect(window),
-        ) else { return false };
+        ) else { return };
         let (left, top) = if position.flags & SWP_NOMOVE != 0 {
             (previous.left, previous.top)
         } else {
@@ -167,7 +167,7 @@ impl WindowData {
         // Corrections at a monitor/DPI boundary belong to the committed resize event.
         let monitor = unsafe { MonitorFromRect(&previous, MONITOR_DEFAULTTONULL) };
         if monitor == 0 || monitor != unsafe { MonitorFromRect(&outer, MONITOR_DEFAULTTONULL) } {
-            return false;
+            return;
         }
         let width_change = (outer.right - outer.left) - (previous.right - previous.left);
         let height_change = (outer.bottom - outer.top) - (previous.bottom - previous.top);
@@ -178,9 +178,7 @@ impl WindowData {
                 window_id: RootWindowId(WindowId(window)),
                 event: WindowEvent::ResizeProposed(PhysicalSize::new(width as u32, height as u32)),
             });
-            return true;
         }
-        false
     }
 }
 
@@ -1455,12 +1453,7 @@ unsafe fn public_window_callback_inner(
             // The next step is the native bounds mutation. A prepared drawable stays unpresented
             // until the resulting WM_SIZE confirms its dimensions.
             let position = unsafe { *(lparam as *const WINDOWPOS) };
-            if userdata.propose_window_size(window, position)
-                && std::env::var_os("RUNE_WIN32_STAGE_NO_COPY").is_some_and(|v| v == "1")
-            {
-                // Native client bits belong to the old layout. The GPU staged a full redraw.
-                unsafe { (*(lparam as *mut WINDOWPOS)).flags |= SWP_NOCOPYBITS };
-            }
+            userdata.propose_window_size(window, position);
             result = ProcResult::Value(0);
         },
 

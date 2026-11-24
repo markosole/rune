@@ -144,7 +144,11 @@ impl Host {
         // Windows: a window still on the CPU renderer draws there (`cpu_frame`).
         #[cfg(target_os = "windows")]
         {
-            if self.win.as_ref().is_some_and(|w| w.native.resize.pending()) { return; }
+            if let Some(w) = self.win.as_ref().filter(|w| w.native.resize.pending()) {
+                if crate::platform::win32::in_size_move(&w.window) { return; }
+                // Redraw can reach us before a deferred gesture-end notification.
+                self.end_live_resize();
+            }
             self.look();
             self.hand_over_if_done();
             if self.win.as_ref().is_some_and(|w| w.native.mode.cpu_draws()) { return self.draw_cpu(resizing); }

@@ -240,6 +240,11 @@ impl Host {
         }
         if matches!(&event, WindowEvent::ScaleFactorChanged { .. }) { self.apply_placement(event_loop); }
         #[cfg(target_os = "windows")]
+        let had_resize_proposal = matches!(&event, WindowEvent::Resized(_))
+            && self.win.as_ref().is_some_and(|w| w.native.resize.pending());
+        #[cfg(not(target_os = "windows"))]
+        let had_resize_proposal = false;
+        #[cfg(target_os = "windows")]
         if let WindowEvent::Resized(size) = &event && self.present_live_resize(*size) {
             self.sync_origin();
             self.shell(event_loop);
@@ -346,7 +351,7 @@ impl Host {
                 // A frame Rune moved itself has its drawable and viewport already.
                 let resized = l.resize_surface(gpu, size);
                 let viewport = (size.width as f32 / scale, size.height as f32 / scale);
-                if !resized && viewport == app.rt().window_viewport() && scale == app.rt().window_scale() {
+                if !had_resize_proposal && !resized && viewport == app.rt().window_viewport() && scale == app.rt().window_scale() {
                     if restored || origin_moved { l.request_redraw(); }
                     return;
                 }

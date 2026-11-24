@@ -1,1 +1,2 @@
-- Add an opt-in Windows diagnostic path for preparing a resize frame before the client changes and comparing the resulting DXGI flip timing.
+- Prepare frames before eligible Windows sizing gestures change the client bounds. Publish only matching frames and let DXGI replace superseded flips without blocking the sizing loop on the compositor.
+- Recover from unmatched or dropped resize frames so ordinary redraws can resume after the gesture. Set `RUNE_WIN32_DISABLE_STAGED_RESIZE=1` to use the previous path for comparison.
