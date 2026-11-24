@@ -160,6 +160,15 @@ pub enum WindowEvent {
     /// The size of the window has changed. Contains the client area's new dimensions.
     Resized(PhysicalSize<u32>),
 
+    /// A client size proposed during a native Windows sizing gesture. The window still has its
+    /// old bounds; `Resized` reports the size Windows actually commits.
+    #[cfg(target_os = "windows")]
+    ResizeProposed(PhysicalSize<u32>),
+
+    /// Windows ended the native move/size gesture, including cancellation.
+    #[cfg(target_os = "windows")]
+    ResizeGestureEnded,
+
     /// The position of the window has changed. Contains the window's new position.
     ///
     /// ## Platform-specific

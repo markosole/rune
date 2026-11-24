@@ -136,6 +136,9 @@ impl Win {
     pub(in crate::window) fn resize_surface(&mut self, gpu: Option<&Gpu>, size: winit::dpi::PhysicalSize<u32>) -> bool {
         let (width, height) = (size.width.max(1), size.height.max(1));
         if (self.config.width, self.config.height) == (width, height) { return false; }
+        // Drop an unmatched back buffer before swap-chain reconfiguration.
+        #[cfg(target_os = "windows")]
+        { self.native.resize = Default::default(); }
         self.config.width = width;
         self.config.height = height;
         // No surface: `Host::reattach` is between the old one and the new, and takes this size

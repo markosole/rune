@@ -348,23 +348,48 @@ pub(super) fn render_window_frame(
     comp_animating
 }
 
-#[allow(unsafe_code)]
-pub(super) fn submit_and_present_window(
+pub(super) struct SubmittedWindowFrame {
+    pub(super) frame: wgpu::SurfaceTexture,
+    pub(super) size: (u32, u32),
+    #[cfg(target_os = "windows")]
+    present_rect: Option<Vec<[i32; 4]>>,
+    #[cfg(target_os = "windows")]
+    pub(super) prefer_latest: bool,
+}
+
+pub(super) fn submit_window_frame(
     host: &mut Host,
     prepared: PreparedWindowFrame,
+    profile: &mut FrameProfile,
+    encoded: &mut Option<Instant>,
+) -> Option<SubmittedWindowFrame> {
+    let (gpu, renderer) = host.gpu.as_mut()?;
+    renderer.submit(&gpu.queue, prepared.encoder);
+    profile.mark_submitted();
+    crate::marks::mark_once(&FIRST_ENCODED, "frame.first.encoded");
+    *encoded = host.frame_reports.stamp();
+    Some(SubmittedWindowFrame {
+        frame: prepared.frame,
+        size: prepared.size,
+        #[cfg(target_os = "windows")]
+        present_rect: prepared.present_rect,
+        #[cfg(target_os = "windows")]
+        prefer_latest: false,
+    })
+}
+
+#[allow(unsafe_code)]
+pub(super) fn present_window_frame(
+    host: &mut Host,
+    prepared: SubmittedWindowFrame,
     resizing: bool,
     looped: Option<&Vec<u32>>,
     profile: &mut FrameProfile,
-    encoded: &mut Option<Instant>,
     info: &StepInfo,
 ) -> Instant {
     let (Some(l), Some((gpu, renderer))) = (host.win.as_mut(), host.gpu.as_mut()) else {
         return crate::time::now();
     };
-    renderer.submit(&gpu.queue, prepared.encoder);
-    profile.mark_submitted();
-    crate::marks::mark_once(&FIRST_ENCODED, "frame.first.encoded");
-    *encoded = host.frame_reports.stamp();
     l.window.pre_present_notify();
     #[cfg(target_os = "macos")]
     {
@@ -372,11 +397,15 @@ pub(super) fn submit_and_present_window(
         l.native.materials.present(rt.paint.materials(), rt.env.scale, || gpu.queue.present(prepared.frame));
     }
     #[cfg(target_os = "windows")]
-    if let (Some(rects), Some(surface)) = (&prepared.present_rect, l.surface.as_ref())
-        // SAFETY: only names the rectangles the next present changed.
+    if (prepared.prefer_latest || prepared.present_rect.is_some())
+        && let Some(surface) = l.surface.as_ref()
+        // SAFETY: only sets metadata for the next present on this window's surface.
         && let Some(hal) = unsafe { surface.as_hal::<wgpu::hal::api::Dx12>() } {
-        let rects: Vec<_> = rects.iter().map(|&[left, top, right, bottom]| windows::Win32::Foundation::RECT { left, top, right, bottom }).collect();
-        hal.set_present_rects(&rects);
+        if let Some(rects) = &prepared.present_rect {
+            let rects: Vec<_> = rects.iter().map(|&[left, top, right, bottom]| windows::Win32::Foundation::RECT { left, top, right, bottom }).collect();
+            hal.set_present_rects(&rects);
+        }
+        if prepared.prefer_latest { hal.prefer_latest_present_once(); }
     }
     #[cfg(not(target_os = "macos"))]
     gpu.queue.present(prepared.frame);
@@ -394,7 +423,7 @@ pub(super) fn submit_and_present_window(
         );
     }
     #[cfg(not(target_os = "windows"))]
-    let _ = resizing;
+    let _ = (resizing, renderer, prepared.size);
     #[cfg(target_os = "windows")]
     if let Some(surface) = l.surface.as_ref() {
         l.native.slot.presented_surface(surface);

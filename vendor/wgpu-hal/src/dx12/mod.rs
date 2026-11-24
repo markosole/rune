@@ -633,6 +633,8 @@ struct SwapChain {
     size: wgt::Extent3d,
     /// Rune: what the next present changed (Surface::set_present_rects); empty is all of it.
     dirty: Vec<Foundation::RECT>,
+    /// Rune: this resize present can replace earlier queued frames, without allowing tearing.
+    prefer_latest: bool,
 }
 
 enum SurfaceTarget {
@@ -675,6 +677,13 @@ impl Surface {
         if let Some(sc) = self.swap_chain.write().as_mut() {
             sc.dirty.clear();
             sc.dirty.extend_from_slice(rects);
+        }
+    }
+
+    /// Rune: use DXGI's zero sync interval for the next flip, leaving tearing disabled.
+    pub fn prefer_latest_present_once(&self) {
+        if let Some(sc) = self.swap_chain.write().as_mut() {
+            sc.prefer_latest = true;
         }
     }
 
@@ -2015,6 +2024,7 @@ impl crate::Surface for Surface {
             format: config.format,
             size: config.extent,
             dirty: Vec::new(),
+            prefer_latest: false,
         });
 
         Ok(())
@@ -2185,12 +2195,16 @@ impl crate::Queue for Queue {
         let sc = swapchain.as_mut().unwrap();
         sc.acquired_count -= 1;
 
-        let (interval, flags) = match sc.present_mode {
-            // We only allow immediate if ALLOW_TEARING is valid.
-            wgt::PresentMode::Immediate => (0, Dxgi::DXGI_PRESENT_ALLOW_TEARING),
-            wgt::PresentMode::Mailbox => (0, Dxgi::DXGI_PRESENT::default()),
-            wgt::PresentMode::Fifo => (1, Dxgi::DXGI_PRESENT::default()),
-            m => unreachable!("Cannot make surface with present mode {m:?}"),
+        let (interval, flags) = if mem::take(&mut sc.prefer_latest) {
+            (0, Dxgi::DXGI_PRESENT::default())
+        } else {
+            match sc.present_mode {
+                // We only allow immediate if ALLOW_TEARING is valid.
+                wgt::PresentMode::Immediate => (0, Dxgi::DXGI_PRESENT_ALLOW_TEARING),
+                wgt::PresentMode::Mailbox => (0, Dxgi::DXGI_PRESENT::default()),
+                wgt::PresentMode::Fifo => (1, Dxgi::DXGI_PRESENT::default()),
+                m => unreachable!("Cannot make surface with present mode {m:?}"),
+            }
         };
 
         profiling::scope!("IDXGISwapchain3::Present");

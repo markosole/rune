@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use super::Host;
 use super::render::{
     FrameProfile, PreparedWindowFrame, open_trace_if_needed, prepare_window_render,
-    record_trace_frame, render_window_frame, submit_and_present_window,
+    present_window_frame, record_trace_frame, render_window_frame, submit_window_frame,
 };
 use super::stepping::FrameMove;
 use crate::frame::clock::FrameClock;
@@ -144,11 +144,16 @@ impl Host {
         // Windows: a window still on the CPU renderer draws there (`cpu_frame`).
         #[cfg(target_os = "windows")]
         {
+            if self.win.as_ref().is_some_and(|w| w.native.resize.pending()) { return; }
             self.look();
             self.hand_over_if_done();
             if self.win.as_ref().is_some_and(|w| w.native.mode.cpu_draws()) { return self.draw_cpu(resizing); }
         }
-        let mut frame = WindowFrame { host: self, resizing, state: FrameState::default() };
+        let mut frame = WindowFrame {
+            host: self, resizing, state: FrameState::default(),
+            #[cfg(target_os = "windows")]
+            stage_size: None,
+        };
         host_step::run(&mut frame);
     }
 }
@@ -177,13 +182,25 @@ struct FrameState {
     post_acquire_done: bool,
     now: Option<Instant>,
     encoded: Option<Instant>,
+    #[cfg(target_os = "windows")]
+    staged: Option<(super::render::SubmittedWindowFrame, StepInfo)>,
 }
 
 struct WindowFrame<'a> {
     host: &'a mut Host,
     resizing: bool,
     state: FrameState,
+    #[cfg(target_os = "windows")]
+    stage_size: Option<ResizeSize>,
 }
+
+#[cfg(target_os = "windows")]
+#[path = "resize_stage.rs"]
+mod resize_stage;
+#[cfg(target_os = "windows")]
+pub(in crate::window) use resize_stage::ResizeStage;
+#[cfg(target_os = "windows")]
+use resize_stage::ResizeSize;
 
 impl WindowFrame<'_> {
     fn reblend_surface(&mut self) -> bool {
@@ -604,15 +621,25 @@ impl FrameHost for WindowFrame<'_> {
     }
 
     fn submit_and_present(&mut self, prepared: PreparedWindowFrame, info: &StepInfo) -> Instant {
-        submit_and_present_window(
+        let Some(submitted) = submit_window_frame(self.host, prepared, &mut self.state.profile, &mut self.state.encoded) else {
+            return crate::time::now();
+        };
+        present_window_frame(
             self.host,
-            prepared,
+            submitted,
             self.resizing,
             self.state.looped.as_ref(),
             &mut self.state.profile,
-            &mut self.state.encoded,
             info,
         )
+    }
+
+    #[cfg(target_os = "windows")]
+    fn stage_for_resize(&mut self, prepared: PreparedWindowFrame, info: &StepInfo) -> Option<PreparedWindowFrame> {
+        if self.stage_size.is_none() { return Some(prepared); }
+        self.state.staged = submit_window_frame(self.host, prepared, &mut self.state.profile, &mut self.state.encoded)
+            .map(|frame| (frame, *info));
+        None
     }
 
     fn present_targets(&mut self) -> (Option<&mut FrameClock>, &mut RuntimeCore) {

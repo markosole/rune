@@ -23,9 +23,8 @@ mod windows {
         GetAsyncKeyState, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, VK_LBUTTON, mouse_event,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        BringWindowToTop, EnumWindows, GetClientRect, GetForegroundWindow, GetWindowRect,
-        GetWindowThreadProcessId, IsWindowVisible, SendMessageTimeoutW, SetCursorPos,
-        SetForegroundWindow, HTBOTTOM, SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_NCLBUTTONDOWN,
+        BringWindowToTop, EnumWindows, GetClientRect, GetForegroundWindow, GetWindowLongW, GetWindowRect,
+        GetWindowThreadProcessId, IsWindowVisible, SetCursorPos, SetForegroundWindow, GWL_STYLE, WS_THICKFRAME,
     };
     use windows_sys::core::BOOL;
 
@@ -40,6 +39,7 @@ mod windows {
     struct FindWindow {
         pid: u32,
         found: HWND,
+        count: u32,
     }
 
     unsafe extern "system" fn find_window(hwnd: HWND, data: LPARAM) -> BOOL {
@@ -49,24 +49,23 @@ mod windows {
         // SAFETY: `hwnd` came from EnumWindows and `pid` is writable for this call.
         unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
         // SAFETY: `hwnd` came from EnumWindows and remains valid during the callback.
-        let visible = unsafe { IsWindowVisible(hwnd) } != 0;
-        if pid == find.pid && visible {
+        let usable = unsafe { IsWindowVisible(hwnd) != 0 && GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_THICKFRAME != 0 };
+        if pid == find.pid && usable {
             find.found = hwnd;
-            return 0;
+            find.count += 1;
         }
         1
     }
 
-    fn find_process_window() -> Result<HWND, String> {
+    fn find_process_window(pid: u32) -> Result<HWND, String> {
         let mut find = FindWindow {
-            // SAFETY: process IDs require no additional lifetime or ownership.
-            pid: unsafe { GetCurrentProcessId() },
+            pid,
             ..Default::default()
         };
         // SAFETY: callback and context remain valid until this synchronous enumeration returns.
         unsafe { EnumWindows(Some(find_window), &mut find as *mut FindWindow as LPARAM) };
-        if find.found.is_null() {
-            Err("could not find the Rune fixture window".into())
+        if find.count != 1 {
+            Err(format!("expected one visible window for test process, found {}", find.count))
         } else {
             Ok(find.found)
         }
@@ -168,14 +167,19 @@ mod windows {
             let hwnd = hwnd as HWND;
             std::thread::sleep(Duration::from_millis(80));
             let mut sizes = BTreeSet::from([initial]);
-            let offsets = (1..=20)
-                .map(|step| -8 * step)
-                .chain((0..20).rev().map(|step| -8 * step));
+            let (steps, pixels, delay) = if fast_drag() {
+                (20, 20, Duration::from_millis(10))
+            } else {
+                (20, 8, STEP)
+            };
+            let offsets = (1..=steps)
+                .map(|step| -pixels * step)
+                .chain((0..steps).rev().map(|step| -pixels * step));
             for offset in offsets {
                 // SAFETY: this walks the cursor through the bounded edge-drag sequence.
                 let moved = unsafe { SetCursorPos(x, bottom + offset) };
                 checked(moved, "SetCursorPos(gesture)")?;
-                std::thread::sleep(STEP);
+                std::thread::sleep(delay);
                 sizes.insert(client_size(hwnd)?);
             }
             Ok(sizes)
@@ -189,12 +193,15 @@ mod windows {
         }
     }
 
+    fn fast_drag() -> bool { rune::env::flag("RUNE_FIXTURE_FAST_RESIZE") }
+
     fn drag_bottom_edge_once(hwnd: HWND, attempt: usize) -> Result<usize, String> {
         let outer = rect(hwnd, false)?;
         let initial = client_size(hwnd)?;
         eprintln!(
-            "LIVE_RESIZE_BEGIN attempt={} outer={}x{} client={}x{}",
+            "LIVE_RESIZE_BEGIN attempt={} origin={},{} outer={}x{} client={}x{}",
             attempt,
+            outer.left, outer.top,
             outer.right - outer.left,
             outer.bottom - outer.top,
             initial.0,
@@ -208,39 +215,17 @@ mod windows {
         let moved = unsafe { SetCursorPos(x, bottom) };
         checked(moved, "SetCursorPos(edge)")?;
         set_left_button(true)?;
-        let hwnd_value = hwnd as usize;
-        let mover = std::thread::Builder::new()
-            .name("native-resize-mover".into())
-            .spawn(move || move_sizing_cursor(hwnd_value, x, bottom, initial));
-        let mover = match mover {
-            Ok(mover) => mover,
-            Err(error) => {
-                if let Err(release) = set_left_button(false) {
-                    eprintln!("LIVE_RESIZE_NOTE spawn-failure release failed: {release}");
-                }
-                return Err(format!("could not start native resize mover: {error}"));
-            }
-        };
-        let point = ((bottom as u16 as u32) << 16) | u32::from(x as u16);
-        let mut message_result = 0;
-        // SAFETY: `hwnd` is live; the bounded timeout prevents a hung modal loop, while the mover
-        // thread supplies the matching cursor motion and verified button release.
-        let sent = unsafe {
-            SendMessageTimeoutW(
-                hwnd,
-                WM_NCLBUTTONDOWN,
-                HTBOTTOM as usize,
-                point as LPARAM,
-                SMTO_BLOCK | SMTO_ABORTIFHUNG,
-                5000,
-                &mut message_result,
-            )
-        };
-        let mut sizes = mover.join().map_err(|_| "native resize mover panicked".to_string())??;
-        if sent == 0 { return Err("SendMessageTimeoutW(WM_NCLBUTTONDOWN) failed or timed out".into()); }
+        // The actual pointer press enters the system's sizing loop. Sending an additional
+        // WM_NCLBUTTONDOWN can enter a second loop after the first button release.
+        let mut sizes = move_sizing_cursor(hwnd as usize, x, bottom, initial)?;
         std::thread::sleep(Duration::from_millis(1000));
         let final_size = client_size(hwnd)?;
         sizes.insert(final_size);
+        if fast_drag() && (final_size != initial || sizes.iter().any(|&(w, h)| {
+            w != initial.0 || h < initial.1 - 402 || h > initial.1 + 2
+        })) {
+            return Err(format!("fast drag escaped its expected bounds: {sizes:?}"));
+        }
         if !sizes.iter().any(|&size| size != initial) {
             return Err("native client geometry never changed during the sizing gesture".into());
         }
@@ -303,11 +288,32 @@ mod windows {
     }
 
     pub(super) fn run() {
+        if let Some(value) = std::env::args().nth(1) && let Some(pid) = value.strip_prefix("--inspect-pid=") {
+            let result = pid.parse::<u32>().map_err(|error| error.to_string())
+                .and_then(find_process_window).and_then(|hwnd| rect(hwnd, false));
+            match result {
+                Ok(outer) => println!("{} {} {} {}", outer.left, outer.top, outer.right, outer.bottom),
+                Err(error) => { eprintln!("LIVE_RESIZE_FAILED {error}"); std::process::exit(1); }
+            }
+            return;
+        }
+        if let Some(value) = std::env::args().nth(1) && let Some(pid) = value.strip_prefix("--target-pid=") {
+            let result = pid.parse::<u32>().map_err(|error| error.to_string())
+                .and_then(find_process_window).and_then(drag_bottom_edge);
+            match result {
+                Ok(count) => eprintln!("LIVE_RESIZE_OK distinct_client_sizes={count}"),
+                Err(error) => { eprintln!("LIVE_RESIZE_FAILED {error}"); std::process::exit(1); }
+            }
+            return;
+        }
         let spec = AppSpec {
             min_size: Some((400.0, 320.0)),
-            ..AppSpec::new("Rune Windows live resize", (960.0, 720.0), State::default, view)
+            ..AppSpec::new("Rune Windows live resize", (960.0, 840.0), State::default, view)
         };
-        let app = App::new(spec);
+        let app = App::new(spec).window_options(WindowOptions {
+            position: fast_drag().then_some((128, 128)),
+            ..WindowOptions::default()
+        });
         let handle = app.handle();
         let mut started = false;
         app.on_ready(move |_| {
@@ -319,7 +325,8 @@ mod windows {
                 // Let the CPU first frame hand over to the instrumented GPU surface.
                 std::thread::sleep(Duration::from_millis(2500));
                 let result = match catch_unwind(AssertUnwindSafe(|| {
-                    find_process_window().and_then(drag_bottom_edge)
+                    // SAFETY: the current PID has no lifetime or ownership requirements.
+                    find_process_window(unsafe { GetCurrentProcessId() }).and_then(drag_bottom_edge)
                 })) {
                     Ok(result) => result,
                     Err(_) => Err("native sizing worker panicked".into()),

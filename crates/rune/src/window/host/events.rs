@@ -214,6 +214,12 @@ impl Host {
         if self.win.as_ref().is_none_or(|w| w.window.id() != id) {
             return;
         }
+        #[cfg(target_os = "windows")]
+        match &event {
+            WindowEvent::ResizeProposed(size) => { self.prepare_live_resize(*size); return; }
+            WindowEvent::ResizeGestureEnded => { self.end_live_resize(); return; }
+            _ => {}
+        }
         self.a11y_window_event(&event);
         // What says whether other windows cover it (`look`): the pointer reaching it shows some
         // of it; its own move, size or focus makes the next frame look.
@@ -233,6 +239,12 @@ impl Host {
             pacing.update_display(&w.window);
         }
         if matches!(&event, WindowEvent::ScaleFactorChanged { .. }) { self.apply_placement(event_loop); }
+        #[cfg(target_os = "windows")]
+        if let WindowEvent::Resized(size) = &event && self.present_live_resize(*size) {
+            self.sync_origin();
+            self.shell(event_loop);
+            return;
+        }
         match event {
             WindowEvent::Focused(focused) => {
                 // winit queues an initial false from its hidden source window before

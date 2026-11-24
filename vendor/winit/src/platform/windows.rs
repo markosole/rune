@@ -496,6 +496,9 @@ pub trait WindowAttributesExtWindows {
     /// This sets `WS_EX_NOREDIRECTIONBITMAP`.
     fn with_no_redirection_bitmap(self, flag: bool) -> Self;
 
+    /// Emits synchronous resize proposals for interactive sizing of a decorated window.
+    fn with_resize_proposals(self, enabled: bool) -> Self;
+
     /// Enables or disables drag and drop support (enabled by default). Will interfere with other
     /// crates that use multi-threaded COM API (`CoInitializeEx` with `COINIT_MULTITHREADED`
     /// instead of `COINIT_APARTMENTTHREADED`) on the same thread. Note that winit may still
@@ -567,6 +570,11 @@ impl WindowAttributesExtWindows for WindowAttributes {
     #[inline]
     fn with_no_redirection_bitmap(mut self, flag: bool) -> Self {
         self.platform_specific.no_redirection_bitmap = flag;
+        self
+    }
+
+    fn with_resize_proposals(mut self, enabled: bool) -> Self {
+        self.platform_specific.resize_proposals = enabled;
         self
     }
 

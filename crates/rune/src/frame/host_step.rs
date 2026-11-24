@@ -30,6 +30,9 @@ pub(crate) enum Outcome {
     /// recovery path.
     #[cfg(any(test, target_os = "windows", target_arch = "wasm32"))]
     Aborted,
+    /// A native resize has rendered; its bounds confirmation will present the frame.
+    #[cfg(target_os = "windows")]
+    Staged,
     /// A frame was drawn, submitted/presented, recorded on the clock and interaction tracker, and
     /// settled.
     Presented,
@@ -409,6 +412,12 @@ pub(crate) trait FrameHost {
     /// compositor reported that it is still animating.
     fn render(&mut self, prepared: &mut Self::Prepared, info: &StepInfo) -> bool;
 
+    #[cfg(target_os = "windows")]
+    #[inline]
+    fn stage_for_resize(&mut self, prepared: Self::Prepared, _info: &StepInfo) -> Option<Self::Prepared> {
+        Some(prepared)
+    }
+
     /// Submits GPU work, presents the drawable, performs any post-present GPU sync, and returns
     /// the submission timestamp recorded on the frame clock and interaction tracker.
     fn submit_and_present(&mut self, prepared: Self::Prepared, info: &StepInfo) -> Instant;
@@ -557,20 +566,22 @@ pub(crate) fn run<H: FrameHost>(host: &mut H) -> Outcome {
     };
     let comp_animating = host.render(&mut prepared, &info);
     info.animating |= comp_animating;
+    #[cfg(target_os = "windows")]
+    let Some(prepared) = host.stage_for_resize(prepared, &info) else { return Outcome::Staged };
     let Effects::One(Effect::Present) = step(&mut phase, Event::Rendered) else { unreachable!() };
     let submitted = host.submit_and_present(prepared, &info);
     let Effects::One(Effect::RecordPresented) = step(&mut phase, Event::Presented) else { unreachable!() };
-    {
-        let (clock, rt) = host.present_targets();
-        if let Some(clock) = clock {
-            clock.presented_core(rt, submitted);
-        }
-        rt.interaction_presented(submitted, info.presents_at);
-    }
+    record_presented(host, submitted, &info);
     let Effects::One(Effect::Settle) = step(&mut phase, Event::Recorded) else { unreachable!() };
     host.settle(submitted, &info);
     let Effects::None = step(&mut phase, Event::Settled) else { unreachable!() };
     phase.outcome()
+}
+
+pub(crate) fn record_presented<H: FrameHost>(host: &mut H, submitted: Instant, info: &StepInfo) {
+    let (clock, rt) = host.present_targets();
+    if let Some(clock) = clock { clock.presented_core(rt, submitted); }
+    rt.interaction_presented(submitted, info.presents_at);
 }
 
 /// Uploads dirty images, optionally kicks off asynchronous native-surface pipeline compilation,

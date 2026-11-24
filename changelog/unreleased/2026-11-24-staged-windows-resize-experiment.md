@@ -1,0 +1,1 @@
+- Add an opt-in Windows diagnostic path for preparing a resize frame before the client changes and comparing the resulting DXGI flip timing.

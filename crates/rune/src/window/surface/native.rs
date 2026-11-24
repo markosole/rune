@@ -72,6 +72,8 @@ pub(in crate::window) struct Native {
 #[cfg(target_os = "windows")]
 #[derive(Default)]
 pub(in crate::window) struct Native {
+    /// Holds one submitted frame until Win32 commits its proposed client bounds.
+    pub(in crate::window) resize: crate::window::host::draw::ResizeStage,
     /// Holds a window that's just been shown off screen until its frame lands.
     pub(in crate::window) cloak: crate::platform::win32::Cloak,
     /// The frame without a title bar a window with `App::titlebar` has.
