@@ -19,10 +19,11 @@ use crate::window::chrome::sync_platform_core;
 use crate::window::handle::native_window_number;
 use crate::window::state::{Cover, RestEvent, rest};
 use crate::window::surface::{
-    Backoff, BackoffEffect, BackoffEvent, Missed, Presented, Win, acquire, reblend_core,
+    Backoff, BackoffEffect, BackoffEvent, Missed, Presented, SurfaceRetries, Win, acquire,
+    reblend_core,
 };
 #[cfg(target_os = "macos")]
-use crate::window::surface::{TIMER_FRAME, configure};
+use crate::window::surface::{RedrawEvent, TIMER_FRAME, configure};
 #[cfg(target_os = "windows")]
 use crate::window::win32::{covered_draw::CoveredDrawEvent, slot};
 #[cfg(target_os = "windows")]
@@ -65,6 +66,41 @@ fn apply_missed_core(
     state.clipboard.flush_core(state.app.rt_mut());
     state.reports.skipped();
     effects
+}
+
+/// Outcome of settling a frame whose GPU device was lost during submission or presentation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LostPresent {
+    Retry,
+    GiveUp,
+}
+
+/// Window-neutral accounting when `gpu.is_lost()` is already true after `submit_and_present`:
+/// invalidates the surface and cached presentation, marks the host idle, reports a skipped frame,
+/// and either arms a bounded backoff retry or reports `GiveUp` once `SurfaceRetries` is exhausted.
+#[allow(clippy::too_many_arguments)]
+fn apply_lost_present_core(
+    surface_retries: &SurfaceRetries,
+    policy: crate::gpu::fallback::Policy,
+    software_available: bool,
+    surface_ok: &mut bool,
+    presented: &mut Option<Presented>,
+    backoff: &mut Backoff,
+    reports: &mut crate::frame::encoded::FrameReports,
+    idle: &mut bool,
+    now: Instant,
+) -> LostPresent {
+    *surface_ok = false;
+    *presented = None;
+    *idle = true;
+    reports.skipped();
+    match surface_retries.loss_retry(now, policy, software_available) {
+        Some(at) => {
+            let _ = backoff.step(BackoffEvent::At(at));
+            LostPresent::Retry
+        }
+        None => LostPresent::GiveUp,
+    }
 }
 
 impl Host {
@@ -153,6 +189,9 @@ impl Host {
             self.hand_over_if_done();
             if self.win.as_ref().is_some_and(|w| w.native.mode.cpu_draws()) { return self.draw_cpu(resizing); }
         }
+        // Linux: so does one there (`linux::cpu_frame`).
+        #[cfg(target_os = "linux")]
+        if self.win.as_ref().is_some_and(|w| w.native.mode.cpu_draws()) { return self.draw_cpu(resizing); }
         let mut frame = WindowFrame {
             host: self, resizing, state: FrameState::default(),
             #[cfg(target_os = "windows")]
@@ -210,9 +249,10 @@ impl WindowFrame<'_> {
     fn reblend_surface(&mut self) -> bool {
         let (Some(l), Some((gpu, renderer))) = (self.host.win.as_mut(), self.host.gpu.as_mut()) else { return false };
         let Some(surface) = l.surface.as_ref() else { return false };
+        let ok = reblend_core(surface, gpu, &mut l.config, renderer, &mut l.alpha, self.host.app.rt_mut());
         #[cfg(target_os = "windows")]
-        l.native.slot.reset();
-        reblend_core(surface, gpu, &mut l.config, renderer, &mut l.alpha, self.host.app.rt_mut())
+        l.native.slot.reconfigured(ok);
+        ok
     }
 }
 
@@ -301,7 +341,7 @@ impl FrameHost for WindowFrame<'_> {
         let deferred = false;
         #[cfg(target_os = "macos")]
         let target = if hidden || self.resizing || deferred { None } else if let Some(pacing) = &mut l.native.pacing {
-            if l.native.prime.presumes() && !pacing.running() {
+            if l.native.prime.presumes() && !pacing.paced() {
                 None
             } else {
                 let Some(target) = pacing.next_frame().target() else { return Gate::Skip };
@@ -310,7 +350,10 @@ impl FrameHost for WindowFrame<'_> {
         } else { None };
         #[cfg(target_os = "macos")]
         let shown = if !hidden && l.native.prime.presumes() {
-            l.native.prime.spend();
+            // A frame drawn while AppKit still launches the app isn't counted: AppKit says
+            // nothing of the window until its own launch work is done, and the frames right
+            // after it presume as those of a window made after the launch do.
+            if !crate::platform::macos::launching() { l.native.prime.spend(); }
             if let Some(surface) = l.surface.as_ref()
                 && let Some(shown) = crate::platform::macos::PresumeShown::new(surface) {
                 Some(shown)
@@ -431,6 +474,8 @@ impl FrameHost for WindowFrame<'_> {
 
     fn is_unchanged(&mut self, info: &StepInfo) -> bool {
         let (Some(l), Some((_, renderer))) = (self.host.win.as_ref(), self.host.gpu.as_ref()) else { return false };
+        #[cfg(target_os = "windows")]
+        if l.native.video_layers.needs_frame() { return false; }
         let now = self.state.now.unwrap_or_else(crate::time::now);
         #[cfg(target_os = "macos")]
         let next_tick = if self.state.deferred { l.native.pacing.as_ref().map(|p| p.tick_after(now)) } else { l.next_tick(now) };
@@ -443,7 +488,17 @@ impl FrameHost for WindowFrame<'_> {
 
     fn on_unchanged(&mut self, _info: &StepInfo) {
         let Some(l) = self.host.win.as_mut() else { return };
-        sync_platform_core(l, self.host.app.rt_mut(), &mut self.host.secure_input, &mut self.host.ime_allowed, &self.host.clipboard);
+        sync_platform_core(l, self.host.app.rt_mut(), &mut self.host.secure_input, &mut self.host.ime, self.host.ime_waits, &self.host.clipboard);
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        self.host.sync_wayland_drop();
+        let Some(l) = self.host.win.as_mut() else { return };
+        #[cfg(target_os = "macos")]
+        l.redraw_step(RedrawEvent::DrewOutsidePaint);
+        // When `deferred` is true, the link was already `Stopped` or `Coasting`: leave a coasting
+        // countdown running without aborting or extending it.
+        #[cfg(target_os = "macos")]
+        if !self.state.deferred { l.stop_pacing(); }
+        #[cfg(not(target_os = "macos"))]
         l.stop_pacing();
         self.host.meter.set_pacing(l.pacing_state(false));
         self.host.frame_reports.unchanged(self.state.target);
@@ -480,12 +535,14 @@ impl FrameHost for WindowFrame<'_> {
                 self.host.app.set_live_visible(true);
                 self.host.app.rt_mut().settle_all();
                 #[cfg(target_os = "macos")]
-                if l.native.pacing.is_none() {
+                if l.native.pacing.is_none() && !self.host.pacing_waits {
                     l.native.pacing = crate::platform::display_link::DisplayLink::new(&l.window, self.host.frame_wake.clone());
                 }
             }
             let now = *self.state.now.get_or_insert_with(crate::time::now);
             open_trace_if_needed(self.host, now);
+            // `--window-script` times its events from this, the window's first drawn frame.
+            if let Some(script) = &mut self.host.window_script { script.start(now); }
         }
         #[cfg(target_os = "macos")]
         if let Some(l) = self.host.win.as_ref() {
@@ -604,7 +661,9 @@ impl FrameHost for WindowFrame<'_> {
         if self.state.hidden { l.hidden_pace.rendered(now); }
         info.update_ms = now.elapsed().as_secs_f64() * 1000.0;
         self.state.profile.mark_built();
-        sync_platform_core(l, self.host.app.rt_mut(), &mut self.host.secure_input, &mut self.host.ime_allowed, &self.host.clipboard);
+        sync_platform_core(l, self.host.app.rt_mut(), &mut self.host.secure_input, &mut self.host.ime, self.host.ime_waits, &self.host.clipboard);
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        self.host.sync_wayland_drop();
     }
 
     fn prepare_render(&mut self, drawable: wgpu::SurfaceTexture, info: &mut StepInfo) -> RenderPrep<PreparedWindowFrame> {
@@ -656,21 +715,55 @@ impl FrameHost for WindowFrame<'_> {
 
     fn settle(&mut self, submitted: Instant, info: &StepInfo) {
         let now = self.state.now.unwrap_or(submitted);
+        if self.host.gpu.as_ref().is_none_or(|(gpu, _)| gpu.is_lost()) {
+            let outcome = if let Some(l) = self.host.win.as_mut() {
+                #[cfg(target_os = "windows")]
+                l.native.slot.reset();
+                l.stop_pacing();
+                self.host.meter.set_pacing(l.pacing_state(false));
+                apply_lost_present_core(
+                    &l.surface_retries,
+                    crate::render::Gpu::env_fallback_policy(),
+                    crate::gpu::fallback::software_fallback_available(),
+                    &mut l.surface_ok,
+                    &mut l.presented,
+                    &mut l.backoff,
+                    &mut self.host.frame_reports,
+                    &mut self.host.idle,
+                    now,
+                )
+            } else {
+                self.host.idle = true;
+                self.host.frame_reports.skipped();
+                LostPresent::Retry
+            };
+            if outcome == LostPresent::GiveUp {
+                let _ = self.host.replace_lost_surface();
+            }
+            return;
+        }
         self.host.meter.presented();
         #[cfg(target_os = "macos")]
         if let Some(l) = self.host.win.as_mut() {
+            l.redraw_step(RedrawEvent::DrewOutsidePaint);
             if let Some(pacing) = &mut l.native.pacing { pacing.presented(submitted); }
             // A display link that couldn't be made while the displays slept: they're back.
-            if !self.state.hidden && l.native.pacing.is_none() {
+            if !self.state.hidden && l.native.pacing.is_none() && !self.host.pacing_waits {
                 l.native.pacing = crate::platform::display_link::DisplayLink::retry(&l.window, self.host.frame_wake.clone());
             }
         }
-        self.host.frame_reports.drawn(self.state.encoded, info.presents_at, now, info.update_ms);
+        let frame_seq = self.host.frame_reports.drawn(self.state.encoded, info.presents_at, now, info.update_ms);
         self.host.app.inspect_frame();
         #[cfg(target_os = "macos")]
         let drawable = self.state.drawable;
         #[cfg(not(target_os = "macos"))]
         let drawable = None;
+        #[cfg(target_os = "macos")]
+        if let (Some(frame_seq), Some(drawable_seq)) = (frame_seq, drawable) {
+            self.host.frame_presented.push_and_drain(drawable_seq, frame_seq);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = frame_seq;
         if record_trace_frame(self.host, now, submitted, self.state.target, drawable) {
             return;
         }
@@ -678,7 +771,8 @@ impl FrameHost for WindowFrame<'_> {
         // A poll asking for the next frame (`wake_after(Duration::ZERO)`) keeps a running display
         // link going; without one its timer waits a frame in `wake_deadline`.
         let next_tick = l.next_tick(now).filter(|_| !self.state.hidden);
-        let rests = !self.state.hidden && !(self.host.trace.is_some() && self.host.args.frames.is_some());
+        let surfaces_pending = self.host.gpu.as_ref().is_some_and(|(_, r)| r.surfaces_pending());
+        let rests = !self.state.hidden && !surfaces_pending && !(self.host.trace.is_some() && self.host.args.frames.is_some());
         self.host.idle = Presented::settle_core(
             &mut l.presented,
             self.host.app.rt(),
@@ -708,8 +802,11 @@ impl FrameHost for WindowFrame<'_> {
             #[cfg(not(target_os = "macos"))]
             l.request_redraw();
             self.host.meter.set_pacing(l.pacing_state(true));
-        } else {
+        } else if self.state.hidden {
             l.stop_pacing();
+            self.host.meter.set_pacing(l.pacing_state(false));
+        } else {
+            l.coast_pacing();
             self.host.meter.set_pacing(l.pacing_state(false));
         }
         self.state.profile.flush(self.host, info.animating, next_tick);
@@ -738,7 +835,7 @@ fn loop_step(clock: &mut FrameClock, rt: &mut RuntimeCore, at: Instant) -> Resul
 }
 
 /// The window's display refresh: its display link's on macOS, else the monitor's.
-fn display_hz(l: &Win) -> Option<f64> {
+pub(super) fn display_hz(l: &Win) -> Option<f64> {
     #[cfg(target_os = "macos")]
     if let Some(pacing) = &l.native.pacing { return Some(pacing.refresh_hz()); }
     l.window.current_monitor().and_then(|m| m.refresh_rate_millihertz()).map(|hz| hz as f64 / 1000.0)

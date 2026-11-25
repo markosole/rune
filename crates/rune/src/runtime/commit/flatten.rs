@@ -10,8 +10,13 @@ pub(in crate::runtime) fn fit_room(own: &CompactStyle, parent_row: bool) -> Comp
     let raw = own.to_style();
     let zero = |d: LengthPercentageAuto| if d.is_auto() { length(0.0) } else { d };
     let main_max = if parent_row { raw.max_size.width } else { raw.max_size.height };
+    let size = if parent_row {
+        Size { width: main_max.into(), height: auto() }
+    } else {
+        Size { width: auto(), height: main_max.into() }
+    };
     CompactStyle::from_style(Style {
-        size: raw.max_size.map(Into::into),
+        size,
         min_size: Size { width: zero(raw.min_size.width), height: zero(raw.min_size.height) },
         flex_grow: 1.0,
         flex_shrink: 1.0,
@@ -77,66 +82,11 @@ enum Picture {
 /// A measured picture's measure key: its ratio, so a new one measures again.
 fn picture_key(ratio: f32) -> u64 { 0x7069_6300_0000_0000 | u64::from(ratio.to_bits()) }
 
-// Build the owned path directly, without cloning a key or formatting an index into a
-// temporary segment first. Measurement and flattening must use the same identity rule.
-/// Whether `path` lies inside an element keyed `scope` (always, without one).
-pub(crate) fn in_scope(path: &str, scope: Option<&str>) -> bool {
-    scope.is_none_or(|s| path.split('/').any(|seg| seg == s))
-}
-
-pub(in crate::runtime) fn node_path(parent: &str, key: Option<&str>, index: usize) -> String {
-    match (parent.is_empty(), key) {
-        (true, Some(key)) => key.to_owned(),
-        (true, None) => format!("#{index}"),
-        // Sized up front: `format!` guesses short and reallocates every deep path, twice a
-        // commit per element.
-        (false, Some(key)) => {
-            let mut path = String::with_capacity(parent.len() + 1 + key.len());
-            path.push_str(parent);
-            path.push('/');
-            path.push_str(key);
-            path
-        }
-        (false, None) => {
-            use std::fmt::Write;
-            let mut path = String::with_capacity(parent.len() + 22);
-            path.push_str(parent);
-            write!(path, "/#{index}").ok();
-            path
-        }
-    }
-}
-
-#[inline(always)]
-fn push_usize(buf: &mut String, mut n: usize) {
-    if n < 10 {
-        buf.push((b'0' + n as u8) as char);
-        return;
-    }
-    let mut digits = [0u8; 20];
-    let mut i = digits.len();
-    while n > 0 {
-        i -= 1;
-        digits[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-    }
-    if let Ok(s) = std::str::from_utf8(&digits[i..]) {
-        buf.push_str(s);
-    }
-}
-
-fn push_segment(path: &mut String, key: Option<&str>, index: usize) {
-    if !path.is_empty() {
-        path.push('/');
-    }
-    match key {
-        Some(k) => path.push_str(k),
-        None => {
-            path.push('#');
-            push_usize(path, index);
-        }
-    }
-}
+pub(crate) use super::path::in_scope;
+pub(in crate::runtime) use super::path::node_path;
+use super::path::push_segment;
+#[cfg(test)]
+use super::path::push_usize;
 
 #[inline]
 fn can_take_old_path(old: &Node, path_buf: &str) -> bool {
@@ -145,6 +95,7 @@ fn can_take_old_path(old: &Node, path_buf: &str) -> bool {
         && old.path == path_buf
         && old.input.is_none()
         && old.focus.get().is_none_or(|f| f.return_to.is_none())
+        && old.handlers.get().is_none_or(|h| h.on_focus_change.is_none() && h.on_focus_within_change.is_none())
 }
 
 #[inline]
@@ -230,17 +181,15 @@ fn prepare_text(
     }
     if let Some(t) = text && t.redacted {
         // Rich links carry URLs and can expose them through hover, copy and tree children.
-        use zeroize::Zeroize;
         let t: &mut TextSpec = t;
         t.selectable = false;
         if let Some(cold) = t.cold.get_mut_if_some() {
-            for link in &mut cold.links {
-                link.id.zeroize();
-                if let Some(label) = &mut link.label { label.zeroize(); }
-                if let Some(help) = &mut link.help { help.zeroize(); }
-            }
-            cold.links.clear();
+            crate::el::wipe_links(&mut cold.links);
             cold.rings.clear();
+            cold.overlines.clear();
+            cold.span_boxes.clear();
+            cold.line_fills.clear();
+            cold.text_indent = 0.0;
             cold.advance_in = None;
             cold.live = None;
         }
@@ -258,8 +207,26 @@ fn prepare_text(
         }
     }
     if let Some(t) = text && t.cold.live.is_some() {
-        assert!(input.is_none() && !t.redacted && !t.wrap && t.spans.is_empty() && t.reveal < 0.0 && !t.truncate,
-            "live_text requires plain single-line text; use truncate_fade for overflow");
+        let incompatible = input.is_some()
+            || t.redacted
+            || !t.spans.is_empty()
+            || t.reveal >= 0.0
+            || t.cold.advance_in.is_some()
+            || !t.cold.links.is_empty()
+            || !t.cold.pills.is_empty()
+            || !t.cold.isolates.is_empty()
+            || !t.cold.rings.is_empty()
+            || !t.cold.strikes.is_empty()
+            || !t.cold.overlines.is_empty()
+            || !t.cold.span_boxes.is_empty()
+            || !t.cold.highlights.is_empty()
+            || !t.cold.line_fills.is_empty()
+            || !t.cold.blocks.is_empty()
+            || !t.cold.soft_breaks.is_empty()
+            || !t.cold.uncopied.is_empty();
+        if incompatible {
+            t.cold.live = None;
+        }
     }
     if input.is_none()
         && text.as_ref().is_some_and(|t| !t.cold.isolates.is_empty() || !t.cold.pills.is_empty())
@@ -282,6 +249,8 @@ fn prepare_text(
         ^ ((t.max_lines as u64) << 2)
         ^ (u64::from(input.is_some_and(|i| i.edit.is_revealed()) || t.cold.secure_revealed) << 3)
         ^ (u64::from(t.wrap_anywhere) << 4) ^ (u64::from(t.greedy) << 5) ^ (u64::from(t.by_line) << 6)
+        ^ ((t.elide as u64) << 7)
+        ^ if t.cold.text_indent == 0.0 { 0 } else { u64::from(t.cold.text_indent.to_bits()).wrapping_mul(0x517c_c1b7_2722_0a95) }
         ^ t.cold.advance_in.as_ref().map_or(0, |(run, at)| run.hash.rotate_left(3) ^ (*at as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)));
     // Secure leaves remeasure without retaining a content-derived dictionary oracle.
     let secure_measure = text.as_ref().is_some_and(|t| t.redacted);
@@ -291,6 +260,7 @@ fn prepare_text(
 
 /// Text, an icon, and a text field's placeholder, caret and selection that weren't given a
 /// colour take the window's foreground ([`Cx::foreground`]), as CSS text takes `color`.
+/// A text field with its own [`El::color`] already derives its uninked defaults from that colour.
 fn take_foreground(
     text: &mut Option<crate::cold::SharedBox<TextSpec>>,
     input: Option<&mut InputSpec>,
@@ -298,18 +268,19 @@ fn take_foreground(
     foreground: Option<Color>,
 ) {
     let Some(fg) = foreground else { return };
+    let text_inked = text.as_ref().is_some_and(|t| t.inked);
     if let Some(t) = text && !t.inked && t.color != fg {
         t.color = fg;
     }
-    if let Some(i) = input {
+    if let Some(i) = input && !text_inked {
         if !i.placeholder_inked {
             i.placeholder_color = fg.alpha(0.4);
         }
         if !i.caret_inked {
             i.caret = fg;
-            if i.selection == crate::el::DEFAULT_SELECTION {
-                i.selection = fg.alpha(0.2);
-            }
+        }
+        if !i.selection_inked {
+            i.selection = fg.alpha(0.2);
         }
     }
     if !vis.icon_inked && vis.icon.is_some_and(|(_, c)| c != fg) && let Some((_, c)) = &mut vis.cold_mut().icon {
@@ -353,8 +324,9 @@ fn needs_node_cold(c: &crate::el::ElCold, meta: &ColdMeta) -> bool {
         || c.label.is_some() || c.help.is_some() || c.transition.is_some()
         || !c.live.is_empty() || c.scroll.is_some() || c.matched.is_some()
         || c.wheel_scrolls.is_some()
-        || c.above.is_some() || c.growth.is_some() || c.sticky.is_some()
-        || c.trace_name.is_some() || c.looping.is_some() || c.opacity_motion.is_some()
+        || c.above.is_some() || c.above_boundary.is_some() || c.growth.is_some() || c.sticky.is_some()
+        || c.trace_name.is_some() || c.looping.is_some() || c.loop_times.is_some() || c.frame_motion.is_some() || c.opacity_motion.is_some()
+        || c.transition_motion.is_some() || c.enter_in_instant || c.matched_motion.is_some()
         || c.lead.is_some() || c.glide.is_some() || c.material.is_some()
         || c.help_cut || c.help_side.is_some() || c.help_open
         || c.scroll_axes != crate::el::ScrollAxes::Y
@@ -369,8 +341,8 @@ fn needs_node_cold(c: &crate::el::ElCold, meta: &ColdMeta) -> bool {
 fn node_cold_meta_only(meta: ColdMeta) -> NodeCold {
     NodeCold {
         trace_name: None, trace_namespace: meta.trace_namespace, label: None, live: Vec::new(),
-        run_layout: None, live_text_seen: None, looping: None, opacity_motion: None, lead: None,
-        transition: None, matched: None, above: None, scroll: None, scroll_axes: crate::el::ScrollAxes::Y,
+        run_layout: None, live_text_seen: None, looping: None, loop_times: None, frame_motion: None, opacity_motion: None, lead: None,
+        transition: None, transition_motion: None, enter_in_instant: false, matched: None, matched_motion: None, above: None, above_boundary: None, resolved_anchor: None, scroll: None, scroll_axes: crate::el::ScrollAxes::Y,
         scroll_edges: crate::el::ScrollEdges::default(), wheel_scrolls: None, sticky: None, growth: None, glide: None,
         a11y: crate::el::A11y::EMPTY, pixel_aspect: meta.pixel_aspect, aspect_fit: meta.aspect_fit,
         material: None, help: None, help_cut: false, help_side: None, help_open: false,
@@ -383,6 +355,56 @@ fn node_cold_meta_only(meta: ColdMeta) -> NodeCold {
 #[inline(never)]
 fn take_cold_input(cold: &mut crate::cold::Cold<crate::el::ElCold>) -> Option<Box<InputSpec>> {
     cold.get_mut_if_some().and_then(|c| c.input.take())
+}
+
+#[cold]
+#[inline(never)]
+fn merge_path_handlers(
+    dst: &mut crate::cold::Cold<crate::el::Handlers>,
+    patch: &mut crate::el::PathBind,
+) {
+    if let Some(next) = patch.on_pointer_move.take() {
+        let h: &mut crate::el::Handlers = &mut *dst;
+        h.on_pointer_move = Some(match h.on_pointer_move.take() {
+            Some(prev) => Rc::new(move |st, p, tx| {
+                prev(st, p, tx);
+                let prev_live = std::mem::take(&mut tx.live_only);
+                next(p, tx);
+                tx.live_only &= prev_live;
+            }),
+            None => Rc::new(move |_, p, tx| next(p, tx)),
+        });
+        #[cfg(debug_assertions)]
+        if h.sites.pointer_move.is_none() {
+            h.sites.pointer_move = patch.pointer_move_site;
+        }
+    }
+    if let Some(next) = patch.on_hover_change.take() {
+        let h: &mut crate::el::Handlers = &mut *dst;
+        h.on_hover_change = Some(match h.on_hover_change.take() {
+            Some(prev) => Rc::new(move |st, inside, tx| {
+                prev(st, inside, tx);
+                let prev_live = std::mem::take(&mut tx.live_only);
+                next(inside, tx);
+                tx.live_only &= prev_live;
+            }),
+            None => Rc::new(move |_, inside, tx| next(inside, tx)),
+        });
+        #[cfg(debug_assertions)]
+        if h.sites.hover_change.is_none() {
+            h.sites.hover_change = patch.hover_change_site;
+        }
+    }
+    if let Some(next) = patch.on_scroll_offset.take() {
+        let h: &mut crate::el::Handlers = &mut *dst;
+        h.on_scroll_offset = Some(match h.on_scroll_offset.take() {
+            Some(prev) => Rc::new(move |at| {
+                prev(at);
+                next(at);
+            }),
+            None => next,
+        });
+    }
 }
 
 mod sealed {
@@ -439,8 +461,11 @@ macro_rules! node_cold_from {
             trace_name: $c.trace_name, trace_namespace: $m.trace_namespace,
             label: take_field!($mode, $c.label), live: take_field!($mode, $c.live),
             run_layout: None, live_text_seen: None,
-            looping: take_field!($mode, $c.looping), opacity_motion: take_field!($mode, $c.opacity_motion),
-            lead: $c.lead, transition: take_field!($mode, $c.transition), matched, above,
+            looping: take_field!($mode, $c.looping), loop_times: $c.loop_times, frame_motion: take_field!($mode, $c.frame_motion),
+            opacity_motion: take_field!($mode, $c.opacity_motion), lead: $c.lead,
+            transition: take_field!($mode, $c.transition), transition_motion: take_field!($mode, $c.transition_motion),
+            enter_in_instant: $c.enter_in_instant,
+            matched, matched_motion: take_field!($mode, $c.matched_motion), above, above_boundary: take_field!($mode, $c.above_boundary), resolved_anchor: None,
             scroll: $c.scroll, scroll_axes: $c.scroll_axes, scroll_edges: $c.scroll_edges,
             wheel_scrolls: take_field!($mode, $c.wheel_scrolls),
             sticky: take_field!($mode, $c.sticky), growth: take_field!($mode, $c.growth),
@@ -625,7 +650,9 @@ fn flatten_owned(
     taffy: &mut LayoutEngine, nodes: &mut Vec<Node>, scale: f32,
     memo_ctx: &mut memo_reuse::MemoFlattenCtx<'_>,
 ) -> (SlotId, bool) {
-    flatten_node(el, parent, path_buf, index, motion, in_row, parent_row, parent_sx, taffy, nodes, scale, memo_ctx)
+    rune_taffy::maybe_grow(|| {
+        flatten_node(el, parent, path_buf, index, motion, in_row, parent_row, parent_sx, taffy, nodes, scale, memo_ctx)
+    })
 }
 
 #[inline(never)]
@@ -636,7 +663,9 @@ fn flatten_ref(
     taffy: &mut LayoutEngine, nodes: &mut Vec<Node>, scale: f32,
     memo_ctx: &mut memo_reuse::MemoFlattenCtx<'_>,
 ) -> (SlotId, bool) {
-    flatten_node(el, parent, path_buf, index, motion, in_row, parent_row, parent_sx, taffy, nodes, scale, memo_ctx)
+    rune_taffy::maybe_grow(|| {
+        flatten_node(el, parent, path_buf, index, motion, in_row, parent_row, parent_sx, taffy, nodes, scale, memo_ctx)
+    })
 }
 
 #[inline(always)]
@@ -652,6 +681,9 @@ fn flatten_node<E: FlattenEl>(
         && let Some(slot) = memo_reuse::try_reuse_memo(el_ref, parent, path_buf, index, motion, in_row, scale, taffy, nodes, memo_ctx)
     {
         return (slot, false);
+    }
+    if el_ref.flags.has(ElFlags::HAS_VIRTUAL) && el_ref.memo.is_some() {
+        memo_ctx.missed_virtual_memo = true;
     }
     let record_built = parent_sx.is_none().then(|| {
         let built = el_ref.memo_built().filter(|b| b.reusable && memo_reuse::same_root_el(el_ref, b, false))
@@ -674,7 +706,8 @@ fn flatten_node<E: FlattenEl>(
     } else {
         in_row
     };
-    let instant_changes = flags.has(ElFlags::INSTANT_CHANGES) || (parent.is_some_and(|p| nodes[p].instant_changes) && !el_ref.cold.animated_changes);
+    let animated_changes = el_ref.cold.animated_changes;
+    let instant_changes = flags.has(ElFlags::INSTANT_CHANGES) || (parent.is_some_and(|p| nodes[p].instant_changes) && !animated_changes);
     let trace_namespace = el_ref.cold.trace_namespace.or_else(|| parent.and_then(|p| nodes[p].trace_namespace));
     let parent_flow = parent.map_or(crate::el::Flow::Ltr, |p| nodes[p].flow);
     let (flow, dir_effect) = crate::el::step_direction(parent_flow, crate::el::DirEvent::of(el_ref));
@@ -700,9 +733,11 @@ fn flatten_node<E: FlattenEl>(
     let hover_within = inherit_hover_within(el.vis(&s), el.as_el().cold.above.as_ref(), parent, nodes);
     let pixel_aspect = el.vis(&s).pixels.as_ref()
         .filter(|_| {
-            let st = el.style(&s);
-            let sz = st.size();
-            st.aspect_ratio().is_none() && sz.width.is_auto() != sz.height.is_auto()
+            el.vis(&s).pixels_wrap.is_none() && {
+                let st = el.style(&s);
+                let sz = st.size();
+                st.aspect_ratio().is_none() && sz.width.is_auto() != sz.height.is_auto()
+            }
         })
         .map(pixel_ratio);
     let picture = pixel_aspect.filter(|&r| r > 0.0).map(|ratio| (ratio, picture_side(el.style_mut(&mut s))));
@@ -739,8 +774,28 @@ fn flatten_node<E: FlattenEl>(
     let static_scale = el_r.scale;
     let time_scale = el_r.cold.time_scale;
     let option_as_alt = el_r.cold.option_as_alt;
+    let window_drag = el_r.window_drag_mode();
+    let virtual_list = el_r.cold.virtual_estimate.is_some();
     let focus = el_r.cold.focus.clone();
-    let (key, handlers, text, vis, cold, style, children) = el.finish(s);
+    let on_path = el_r.cold.get().and_then(|c| c.on_path.clone());
+    let child_count = if on_path.is_some() {
+        el_r.memo.as_ref().map_or(0, |b| b.children.children.len()) + el_r.children.len()
+    } else {
+        0
+    };
+    let (key, mut handlers, text, vis, cold, style, children) = el.finish(s);
+    let extra_children = if let Some(bind) = on_path {
+        let mut patch = crate::el::PathBind::default();
+        bind(&path, &mut patch);
+        merge_path_handlers(&mut handlers, &mut patch);
+        patch.children
+    } else {
+        Vec::new()
+    };
+    let in_flow = {
+        let st = style.as_ref();
+        !matches!(st.position(), Position::Absolute | Position::Fixed) && st.display() != Display::None
+    };
     let cold = if E::cold_is_empty(&cold) && trace_namespace.is_none() && pixel_aspect.is_none() && aspect_fit.is_none() {
         crate::cold::Cold::default()
     } else {
@@ -753,14 +808,18 @@ fn flatten_node<E: FlattenEl>(
         motion, static_scale, time_scale, in_row,
         width_leads: flags.has(ElFlags::WIDTH_LEADS),
         instant_changes,
+        animated_changes,
         streaming: flags.has(ElFlags::STREAMING),
         whole: flags.has(ElFlags::WHOLE),
         inert, flow, directed, pin, scale_track: false, group_fade: false,
         virtual_mount: flags.has(ElFlags::VIRTUAL_MOUNT),
+        virtual_list,
         selection_group: flags.has(ElFlags::SELECTION_GROUP),
-        window_drag: flags.window_drag(),
+        window_drag,
         ime_cursor: flags.has(ElFlags::IME_CURSOR),
         ime_option_as_alt: option_as_alt,
+        in_flow,
+        collapsing: false,
         moved_stub: false,
         epoch: crate::runtime::paint_keep::next_epoch(),
     });
@@ -771,7 +830,12 @@ fn flatten_node<E: FlattenEl>(
     let row = matches!(style.as_ref().flex_direction(), FlexDirection::Row | FlexDirection::RowReverse);
     let child_mark = taffy.begin_children();
     let env = ChildEnv { me, motion, in_row: child_in_row, row, sx: child_sx };
-    let children_dirty = E::flatten_children(children, env, path_buf, taffy, nodes, scale, memo_ctx);
+    let mut children_dirty = E::flatten_children(children, env, path_buf, taffy, nodes, scale, memo_ctx);
+    for (k, extra) in extra_children.into_iter().enumerate() {
+        let (kid, kid_dirty) = flatten_owned(extra, Some(env.me), path_buf, child_count + k, env.motion, env.in_row, env.row, env.sx, taffy, nodes, scale, memo_ctx);
+        taffy.push_child(kid);
+        children_dirty |= kid_dirty;
+    }
     path_buf.truncate(prev_len);
     let (slot, dirty) = taffy.sync_node(id.0, me as u32, style.into_owned(), measure, secure_measure, child_mark, children_dirty);
     nodes[me].taffy = slot;

@@ -33,8 +33,21 @@ pub(crate) fn parse_script(list: Value) -> Vec<Ev> {
             out.push(Ev { t, kind: Kind::Reopen, pos: Pos::Rel(0.0, 0.0) });
             continue;
         }
+        if e["close_request"].as_bool() == Some(true) {
+            out.push(Ev { t, kind: Kind::CloseRequest, pos: Pos::Rel(0.0, 0.0) });
+            continue;
+        }
         if let Some(url) = e["open_url"].as_str() {
             out.push(Ev { t, kind: Kind::OpenUrl(url.into()), pos: Pos::Rel(0.0, 0.0) });
+            continue;
+        }
+        if let Some(files) = e.get("open_files") {
+            let paths: Vec<std::path::PathBuf> = files.as_array()
+                .unwrap_or_else(|| die("open_files needs an array of path strings, like [\"a.txt\"]"))
+                .iter()
+                .map(|p| p.as_str().unwrap_or_else(|| die("open_files entries must be strings")).into())
+                .collect();
+            out.push(Ev { t, kind: Kind::OpenFiles(paths), pos: Pos::Rel(0.0, 0.0) });
             continue;
         }
         if let Some(chord) = e["physical"].as_str() {
@@ -275,9 +288,21 @@ pub(crate) fn parse_script(list: Value) -> Vec<Ev> {
                 out.push(Ev { t, kind: Kind::PopupMenu(Some(id.into())), pos: Pos::Rel(0.0, 0.0) });
             }
             "menu-cancel" => out.push(Ev { t, kind: Kind::PopupMenu(None), pos: Pos::Rel(0.0, 0.0) }),
-            "file-dialog" => {
-                let path = e["path"].as_str().unwrap_or_else(|| die("file-dialog needs a \"path\" (file-dialog-cancel cancels)"));
-                out.push(Ev { t, kind: Kind::FileDialog(Some(path.into())), pos: Pos::Rel(0.0, 0.0) });
+            "file-dialog" => match (e.get("path"), e.get("paths")) {
+                (Some(_), Some(_)) => die("file-dialog takes either \"path\" or \"paths\", not both"),
+                (Some(p), None) => {
+                    let path = p.as_str().unwrap_or_else(|| die("file-dialog \"path\" must be a string"));
+                    out.push(Ev { t, kind: Kind::FileDialog(Some(path.into())), pos: Pos::Rel(0.0, 0.0) });
+                }
+                (None, Some(ps)) => {
+                    let paths: Vec<std::path::PathBuf> = ps.as_array()
+                        .unwrap_or_else(|| die("file-dialog \"paths\" must be an array of strings"))
+                        .iter()
+                        .map(|p| p.as_str().unwrap_or_else(|| die("file-dialog \"paths\" entries must be strings")).into())
+                        .collect();
+                    out.push(Ev { t, kind: Kind::FileDialogFiles(paths), pos: Pos::Rel(0.0, 0.0) });
+                }
+                (None, None) => die("file-dialog needs a \"path\" or \"paths\" (file-dialog-cancel cancels)"),
             }
             "file-dialog-cancel" => out.push(Ev { t, kind: Kind::FileDialog(None), pos: Pos::Rel(0.0, 0.0) }),
             "mark" => {
@@ -291,7 +316,7 @@ pub(crate) fn parse_script(list: Value) -> Vec<Ev> {
     out
 }
 
-/// `{"drag_files": {"paths": […], "at": [x, y]}}` (or `"key": …` for an element's centre) moves a
+/// `{"drag_files": {"paths": […], "at": [x, y]}}` (or `"key": …` for the centre of an element's shown part) moves a
 /// file drag from another app over the window; `{"drag_files": "leave"}` takes it away.
 /// `{"drop_files": {…, "hover": s}}` drags the files there for `s` seconds (default 0), then
 /// drops them. Whether `e` was one.

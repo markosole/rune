@@ -5,7 +5,7 @@ use crate::*;
 /// Brush carried through Parley: 0 is unspanned, n is the nth layout-affecting span; glyph
 /// colour is resolved from [`TextSystem::set_glyph_inks`] at emission.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Ink(pub u16);
+pub struct Ink(pub u32);
 
 /// A styled byte range of a text element (markdown inline code, bold, links).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -117,9 +117,25 @@ pub struct PillChip {
     pub start: u32,
     pub end: u32,
     pub icon: Option<&'static Icon>,
+    pub image: Option<rune_image::pixels::Pixels>,
     pub bg: Option<Color>,
     pub fg: Option<Color>,
+    pub ring: Option<(Color, f32)>,
+    pub radius: Option<f32>,
     pub bare: Option<Box<BareIcon>>,
+}
+
+impl PillChip {
+    /// Whether this chip or inline icon holds a Pixels image.
+    #[doc(hidden)]
+    pub fn has_image(&self) -> bool {
+        self.image.is_some() || self.bare.as_ref().is_some_and(|b| b.image.is_some())
+    }
+
+    /// Whether a non-bare chip reserves leading room for an icon or image.
+    pub(crate) fn has_lead_visual(&self) -> bool {
+        self.icon.is_some() || self.image.is_some()
+    }
 }
 
 /// An inline icon's room and look in points (see `InlineIcon`).
@@ -183,6 +199,165 @@ impl PillMetrics {
 /// Tags the inline boxes around pill labels: the rest of the id is the pill's index shifted
 /// left once, with the low bit set on the box after the label.
 pub(crate) const PILL_BOX: u64 = 1 << 62;
+
+/// Tags the inline boxes around padded [`SpanBox`] ranges: the rest of the id is the box's index
+/// shifted left once, with the low bit set on the trailing spacer.
+pub(crate) const SPAN_BOX: u64 = 1 << 61;
+
+const fn nonneg_pt(v: f32) -> f32 {
+    if v.is_finite() && v > 0.0 { v } else { 0.0 }
+}
+
+/// Style for a padded inline box drawn around a UTF-8 byte range of static text via
+/// `El::span_box` or `El::span_boxes`.
+///
+/// Unlike [`Span::bg`], horizontal padding (`pad` / `pad_x`) reserves layout room in the line so
+/// adjacent inline chips (such as a search filter's `from:` key and `ada` value) meet without
+/// overlapping, and [`Self::corners`] sets per-corner radii `[top_left, top_right, bottom_right,
+/// bottom_left]` in CSS `border-radius` order (matching `El::corners`).
+///
+/// ```
+/// use rune_core::color::Color;
+/// use rune_text::SpanBox;
+///
+/// let key = SpanBox::new()
+///     .bg(Color { r: 0.2, g: 0.2, b: 0.25, a: 1.0 })
+///     .pad_x(6.0, 4.0)
+///     .corners([4.0, 0.0, 0.0, 4.0]);
+/// let val = SpanBox::new()
+///     .bg(Color { r: 0.15, g: 0.35, b: 0.65, a: 1.0 })
+///     .pad_x(4.0, 6.0)
+///     .corners([0.0, 4.0, 4.0, 0.0])
+///     .border(Color { r: 0.4, g: 0.6, b: 1.0, a: 0.8 }, 1.0);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpanBox {
+    bg: Option<Color>,
+    pad_left: f32,
+    pad_right: f32,
+    corners: [f32; 4],
+    border: Option<(Color, f32)>,
+}
+
+impl Default for SpanBox {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SpanBox {
+    /// An empty box with no fill, no border, zero horizontal padding, and the default
+    /// [`SPAN_RADIUS`](crate::SPAN_RADIUS) corner radius on all four corners.
+    pub const fn new() -> Self {
+        Self {
+            bg: None,
+            pad_left: 0.0,
+            pad_right: 0.0,
+            corners: [crate::SPAN_RADIUS; 4],
+            border: None,
+        }
+    }
+
+    /// Fill colour drawn behind the range and its horizontal padding.
+    pub const fn bg(mut self, color: Color) -> Self {
+        self.bg = Some(color);
+        self
+    }
+
+    /// Symmetric layout-affecting horizontal padding in points on both sides of the range.
+    /// Negative or non-finite values become `0.0`.
+    pub const fn pad(mut self, pad: f32) -> Self {
+        let p = nonneg_pt(pad);
+        self.pad_left = p;
+        self.pad_right = p;
+        self
+    }
+
+    /// Asymmetric layout-affecting horizontal padding in points: `left` at the range's start and
+    /// `right` at its end (in RTL text, leading and trailing inline padding). Negative or
+    /// non-finite values become `0.0`.
+    pub const fn pad_x(mut self, left: f32, right: f32) -> Self {
+        self.pad_left = nonneg_pt(left);
+        self.pad_right = nonneg_pt(right);
+        self
+    }
+
+    /// Uniform corner radius in points for all four corners. Negative or non-finite values become
+    /// `0.0`. Clamped to half the box's shorter side at paint time.
+    pub const fn radius(mut self, radius: f32) -> Self {
+        let r = nonneg_pt(radius);
+        self.corners = [r; 4];
+        self
+    }
+
+    /// Per-corner radii in points: `[top_left, top_right, bottom_right, bottom_left]`, matching
+    /// CSS `border-radius` order and `El::corners`. Negative or non-finite values become `0.0`.
+    pub const fn corners(mut self, corners: [f32; 4]) -> Self {
+        self.corners = [
+            nonneg_pt(corners[0]),
+            nonneg_pt(corners[1]),
+            nonneg_pt(corners[2]),
+            nonneg_pt(corners[3]),
+        ];
+        self
+    }
+
+    /// Inset border ring `width` points wide inside the box edges (ignored when `width` is not
+    /// finite and positive).
+    pub const fn border(mut self, color: Color, width: f32) -> Self {
+        self.border = if width > 0.0 && width.is_finite() { Some((color, width)) } else { None };
+        self
+    }
+
+    #[doc(hidden)]
+    pub const fn bg_color(&self) -> Option<Color> {
+        self.bg
+    }
+
+    #[doc(hidden)]
+    pub const fn pad_left(&self) -> f32 {
+        self.pad_left
+    }
+
+    #[doc(hidden)]
+    pub const fn pad_right(&self) -> f32 {
+        self.pad_right
+    }
+
+    #[doc(hidden)]
+    pub const fn corner_radii(&self) -> [f32; 4] {
+        self.corners
+    }
+
+    #[doc(hidden)]
+    pub const fn border_ring(&self) -> Option<(Color, f32)> {
+        self.border
+    }
+
+    #[doc(hidden)]
+    pub const fn has_padding(&self) -> bool {
+        self.pad_left > 0.0 || self.pad_right > 0.0
+    }
+
+    #[doc(hidden)]
+    pub const fn is_painted(&self) -> bool {
+        self.bg.is_some() || self.border.is_some()
+    }
+
+    #[doc(hidden)]
+    pub const fn has_effect(&self) -> bool {
+        self.is_painted() || self.has_padding()
+    }
+}
+
+/// A [`SpanBox`] attached to UTF-8 byte range `start..end`.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpanBoxRun {
+    pub start: u32,
+    pub end: u32,
+    pub style: SpanBox,
+}
 
 /// Flattens overlapping [`Span`]s into non-overlapping elementary intervals so that Parley's
 /// single `Brush(Ink)` index per glyph run carries the combined colour, background, underline,
@@ -267,7 +442,7 @@ pub fn flatten_spans(spans: &[Span]) -> Vec<Span> {
 }
 
 /// A pressable byte range of a text element: a link, an @mention, a file chip. Attach with
-/// [`El::link`](crate::El::link) and handle with [`El::on_link`](crate::El::on_link). Its resting
+/// `El::link` and handle with `El::on_link`. Its resting
 /// look is whatever [`Span`]s cover it; [`LinkPaint`]s add the hover, pressed and focus looks.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Link {
@@ -332,7 +507,7 @@ impl Link {
         self.focused = Some(paint);
         self
     }
-    /// A tooltip for this link alone, as [`El::help`](crate::El::help) is for an element:
+    /// A tooltip for this link alone, as `El::help` is for an element:
     /// shown after the hover delay while the pointer rests on the link's glyphs, and hidden
     /// by a press, scroll, key or the pointer leaving them. An empty string sets none.
     pub fn help(mut self, text: impl Into<String>) -> Self {
@@ -451,8 +626,7 @@ impl TextHighlight {
         self.vpad = vpad.max(0.0);
         self
     }
-    /// Optional key for [`Tx::scroll_into_view`](crate::Tx::scroll_into_view),
-    /// [`Cx::layout`](crate::Cx::layout) and [`Runtime::find`](crate::Runtime::find).
+    /// Optional key for `Tx::scroll_into_view`, `Cx::layout` and `Runtime::find`.
     pub fn key(mut self, key: impl Into<String>) -> Self {
         self.key = Some(key.into());
         self

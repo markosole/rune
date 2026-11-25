@@ -4,7 +4,7 @@
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
 #[cfg(not(target_os = "macos"))]
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::window::Window;
 
 use crate::runtime::RuntimeCore;
@@ -16,6 +16,8 @@ pub(in crate::window) mod float_on_open;
 #[cfg(target_os = "macos")]
 pub(in crate::window) mod mac;
 pub(in crate::window) mod platform_sync;
+#[cfg(test)]
+mod tests;
 
 pub(in crate::window) use platform_sync::sync_platform_core;
 
@@ -56,12 +58,16 @@ pub(in crate::window) fn frame_chrome(chrome: Chrome, titlebar: Option<crate::Ti
 /// Places the traffic lights, and tells the runtime what the window's controls take of the
 /// titlebar and which caption buttons to draw over it. A change re-runs the view.
 pub(in crate::window) fn sync_chrome_core(rt: &mut RuntimeCore, w: &Win, chrome: Chrome, titlebar: Option<crate::Titlebar>) {
+    let resolved = titlebar.map(|t| rt.titlebar_set().over(t));
+    #[cfg(target_os = "macos")]
+    if let Some(t) = resolved {
+        crate::platform::macos::traffic_lights::set_hidden(&w.window, !t.has_controls());
+    }
     let leading = place_chrome(&w.window, frame_chrome(chrome, titlebar, rt.titlebar_set()));
     rt.set_titlebar_inset(leading);
-    let height = titlebar.map(|t| rt.titlebar_set().over(t).height());
-    let caption = caption(w, height);
+    let caption = caption(w, resolved);
     let scale = w.window.scale_factor() as f32;
-    let height = height.filter(|_| custom_frame(w)).unwrap_or(0.0);
+    let height = resolved.filter(|_| custom_frame(w)).map_or(0.0, |t| t.height());
     let buttons = caption.map_or(0.0, |c| c.width(scale));
     // The traffic lights' room is on the right in a right-to-left app on macOS, as the caption
     // buttons' is on the left on Windows.
@@ -69,6 +75,8 @@ pub(in crate::window) fn sync_chrome_core(rt: &mut RuntimeCore, w: &Win, chrome:
     let (left, right) = if caption.is_some_and(|c| c.mirrored) { (left + buttons, right) } else { (left, right + buttons) };
     rt.set_chrome_insets(crate::ChromeInsets::new(left, right, height));
     rt.set_caption(caption);
+    rt.set_maximized(w.is_maximized());
+    rt.set_full_screen(w.is_full_screen());
 }
 
 /// The traffic lights sit at the window's right: a right-to-left app on macOS.
@@ -90,19 +98,45 @@ fn custom_frame(w: &Win) -> bool {
     { let _ = w; false }
 }
 
-/// The caption buttons a custom frame draws `height` points tall; none in full screen.
-fn caption(w: &Win, height: Option<f32>) -> Option<crate::titlebar::Caption> {
+/// The caption buttons a custom frame draws for `titlebar`; hidden in full screen or when
+/// `Titlebar::controls(false)` is set.
+fn caption(w: &Win, titlebar: Option<crate::Titlebar>) -> Option<crate::titlebar::Caption> {
     #[cfg(target_os = "windows")]
     return w.native.frame.as_ref().map(|f| {
-        if let Some(h) = height { f.set_height(h); }
+        if let Some(t) = titlebar {
+            f.set_height(t.height());
+            f.set_controls(t.has_controls());
+        }
         f.caption(&w.window)
     });
     #[cfg(not(target_os = "windows"))]
-    { let _ = (w, height); None }
+    { let _ = (w, titlebar); None }
+}
+
+/// Which native target carries out a titlebar action. Adopted macOS panels drag the `NSPanel`
+/// directly and ignore `DoubleClick` so no titlebar action can reach winit's hidden source
+/// `NSWindow`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::window) enum TitlebarTarget {
+    DragPanel,
+    DragWindow,
+    DoubleClickWindow,
+    Ignore,
+}
+
+/// Selects the native target for a titlebar action based on whether the window is backed by an
+/// adopted macOS `NSPanel`.
+pub(in crate::window) fn titlebar_target(action: crate::runtime::TitlebarAction, panel: bool) -> TitlebarTarget {
+    match (action, panel) {
+        (crate::runtime::TitlebarAction::Drag, true) => TitlebarTarget::DragPanel,
+        (crate::runtime::TitlebarAction::Drag, false) => TitlebarTarget::DragWindow,
+        (crate::runtime::TitlebarAction::DoubleClick, true) => TitlebarTarget::Ignore,
+        (crate::runtime::TitlebarAction::DoubleClick, false) => TitlebarTarget::DoubleClickWindow,
+    }
 }
 
 /// A double click on a titlebar: AppKit's action on macOS, else maximize or restore, as the
-/// maximize button would.
+/// maximize button would. Adopted macOS panels ignore it.
 pub(in crate::window) fn titlebar_double_click(window: &Window) {
     #[cfg(target_os = "macos")]
     mac::titlebar_double_click(window);
@@ -111,8 +145,10 @@ pub(in crate::window) fn titlebar_double_click(window: &Window) {
 }
 
 /// Maximizes the window, or restores it when it is maximized. A window without a maximize
-/// button (one that isn't resizable) only restores.
+/// button (one that isn't resizable) only restores. Adopted macOS panels ignore it.
 pub(in crate::window) fn toggle_maximized(window: &Window) {
+    #[cfg(target_os = "macos")]
+    if crate::platform::macos::is_panel(window) { return; }
     let maximized = window.is_maximized();
     if maximized || window.enabled_buttons().contains(winit::window::WindowButtons::MAXIMIZE) {
         window.set_maximized(!maximized);
@@ -127,10 +163,20 @@ pub(in crate::window) fn open_as(window: &Window, open_as: crate::windows::OpenA
     if open_as.full_screens() { window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None))); }
 }
 
-/// Takes the window full screen, borderless over its display, or brings it back.
+/// Sets the window's full-screen state (`true` for borderless full screen over its display,
+/// `false` to exit). Adopted macOS panels ignore it.
+pub(in crate::window) fn set_full_screen(window: &Window, full_screen: bool) {
+    #[cfg(target_os = "macos")]
+    if crate::platform::macos::is_panel(window) { return; }
+    window.set_fullscreen(full_screen.then_some(winit::window::Fullscreen::Borderless(None)));
+}
+
+/// Takes the window full screen, borderless over its display, or brings it back. Adopted
+/// macOS panels ignore it.
 pub(in crate::window) fn toggle_full_screen(window: &Window) {
-    let full = window.fullscreen().is_some();
-    window.set_fullscreen((!full).then_some(winit::window::Fullscreen::Borderless(None)));
+    #[cfg(target_os = "macos")]
+    if crate::platform::macos::is_panel(window) { return; }
+    set_full_screen(window, window.fullscreen().is_none());
 }
 
 /// The window menu, where a custom titlebar (at `at`, the click's point in window points, else
@@ -154,10 +200,11 @@ pub(in crate::window) fn has_window_menu(window: &Window) -> bool {
     { let _ = window; false }
 }
 
-/// Sizes the window's content to `size` points.
+/// Sizes the window's content to `size` points. Returns the applied physical size when the
+/// platform resizes immediately without sending `WindowEvent::Resized` (Wayland).
 #[cfg(not(target_os = "macos"))]
-pub(in crate::window) fn request_inner_size(window: &Window, size: (f32, f32)) {
+pub(in crate::window) fn request_inner_size(window: &Window, size: (f32, f32)) -> Option<PhysicalSize<u32>> {
     #[cfg(target_os = "windows")]
-    if crate::platform::win32::request_inner_size(window, size) { return; }
-    let _size = window.request_inner_size(LogicalSize::new(size.0, size.1));
+    if crate::platform::win32::request_inner_size(window, size) { return None; }
+    window.request_inner_size(LogicalSize::new(size.0, size.1))
 }

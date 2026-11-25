@@ -343,30 +343,81 @@ impl tracks::MotionState {
             if from == to || tree.node_index.contains_key(&from) || !scene.contains(from) || is_exiting { continue; }
             let index = old_index.get_or_insert_with(|| tree.nodes.iter().enumerate().map(|(k, n)| (n.id, k)).collect());
             let Some(&from_i) = index.get(&from) else { continue };
-            // Scroll offsets live outside the scene: start where `from` was seen on screen. They
-            // come from the last build, which a commit earlier in the same frame (a glide's poll
-            // before the key that closes it) leaves in place, so look nodes up by id.
+            // Scroll offsets and ancestor zoom live outside the scene: start where `from` was seen
+            // on screen. They come from the last build, which a commit earlier in the same frame
+            // (a glide's poll before the key that closes it) leaves in place, so look nodes up by id.
             let built = &*built_index.get_or_insert_with(|| tree.built_ids.iter().enumerate().map(|(k, &id)| (id, k)).collect());
-            // Flights drop the cover offsets of flights around them.
-            let shift = |id: NodeId| built.get(&id).and_then(|&k| paint.inh_scratch.get(k)).map_or([0.0; 2], |h| [h.dx - h.cover[0], h.dy - h.cover[1]]);
-            let source = tree.nodes[from_i].parent.map_or([0.0; 2], |p| shift(tree.nodes[p].id));
+            let from_parent_inh = tree.nodes[from_i].parent
+                .and_then(|p| built.get(&tree.nodes[p].id).copied())
+                .and_then(|k| paint.inh_scratch.get(k))
+                .copied();
             let row = built.get(&from).and_then(|&k| paint.row_dy.get(k)).copied().unwrap_or(0.0);
-            let dest = std::iter::successors(nodes[i].parent, |&p| nodes[p].parent)
-                .map(|p| nodes[p].id).find(|id| built.contains_key(id)).map_or([0.0; 2], shift);
-            let offset = rune_motion::Vec2::new(source[0] - dest[0], source[1] + row - dest[1]);
-            let spring = tx.motion.map(MotionSource::spring).or(nodes[i].matched.as_ref().and_then(|m| m.1)).unwrap_or(crate::tok::motion::REFLOW);
+            let flight_anim: Anim = nodes[i]
+                .matched_motion
+                .as_deref()
+                .copied()
+                .or_else(|| tx.motion.map(MotionSource::anim))
+                .or_else(|| nodes[i].matched.as_ref().and_then(|m| m.1).map(Anim::from))
+                .unwrap_or_else(|| Anim::from(crate::tok::motion::REFLOW));
             let rest_fill = tree.nodes[from_i].vis.fill;
             let fill = if scene.store().is_animating(from, P_FILL) { scene.get(from, P_FILL).unwrap_or(rest_fill) } else { rest_fill };
             let opacity = scene.get(from, prop::OPACITY);
-            scene.match_geometry_offset(from, to, offset, LayoutAnim::new(spring).screen());
+            let anim = LayoutAnim::new(flight_anim).screen();
+            if self.flying.iter().any(|f| f.0 == from) && !self.launches.launched(from) {
+                // Mid-flight toggle: `from` drew along its blended flight frame rather than its
+                // parent's full zoom, so continue from that exact drawn rect and speed.
+                let held = from_parent_inh.map_or((1.0, [0.0; 2], [0.0; 2]), |h| h.held);
+                let dxy = from_parent_inh.map_or([0.0, row], |h| [h.dx - h.cover[0], h.dy - h.cover[1] + row]);
+                let anc_off = super::super::paint::build::pose::ancestor_scene_offset(&tree.nodes, scene, tree.nodes[from_i].parent);
+                let row_h = built.get(&from).and_then(|&k| paint.row_h.get(k)).copied().unwrap_or(-1.0);
+                let p_rect = scene.presented(from).map_or(tree.nodes[from_i].local, |p| p.rect);
+                let delta = super::super::paint::build::pose::flight_rest_delta(scene, &tree.nodes[from_i], p_rect, 1.0, row_h, held, dxy, anc_off);
+                let travel = scene.get(from, prop::TRAVEL).unwrap_or(rune_motion::Vec2::new(1.0, 1.0));
+                let travel_vel = scene.store().sample_velocity(from, prop::TRAVEL).unwrap_or(rune_motion::Vec2::ZERO);
+                let k_t = (0.5 * (travel.x + travel.y)).clamp(0.0, 1.0);
+                let radius_scale = 1.0 + (held.0 - 1.0) * k_t;
+                scene.match_geometry_from_flight(from, to, delta, travel, travel_vel, radius_scale, anim);
+            } else {
+                let (scale, anchor, anchor_to) = if self.launches.launched(from) {
+                    from_parent_inh.map_or((1.0, [0.0; 2], [0.0; 2]), |h| h.still)
+                } else {
+                    built.get(&from)
+                        .and_then(|&k| paint.inh_scratch.get(k))
+                        .map_or((1.0, [0.0; 2], [0.0; 2]), |h| (h.scale, h.anchor, h.anchor_to))
+                };
+                let source = from_parent_inh.map_or([0.0; 2], |h| {
+                    if self.launches.launched(from) { [h.dx - h.cover[0], h.dy - h.cover[1]] } else { [h.dx, h.dy] }
+                });
+                let offset = rune_motion::Vec2::new(source[0], source[1] + row);
+                scene.match_geometry_scaled(
+                    from,
+                    to,
+                    scale,
+                    rune_motion::Vec2::new(anchor[0], anchor[1]),
+                    rune_motion::Vec2::new(anchor_to[0], anchor_to[1]),
+                    offset,
+                    anim,
+                );
+            }
+            for h in scene.take_handovers() {
+                let start = [h.start.x, h.start.y, h.start.w, h.start.h];
+                let from_rect = built.get(&h.from).and_then(|&k| paint.drawn.get(k).copied()).unwrap_or(start);
+                self.record_handover(tracks::RecordedHandover {
+                    from_path: tree.nodes[from_i].path.clone(),
+                    to_path: nodes[i].path.clone(),
+                    to_id: h.to,
+                    from_rect,
+                    start_rect: start,
+                });
+            }
             let live = |p: crate::live::Property| nodes[i].live.iter().any(|b| b.property == p);
             if fill != nodes[i].vis.fill && !live(crate::live::Property::Fill) {
                 scene.set(to, P_FILL, fill);
-                scene.animate(to, P_FILL, nodes[i].vis.fill, spring);
+                scene.animate(to, P_FILL, nodes[i].vis.fill, flight_anim);
             }
             if let Some(o) = opacity.filter(|&o| o != nodes[i].vis.opacity) && !live(crate::live::Property::Opacity) {
                 scene.set(to, prop::OPACITY, o);
-                scene.animate(to, prop::OPACITY, nodes[i].vis.opacity, spring);
+                scene.animate(to, prop::OPACITY, nodes[i].vis.opacity, flight_anim);
             }
             // Its content mounted with it and flies as part of what was seen, so none of it fades
             // in on its own (each fresh level under a present parent otherwise would).
@@ -376,7 +427,7 @@ impl tracks::MotionState {
             }
             self.flying.retain(|f| f.0 != to);
             self.flying.push((to, nodes[i].local));
-            self.launches.unclip(to, tx.unclipped_flights);
+            self.launches.unclip(to, tx.unclipped_flights && !nodes[i].vis.flight_in_place);
         }
     }
 

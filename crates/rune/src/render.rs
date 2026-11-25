@@ -9,6 +9,7 @@ mod breaker;
 mod damaged;
 mod device;
 mod dxbc;
+mod effect_warm;
 mod fill;
 mod first_use;
 mod gpu_loss;
@@ -33,9 +34,15 @@ mod prewarm {
     pub(super) fn take() -> Option<(super::Gpu, super::Renderer)> { None }
     pub(super) fn discard() {}
 }
+mod shader_check;
+mod surface_setup;
 mod uber_wgsl;
 mod upload;
 mod variant;
+#[cfg(any(target_os = "linux", all(test, not(target_arch = "wasm32"))))]
+mod vulkan_icd;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod warm_machine;
 mod warmup;
 #[cfg(target_os = "macos")]
 mod windfoil_metallib;
@@ -62,28 +69,47 @@ mod prewarm_tests;
 #[cfg(test)]
 #[path = "render/warm_tests.rs"]
 mod warm_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod webgl_shader_tests;
 
 use pass::{ActivePass, Backdrop};
 
 #[cfg(target_os = "windows")]
 pub(crate) use damaged::MAX_RECTS;
+pub(crate) use shader_check::ShaderError;
+pub(crate) use surface_setup::{SurfaceSetupError, format_window_setup_error};
+#[cfg(target_os = "windows")]
+pub(crate) use surface_setup::with_wine_hwnd_hint;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use device::cancel_prewarm;
 pub(crate) use device::choose_gpu_backend;
 pub(crate) use device::discard_prewarm;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use device::reopen_prewarm;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use device::shutdown_prewarm;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use warm_machine::ShutdownOutcome;
 pub(crate) use instance::Globals;
 pub(crate) use instance::INSTANCE_WORDS;
 pub(crate) use instance::effect_mark;
 pub(crate) use instance::end_layer;
 pub(crate) use instance::pack_u64_f32;
+pub(crate) use instance::shader_consts;
 pub(crate) use instance::turned_bounds;
 pub(crate) use instance::unpack_u64_f32;
 pub(crate) use instance::word;
 pub(crate) use warmup::park_gpu;
 pub(crate) use warmup::surface_gpu;
+#[cfg(target_os = "linux")]
+pub(crate) use warmup::{warm_gpu_made, warm_gpu_then};
 
 pub use backdrop_blur::MAX_BACKDROP_BLURS;
 pub use device::Gpu;
 pub use device::prewarm_gpu;
 pub use device::prewarm_gpu_on;
+pub use device::set_gpu_memory_policy;
+pub use effect_warm::PrewarmEffects;
 #[doc(hidden)]
 pub use fill::FillDrift;
 pub use first_use::make_layer_blur;
@@ -117,6 +143,7 @@ pub use offscreen::Offscreen;
 pub use offscreen::write_png;
 pub use rune_core::Blend;
 pub use warmup::warm_gpu;
+pub use warmup::warm_gpu_cache;
 pub use warmup::warm_gpu_with;
 
 /// Rows the first glyph atlas page's texture starts with: a window that shows a few labels holds
@@ -263,6 +290,10 @@ enum BatchBind {
 }
 
 pub struct Renderer {
+    /// Post-first-frame background effect-pipeline warmer: listed first so its Drop drains
+    /// any active worker before GPU resources on this renderer drop.
+    effect_warm: effect_warm::EffectWarm,
+    first_frame_submitted: std::sync::atomic::AtomicBool,
     surfaces: Option<crate::native_surface::SurfaceRenderer>,
     /// The native surface renderer while its pipeline compiles (`build_surfaces`).
     surfaces_building: Option<crate::native_surface::Building>,
@@ -320,6 +351,12 @@ pub struct Renderer {
     backdrop_blur: Option<backdrop_blur::BackdropBlur>,
     /// Which lazily built pipelines the device took (`breaker`).
     breakers: breaker::Breakers,
+    /// Health of the primary uber shader and pipeline (`shader_check`), tracking async WebGPU
+    /// error scopes on the web.
+    uber_check: shader_check::UberCheck,
+    uber_check_seq: crate::machine::Seq,
+    #[cfg(target_arch = "wasm32")]
+    uber_check_wake: shader_check::WakeSlot,
     uploads: upload::Uploads,
     /// Atlas fills `prepare` staged, recorded into the frame's encoder with the uploads.
     fills: std::sync::Mutex<Option<fill::PendingFills>>,
@@ -342,8 +379,24 @@ impl Renderer {
         self.device_key
     }
 
+    /// Creates a renderer for `device` drawing into `format`, panicking if the GPU rejects
+    /// Rune's last-resort uber shader or pipeline. Windows and headless runs use [`Self::try_new`].
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Renderer {
-        Self::create(device, format, None, cfg!(target_os = "macos"))
+        Self::try_new(device, format).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Creates a renderer for `device` drawing into `format`, returning an error instead of
+    /// leaving an invalid pipeline if the GPU rejects Rune's last-resort uber shader or pipeline.
+    ///
+    /// On native devices and WebGL2 the shader and pipeline are checked synchronously inside
+    /// validation, out-of-memory and internal error scopes. On browser WebGPU, error scopes
+    /// resolve asynchronously and are checked by the web host without blocking startup.
+    pub fn try_new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Result<Renderer, String> {
+        Self::try_new_classified(device, format).map_err(Into::into)
+    }
+
+    pub(crate) fn try_new_classified(device: &wgpu::Device, format: wgpu::TextureFormat) -> Result<Renderer, ShaderError> {
+        Self::try_create(device, format, None, cfg!(target_os = "macos"))
     }
 
     pub fn set_srgb_blend(&mut self, enabled: bool) {
@@ -363,15 +416,29 @@ impl Renderer {
 
     /// Opt-in retained geometry. IDs map instances to shared translation/opacity nodes.
     /// Upload geometry once with `prepare`, then use `present_at` without rebuilding instances.
+    /// Panics if the GPU rejects the spring uber shader or pipeline; use [`Self::try_with_springs`]
+    /// to handle that failure.
     pub fn with_springs(device: &wgpu::Device, format: wgpu::TextureFormat, nodes: &[crate::gpu::springs::Node], ids: &[u32]) -> Renderer {
-        Self::create(device, format, Some((nodes, ids)), true)
+        Self::try_with_springs(device, format, nodes, ids).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Like [`Self::with_springs`], returning an error if the GPU rejects the shader or pipeline.
+    pub fn try_with_springs(device: &wgpu::Device, format: wgpu::TextureFormat, nodes: &[crate::gpu::springs::Node], ids: &[u32]) -> Result<Renderer, String> {
+        Self::try_create(device, format, Some((nodes, ids)), true).map_err(Into::into)
     }
 
     /// A renderer that starts with the Classic uber shader, as on macOS, and builds Windfoil when
     /// text first draws from outlines (render/variant.rs); for checking that path elsewhere.
     #[doc(hidden)]
     pub fn new_classic(device: &wgpu::Device, format: wgpu::TextureFormat) -> Renderer {
-        Self::create(device, format, None, true)
+        Self::try_new_classic(device, format).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Like [`Self::new_classic`], returning an error if the GPU rejects the Classic shader or
+    /// pipeline.
+    #[doc(hidden)]
+    pub fn try_new_classic(device: &wgpu::Device, format: wgpu::TextureFormat) -> Result<Renderer, String> {
+        Self::try_create(device, format, None, true).map_err(Into::into)
     }
 
     /// Draws uploaded instances `range` into a pass whose target has `format` (the renderer's
@@ -569,7 +636,9 @@ impl Renderer {
 
     pub fn submit(&self, queue: &wgpu::Queue, mut encoder: wgpu::CommandEncoder) -> wgpu::SubmissionIndex {
         self.before_submit(&mut encoder);
-        if let Some(s) = &self.surfaces { s.submit(queue, encoder) } else { queue.submit([encoder.finish()]) }
+        let index = if let Some(s) = &self.surfaces { s.submit(queue, encoder) } else { queue.submit([encoder.finish()]) };
+        self.first_frame_submitted.store(true, std::sync::atomic::Ordering::Release);
+        index
     }
 
     /// Whether `submit` is `queue.submit` after `before_submit` and nothing more: no native video

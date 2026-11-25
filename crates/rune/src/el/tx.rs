@@ -6,7 +6,9 @@ use rune_motion::{Anim, Spring};
 
 use crate::el::*;
 
+mod elements;
 mod keys;
+mod pick;
 mod press;
 mod scroll;
 
@@ -29,6 +31,10 @@ pub struct Tx {
     pub(crate) physical_key: Option<crate::PhysicalKeyCode>,
     pub(crate) key_base: Option<char>,
     pub(crate) focused: Option<String>,
+    /// Full tree path of the focused element, for [`Tx::focus_within`].
+    pub(crate) focused_path: Option<String>,
+    /// Focused inline link id (when focus sits on a [`Link`](crate::Link)), for [`Tx::focus_within`].
+    pub(crate) focused_link: Option<String>,
     /// What this change does with motion ([`Tx::instant`], [`Tx::animated`], [`Tx::settle`]).
     pub(crate) commit: Commit,
     /// The motion this change's layout moves on ([`Tx::motion`], [`Tx::motion_curve`]).
@@ -65,33 +71,56 @@ pub struct Tx {
     /// Scroll viewports to send to their bottom: (key, animated).
     pub(crate) scroll_bottom: Vec<(String, bool)>,
     /// Scroll viewports to page: (key, pages).
-    pub(crate) scroll_pages: Vec<(String, i32)>,
+    pub(crate) scroll_pages: Vec<(String, i32, crate::ScrollSource)>,
     /// Scroll viewports to move to offsets (`Tx::scroll_to` and kin).
     pub(crate) scroll_offsets: Vec<crate::runtime::ScrollRequest>,
+    /// Scroll viewports to halt where they stand (`Tx::stop_scroll`).
+    pub(crate) scroll_stops: Vec<String>,
     /// Elements to hold where they show across this commit (`Tx::keep_on_screen`).
     pub(crate) keep_on_screen: Vec<String>,
     pub(crate) wakes: Vec<std::time::Duration>,
     pub(crate) shell: Option<Shell>,
+    /// User-initiated close request (macOS unhandled ⌘W / Window › Close, assistive activation of
+    /// the custom caption close button): routes through `App::on_close_request` instead of
+    /// programmatic `Shell::Close`.
+    pub(crate) user_close_request: bool,
     pub(crate) minimize_order: Option<std::num::NonZeroU64>,
     /// `Tx::toggle_maximized`.
     pub(crate) toggle_maximized: bool,
-    /// `Tx::toggle_full_screen`.
-    pub(crate) toggle_full_screen: bool,
+    /// `Tx::toggle_full_screen` and `Tx::set_full_screen`; the last call in a turn wins.
+    pub(crate) full_screen: Option<FullScreenRequest>,
     /// `Tx::send_key`, in order.
     pub(crate) keys: Vec<crate::KeyEvent>,
     /// `Tx::drop_point`.
     pub(crate) drop_point: Option<PointerEvent>,
+    /// `Tx::drag_paths`.
+    pub(crate) drag_paths: Option<Rc<[std::path::PathBuf]>>,
     pub(crate) title: Option<String>,
+    pub(crate) color_scheme: Option<crate::ColorScheme>,
+    /// `Tx::set_represented_file`: `Some(Some(path))` sets, `Some(None)` clears.
+    pub(crate) represented_file: Option<Option<std::path::PathBuf>>,
+    /// `Tx::set_document_edited`.
+    pub(crate) document_edited: Option<bool>,
     /// `Tx::announce`: what a screen reader says after this handler.
     pub(crate) announce: Option<(String, crate::LiveRegion)>,
     pub(crate) open_urls: Vec<crate::open_url::Link>,
+    pub(crate) open_paths: Vec<crate::open_path::PathRequest>,
     pub(crate) trace: Option<TraceCalls>,
     pub(crate) popups: Vec<crate::popup_menu::Call>,
+    /// `Tx::resolve_field_menu`: `Some(Some(id))` picks an item, `Some(None)` dismisses.
+    pub(crate) field_menu_resolution: Option<Option<String>>,
+    /// A handler in this transaction opened a new fallback field menu (`App::on_field_menu`),
+    /// superseding any earlier action's stale `field_menu_resolution` in the same frame.
+    pub(crate) field_menu_opened: bool,
     pub(crate) file_dialogs: Vec<crate::file_dialog::Call>,
     pub(crate) window_frame: Option<crate::window::frame::FrameRequest>,
     /// The mouse button driving this press or drag (`Tx::button`).
     pub(crate) button: crate::PointerButton,
     pub(crate) touch_tap: bool,
+    /// `Tx::press_point`.
+    pub(crate) press_point: Option<PointerEvent>,
+    /// `Tx::link_rect`.
+    pub(crate) link_rect: Option<[f32; 4]>,
     /// Modifier keys held as the handler runs.
     pub(crate) mods: crate::Mods,
     pub(crate) srgb_blend: Option<bool>,
@@ -99,7 +128,13 @@ pub struct Tx {
     pub(crate) rewind: Option<Option<crate::rewind::Rewind>>,
     pub(crate) font_smoothing: Option<crate::text::FontSmoothing>,
     pub(crate) font_families: Option<(String, String)>,
+    /// `Tx::set_emoji_family`: `Some(Some(name))` sets, `Some(None)` clears to system fallback.
+    pub(crate) emoji_family: Option<Option<String>>,
+    /// `Tx::add_font`: new font bytes were registered during this handler.
+    pub(crate) fonts_added: bool,
     pub(crate) blur: bool,
+    /// `Tx::cancel_pointer`.
+    pub(crate) cancel_pointer: bool,
     /// `Tx::focus` and `Tx::return_focus`: the key, whether its ring shows, and which asked.
     pub(crate) focus_to: Option<(String, bool, FocusAsk)>,
     /// `Tx::focus_visible`.
@@ -125,6 +160,16 @@ pub struct Tx {
     pub(crate) evict_memos: Vec<String>,
     /// `Tx::clock`.
     pub(crate) clock: f64,
+    /// `Tx::scale` (0 when unset on `Tx::default()`, which reads as 1.0).
+    pub(crate) scale: f32,
+}
+
+/// What a handler asked of the window's full-screen state ([`Tx::toggle_full_screen`],
+/// [`Tx::set_full_screen`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FullScreenRequest {
+    Toggle,
+    Set(bool),
 }
 
 /// Which asked for focus: [`Tx::focus`], [`Tx::focus_when_shown`], or [`Tx::return_focus`]
@@ -290,7 +335,8 @@ impl Tx {
         self.pick_read(None, x, y, crate::Pick::default(), f);
     }
 
-    /// [`Tx::element_at`] with options ([`Pick`](crate::Pick)).
+    /// [`Tx::element_at`] with options ([`Pick`](crate::Pick)): transparent layers,
+    /// [`crate::Pick::interactive`] hit targets, or [`crate::Pick::drop_targets`].
     pub fn element_at_with<S: 'static>(&mut self, x: f32, y: f32, pick: crate::Pick, f: impl FnOnce(&mut S, Option<crate::Picked>, &mut Tx) + 'static) {
         self.pick_read(None, x, y, pick, f);
     }
@@ -311,7 +357,7 @@ impl Tx {
         let f: PickFn = Box::new(move |s, picked, tx| {
             if let Some(s) = s.cast::<S>() { f(s, picked, tx); }
         });
-        self.pick_reads.push(PickRead { within, x, y, pick, f: Rc::new(std::cell::Cell::new(Some(f))) });
+        self.pick_reads.push(PickRead::Element { within, x, y, pick, f: Rc::new(std::cell::Cell::new(Some(f))) });
     }
 
     /// [`Runtime::invalidate_memos_by_prefix`](crate::Runtime::invalidate_memos_by_prefix) on
@@ -328,7 +374,7 @@ impl Tx {
     /// or a text flight. A `wake_after` only schedules.
     pub(crate) fn frame_work(&self) -> bool {
         !self.pick_reads.is_empty() || !self.scroll_to.is_empty() || !self.scroll_bottom.is_empty() || !self.scroll_pages.is_empty() || !self.scroll_offsets.is_empty()
-            || !self.keep_on_screen.is_empty() || !self.text_flights.is_empty() || !self.launches.is_empty() || self.select.is_some()
+            || !self.scroll_stops.is_empty() || !self.keep_on_screen.is_empty() || !self.text_flights.is_empty() || !self.launches.is_empty() || self.select.is_some() || self.field_menu_resolution.is_some()
     }
 
     /// An app marker on the next frame, e.g. `tx.trace_event(format_args!("lab:{step:?}"))`.
@@ -352,9 +398,9 @@ impl Tx {
     ///
     /// `wake_after(Duration::ZERO)` from the poll asks for the next frame: a poll that steps
     /// its own animation from the frame clock keeps a shown window or overlay drawing at the
-    /// display's rate this way, until it stops asking. That needs a display link pacing the
-    /// surface (macOS); hidden, covered, faded out or unpaced, a wake due sooner than a frame
-    /// waits about a frame (60 Hz), so a poll that keeps asking never spins the loop.
+    /// display's rate this way, until it stops asking. That uses the display link on macOS and
+    /// display vblank pacing on Windows; hidden, covered, faded out or unpaced, a wake due sooner
+    /// than a frame waits about a frame (60 Hz), so a poll that keeps asking never spins the loop.
     #[cfg_attr(feature = "frame-profile", track_caller)]
     pub fn wake_after(&mut self, duration: std::time::Duration) {
         #[cfg(feature = "frame-profile")]
@@ -370,6 +416,20 @@ impl Tx {
         self.clock
     }
 
+    /// The window's display scale in device pixels per view point (matching
+    /// [`Cx::env`](crate::Cx::env)`.scale`, including any [`Cx::zoom`](crate::Cx::zoom)) as
+    /// this handler or `poll` runs. `1.0` for a `Tx` no runtime made.
+    ///
+    /// ```ignore
+    /// .on_layout_tx(|s: &mut Viewer, [_, _, w, h], tx| {
+    ///     let scale = tx.scale();
+    ///     s.backing_px = [(w * scale).round() as u32, (h * scale).round() as u32];
+    /// })
+    /// ```
+    pub fn scale(&self) -> f32 {
+        if self.scale.is_finite() && self.scale > 0.0 { self.scale } else { 1.0 }
+    }
+
     /// Wake the app's poll hook once the clock reaches `due` (seconds on [`Tx::clock`]), as
     /// [`Tx::wake_after`] does for the time left; a deadline already past wakes the next
     /// frame. A timed state stores its deadline and asks for it here, and its poll checks
@@ -381,9 +441,17 @@ impl Tx {
         self.wakes.push(std::time::Duration::from_secs_f64((due - self.clock).max(0.0)));
     }
 
-    /// Close the window after this handler, as the close button would (`App::on_close` runs).
+    /// Close the window after this handler (`App::on_close` runs; bypasses
+    /// `App::on_close_request` so an approved close completes without re-asking).
     pub fn close_window(&mut self) {
         self.shell = self.shell.max(Some(Shell::Close));
+    }
+
+    /// Requests closing the window on the user's behalf (macOS unhandled ⌘W / Window › Close,
+    /// assistive activation of the custom caption close button), routing through
+    /// `App::on_close_request` before closing. Programmatic app code calls `Self::close_window`.
+    pub(crate) fn request_user_close(&mut self) {
+        self.user_close_request = true;
     }
 
     /// Quit the app after this handler, whether or not it keeps running without a window. Every
@@ -401,16 +469,19 @@ impl Tx {
     }
 
     /// Minimize this window after this handler, as its minimize button would (winit's
-    /// `set_minimized` off macOS). Does nothing (logging in debug builds) where a window
-    /// can't minimize: an overlay, a panel or launcher, a borderless window, or one without a
-    /// minimize button.
+    /// `set_minimized` off macOS). On Windows and Linux, resizable borderless windows
+    /// (`WindowOptions { borderless: true, ..Default::default() }`) minimize when
+    /// `WindowButtons::MINIMIZE` is enabled; does nothing (logging in debug builds) for a
+    /// hidden window, a panel or launcher, a click-through overlay, a non-resizable
+    /// borderless window, a borderless window on macOS, or a window without a minimize button.
     /// A close or quit asked in the same change wins.
     pub fn minimize(&mut self) {
         self.minimize_order = Some(crate::app::window_request_order());
     }
 
     /// Maximize this window after this handler, or restore it when it is maximized, as its
-    /// maximize button would (macOS zooms). Does nothing for overlays and headless runs.
+    /// maximize button would (macOS zooms). Does nothing for overlays, macOS non-activating
+    /// panels, and headless runs. Read the confirmed OS state with [`crate::Cx::is_maximized`].
     pub fn toggle_maximized(&mut self) {
         self.toggle_maximized = true;
     }
@@ -418,9 +489,27 @@ impl Tx {
     /// Take this window full screen after this handler, or bring it back, as macOS's green
     /// button and Electron's `setFullScreen` do: on Windows and Linux a borderless window over
     /// its display, which hides a custom titlebar's caption buttons (`Cx::chrome_insets`).
-    /// Does nothing for overlays and headless runs.
+    /// Does nothing for overlays, macOS non-activating panels, and headless runs. When both
+    /// `toggle_full_screen` and [`Self::set_full_screen`] run in one turn, the last call wins.
+    /// Read the confirmed OS state with [`crate::Cx::is_full_screen`].
     pub fn toggle_full_screen(&mut self) {
-        self.toggle_full_screen = true;
+        self.full_screen = Some(FullScreenRequest::Toggle);
+    }
+
+    /// Enter (`true`) or exit (`false`) full screen after this handler, as Electron's
+    /// `BrowserWindow.setFullScreen(flag)` does: on Windows and Linux a borderless window over
+    /// its display, on macOS a native full-screen Space. Does nothing for overlays, macOS
+    /// non-activating panels, and headless runs, and is a no-op when the window is already in
+    /// the requested state. When multiple calls to `set_full_screen` or
+    /// [`Self::toggle_full_screen`] run in one turn, the last call wins. Read the confirmed OS
+    /// state with [`crate::Cx::is_full_screen`].
+    ///
+    /// ```
+    /// # use rune::{el, Tx};
+    /// let _button = el().on_press_tx(|_: &mut (), tx: &mut Tx| tx.set_full_screen(true));
+    /// ```
+    pub fn set_full_screen(&mut self, full_screen: bool) {
+        self.full_screen = Some(FullScreenRequest::Set(full_screen));
     }
 
     /// Deliver `ev` once this handler is done, as if it were typed: to the focused field, then
@@ -436,6 +525,65 @@ impl Tx {
     /// opened again. Headless `--tree` output shows it as `"title"`. An overlay has no title.
     pub fn set_title(&mut self, title: impl Into<String>) {
         self.title = Some(title.into());
+    }
+
+    /// Override this window's native light or dark chrome after this handler, retained across
+    /// native window recreation.
+    ///
+    /// On Windows this updates the native titlebar (`DWMWA_USE_IMMERSIVE_DARK_MODE`), on macOS
+    /// `NSWindow.appearance`, on Wayland client-side decorations, and on X11 `_GTK_THEME_VARIANT`.
+    /// Passing [`ColorScheme::System`](crate::ColorScheme::System) clears the per-window override
+    /// so the window inherits any app-wide override set via
+    /// [`AppHandle::set_color_scheme`](crate::AppHandle::set_color_scheme) or the operating
+    /// system's appearance. Ignored on overlays, web, and headless.
+    ///
+    /// ```no_run
+    /// use rune::{ColorScheme, El, el};
+    ///
+    /// let button: El = el().on_press_tx(|_: &mut (), tx| tx.set_color_scheme(ColorScheme::Dark));
+    /// let _ = button;
+    /// ```
+    pub fn set_color_scheme(&mut self, scheme: crate::ColorScheme) {
+        self.color_scheme = Some(scheme);
+    }
+
+    /// Sets or clears this window's represented document path on macOS (`NSWindow.representedURL`),
+    /// updating AppKit's titlebar proxy icon and path menu without performing filesystem I/O.
+    /// Pass `None` (or an empty path) to clear the represented file. When the window opted into
+    /// [`MacWindowOptions::title_from_file`](crate::MacWindowOptions::title_from_file), the
+    /// native title updates to the file's final path component (and restores the window's
+    /// configured title when cleared); calling [`Tx::set_title`](Self::set_title) in the same
+    /// turn takes precedence. Retained across native window recreation. No-op off macOS, on
+    /// overlays, and in headless runs.
+    ///
+    /// ```no_run
+    /// use std::path::PathBuf;
+    /// use rune::{El, el};
+    ///
+    /// let button: El = el().on_press_tx(|_: &mut (), tx| {
+    ///     tx.set_represented_file(Some(PathBuf::from("/tmp/notes.md")));
+    /// });
+    /// let _ = button;
+    /// ```
+    pub fn set_represented_file(&mut self, path: Option<std::path::PathBuf>) {
+        self.represented_file = Some(crate::window::spec::normalize_represented_file(path));
+    }
+
+    /// Sets this window's document-edited state on macOS (`NSWindow.documentEdited`), showing
+    /// (`true`) or hiding (`false`) the unsaved-changes dot inside the close button. Retained
+    /// across native window recreation. No-op off macOS, on overlays, and in headless runs.
+    ///
+    /// Following AppKit's default, marking a document as edited disables dragging its proxy icon
+    /// until `set_document_edited(false)` is called.
+    ///
+    /// ```no_run
+    /// use rune::{El, el};
+    ///
+    /// let button: El = el().on_press_tx(|_: &mut (), tx| tx.set_document_edited(true));
+    /// let _ = button;
+    /// ```
+    pub fn set_document_edited(&mut self, edited: bool) {
+        self.document_edited = Some(edited);
     }
 
     /// Have a screen reader say `text` after this handler, without moving focus: a reply that
@@ -490,6 +638,29 @@ impl Tx {
     /// Wayland and headless runs ignore it.
     pub fn center_window(&mut self) {
         self.frame_request(crate::window::frame::FrameRequest { center: true, ..Default::default() });
+    }
+
+    /// Start an interactive OS/compositor-driven window resize from `edge` (winit's
+    /// `Window::drag_resize_window`: Win32 sizing borders, X11 `_NET_WM_MOVERESIZE`, Wayland
+    /// `xdg_toplevel.resize`). Call from a press or [`El::on_drag`](crate::El::on_drag)
+    /// [`Phase::Down`](crate::Phase::Down) handler on a custom resize grip; for a plain resize
+    /// edge or corner without custom logic, prefer
+    /// [`El::window_resize`](crate::El::window_resize), which also supplies the matching resize
+    /// cursor. Ignored on macOS, on the web, in overlays, and in headless runs.
+    ///
+    /// ```
+    /// # use rune::{Cursor, Phase, ResizeEdge, el};
+    /// # struct App;
+    /// # let _ =
+    /// el().size(12.0, 12.0).cursor(Cursor::ResizeNwse).on_drag(|_: &mut App, d, tx| {
+    ///     if d.phase == Phase::Down {
+    ///         tx.drag_resize_window(ResizeEdge::SouthEast);
+    ///     }
+    /// })
+    /// # ;
+    /// ```
+    pub fn drag_resize_window(&mut self, edge: crate::ResizeEdge) {
+        self.frame_request(crate::window::frame::FrameRequest { resize_drag: Some(edge), ..Default::default() });
     }
 
     /// Drop keyboard focus, as a click on empty space does: after this handler, nothing is
@@ -552,7 +723,8 @@ impl Tx {
         !self.window_hidden
     }
 
-    /// Whether keyboard focus was showing its ring (`:focus-visible`) as this event arrived:
+    /// Whether keyboard focus was showing its ring (`:focus-visible`) as this event arrived
+    /// (or after the transition inside [`El::on_focus_change`] and [`El::on_focus_within_change`]):
     /// the keyboard, not the pointer, has been driving. A menu that opens with it returns focus
     /// to its trigger with the ring.
     pub fn focus_visible(&self) -> bool {
@@ -568,9 +740,11 @@ impl Tx {
     }
 
     /// The [`El::selectable`] text selection as this event arrived: the texts it covers with
-    /// their selected ranges, and the text as copying takes it. `None` when nothing is
-    /// selected (a single click leaves only a caret-sized selection, which reads as `None`).
-    /// What this handler asks with [`Tx::select_text`] and kin shows from the next event on.
+    /// their selected ranges, the text as copying takes it, and whether collection across unbuilt
+    /// virtual rows hit its cap ([`TextSelection::truncated`](crate::TextSelection::truncated)).
+    /// `None` when nothing is selected (a single click leaves only a caret-sized selection, which
+    /// reads as `None`). What this handler asks with [`Tx::select_text`] and kin shows from the
+    /// next event on.
     pub fn text_selection(&self) -> Option<&crate::TextSelection> {
         self.selection.as_deref()
     }
@@ -580,7 +754,7 @@ impl Tx {
     /// handler's commit: an element the same change builds can be selected, and an unbuilt
     /// [`El::virtual_rows`] or [`El::virtualize`] row is built and pinned without scrolling.
     /// The range is clamped to the text and its character boundaries; Cmd+C then copies it and Cmd+A selects all of its text or group.
-    /// Nothing happens when `key` (the element's final key; a [`memo`](crate::memo)'s id replaces one set inside) names no selectable text.
+    /// Nothing happens when `key` (the element's final key; a [`memo`](crate::memo())'s id replaces one set inside) names no selectable text.
     pub fn select_text(&mut self, key: impl Into<String>, range: std::ops::Range<usize>) {
         self.select = Some(SelectRequest::Range(key.into(), range));
         self.select_from_change = false;
@@ -634,6 +808,57 @@ impl Tx {
     /// on parallel threads isolate `measure` with [`rune::text::with_families`](crate::text::with_families).
     pub fn set_font_families(&mut self, sans: impl Into<String>, mono: impl Into<String>) {
         self.font_families = Some((sans.into(), mono.into()));
+    }
+
+    /// Sets or clears the opt-in preferred colour emoji font family (or comma-separated CSS family
+    /// list) for every window and overlay on this thread, and for windows opened later, as
+    /// [`App::emoji_family`](crate::App::emoji_family) does at launch.
+    ///
+    /// Precedence for emoji graphemes is: this explicit `emoji_family` first, then any colour
+    /// emoji font explicitly named in the active family stack (`AppSpec::families`,
+    /// [`Self::set_font_families`], or `Family::Named`), then the lazily loaded system emoji
+    /// font, then the active text stack. Pass `None` or an empty / whitespace-only string to clear
+    /// the override and restore default emoji fallback. Asking for the value already active costs
+    /// nothing; changing it drops shaped layouts, rebuilds memoized subtrees, updates
+    /// [`rune::text::measure`](crate::text::measure), and advances
+    /// [`rune::text::font_epoch`](crate::text::font_epoch).
+    ///
+    /// ```
+    /// # use rune::Tx;
+    /// # let mut tx = Tx::default();
+    /// tx.set_emoji_family(Some("Twemoji"));
+    /// tx.set_emoji_family(None);
+    /// ```
+    pub fn set_emoji_family(&mut self, family: Option<&str>) {
+        self.emoji_family = Some(crate::text::normalize_emoji_family(family));
+    }
+
+    /// Registers font bytes (TTF, OTF, TTC, or variable font) into the process-wide font
+    /// collection at runtime, returning the registered family names in registration order.
+    ///
+    /// Pass bytes loaded off the UI thread (or embedded bytes); never read font files on the UI
+    /// thread. Select a returned family with [`Self::set_font_families`] or
+    /// [`Family::Named`](crate::Family::Named). Every window, overlay, and
+    /// [`rune::text::measure`](crate::text::measure) picks up the new faces, and caches keyed on
+    /// [`rune::text::font_epoch`](crate::text::font_epoch) invalidate automatically.
+    ///
+    /// Empty slices, blobs larger than 64 MiB, and unrecognised font data are ignored and return
+    /// an empty list. Registering bytes that are already registered returns their family names
+    /// without duplicating data or triggering a relayout.
+    ///
+    /// ```
+    /// # use rune::Tx;
+    /// # let mut tx = Tx::default();
+    /// # let bytes: Vec<u8> = Vec::new();
+    /// let families = tx.add_font(bytes);
+    /// if let Some(family) = families.first() {
+    ///     tx.set_font_families(family, "ui-monospace");
+    /// }
+    /// ```
+    pub fn add_font(&mut self, bytes: impl Into<std::sync::Arc<[u8]>>) -> Vec<String> {
+        let (families, added) = crate::text::full_faces::add_font_checked(bytes.into());
+        self.fonts_added |= added;
+        families
     }
 
     /// Shapes and breaks the text of `view` into the window's layout cache in its next idle turn,

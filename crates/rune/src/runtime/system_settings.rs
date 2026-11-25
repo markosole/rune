@@ -28,6 +28,20 @@ impl window_requests::HostState {
         true
     }
 
+    #[inline]
+    pub(super) fn set_maximized(&mut self, maximized: bool) -> bool {
+        if maximized == self.maximized { return false; }
+        self.maximized = maximized;
+        true
+    }
+
+    #[inline]
+    pub(super) fn set_full_screen(&mut self, full_screen: bool) -> bool {
+        if full_screen == self.full_screen { return false; }
+        self.full_screen = full_screen;
+        true
+    }
+
     /// What [`Cx::accent`] and [`Cx::focus_color`] report, and the colour of default focus
     /// rings. Native windows set it from [`system_accent`](crate::system_accent) and again when
     /// the user picks another accent; a change re-runs the view. Headless runs keep
@@ -69,6 +83,16 @@ impl window_requests::HostState {
     #[inline]
     pub(crate) fn system_reduced_motion(&self) -> bool {
         self.system_reduced_motion
+    }
+
+    pub(super) fn set_languages(&mut self, languages: Vec<String>) -> bool {
+        let normalized = crate::platform::languages::normalize(languages);
+        if self.system_languages.as_deref() == Some(normalized.as_slice()) {
+            return false;
+        }
+        self.system_languages = Some(Rc::from(normalized));
+        self.languages_gen = self.languages_gen.wrapping_add(1);
+        true
     }
 
     #[inline]
@@ -160,6 +184,21 @@ impl RuntimeCore {
         if self.host.set_titlebar_inset(points) { self.commit.dirty = true; }
     }
 
+    /// What [`Cx::is_maximized`] reports. Native windows set it from confirmed OS window state
+    /// on create, resize, scale change, and focus; a change re-runs the view and its memos.
+    #[inline]
+    pub fn set_maximized(&mut self, maximized: bool) {
+        if self.host.set_maximized(maximized) { self.commit.dirty = true; }
+    }
+
+    /// What [`Cx::is_full_screen`] reports. Native windows set it from confirmed OS window state
+    /// on create, resize, scale change, focus, and macOS full-screen transitions; a change
+    /// re-runs the view and its memos.
+    #[inline]
+    pub fn set_full_screen(&mut self, full_screen: bool) {
+        if self.host.set_full_screen(full_screen) { self.commit.dirty = true; }
+    }
+
     #[inline]
     pub(crate) fn system_accent(&self) -> crate::SystemAccent {
         self.host.system_accent()
@@ -202,6 +241,13 @@ impl RuntimeCore {
     #[inline]
     pub fn set_system_text_scale(&mut self, scale: f32) {
         if self.host.set_system_text_scale(scale) { self.commit.dirty = true; }
+    }
+
+    /// Sets the preferred language list reported by [`Cx::system_languages`] and [`Cx::locale`],
+    /// as BCP 47 tags in preference order. Empty and duplicate tags are dropped. A change re-runs
+    /// the view and its memos.
+    pub fn set_languages(&mut self, languages: Vec<String>) {
+        if self.host.set_languages(languages) { self.commit.dirty = true; }
     }
 
     #[inline]

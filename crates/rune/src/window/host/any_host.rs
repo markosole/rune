@@ -7,11 +7,11 @@ use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
 
-use super::Host;
+use super::{Host, WindowApp};
 use crate::time::Instant;
 use crate::window::file_drop::DROP_SAMPLE;
-use crate::window::state::{Cover, RestEvent, Reveal};
-use crate::window::surface::{BackoffEvent, RedrawEffect, RedrawEvent, Win, timer_deadline_core};
+use crate::window::state::{Cover, Life, RestEvent, Reveal};
+use crate::window::surface::{BackoffEvent, Redraw, RedrawEffect, RedrawEvent, Win, timer_deadline_core};
 #[cfg(target_os = "windows")]
 use crate::window::win32::covered_draw::CoveredDrawEvent;
 use crate::window::{AnyHost, WakeEvent};
@@ -21,14 +21,16 @@ impl AnyHost for Host {
         self.win.as_ref().is_some_and(|w| w.window.id() == id)
     }
     fn finished(&self) -> bool { self.life.finished() }
+    fn has_shown(&self) -> bool { self.shown }
+    fn take_startup_error(&mut self) -> Option<String> { self.startup_error.take() }
     fn keeps_loop(&self) -> bool { self.keeps_loop }
     fn closing_ends_app(&mut self) { self.ends_app = true; }
     fn key(&self) -> Option<&str> { Some(self.native_handle.key()) }
     fn reopen_candidate(&self) -> crate::platform::reopen::Candidate {
         let shown = self.shown_win();
-        let minimized = shown.is_some_and(|w| w.window.is_minimized() == Some(true));
+        let minimized = shown.is_some_and(Win::is_minimized_native);
         crate::platform::reopen::Candidate {
-            reopenable: !self.life.finished() && !self.macos_window.nonactivating_panel,
+            reopenable: !self.life.finished() && !self.macos_window.nonactivating_panel && !self.no_activate(),
             visible: shown.is_some() && !minimized,
             minimized,
             hidden_at: self.life.hidden_at(),
@@ -44,15 +46,15 @@ impl AnyHost for Host {
         let win = self.win.as_ref();
         // A frame waiting for room in the swap chain comes when there is (`slot`): its timers
         // would turn the loop at once until then.
-        let runtime = timer_deadline_core(self.app.rt()).filter(|_| !win.is_some_and(|w| w.paced() || w.waits_for_slot()));
+        let runtime = self.poll_deadline().filter(|_| !win.is_some_and(|w| w.paced() || w.waits_for_slot()));
         // A due timer whose frame is still on its way takes the frame's bound instead
         // (`TimerFrame`), so the loop sleeps rather than waking at once for a frame that can't
         // come.
         let shown = self.shown_win();
         let runtime = shown.map_or(runtime, |w| w.timer_frame.wait(runtime, now));
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         let handover = win.and_then(|w| w.handover_deadline(now));
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         let handover = None;
         #[cfg(target_os = "windows")]
         let covered_draw = win.and_then(|w| w.covered_draw.deadline());
@@ -66,10 +68,12 @@ impl AnyHost for Host {
             .chain(win.and_then(Win::cloak_deadline))
             .chain(win.and_then(|w| w.backoff.deadline()))
             .chain(win.filter(|_| shown.is_none()).and_then(|w| w.hidden_pace.deadline()))
-            .chain(look_deadline(win))
+            .chain(look_deadline(win, self.life))
             .chain(self.files.pointer.as_ref().filter(|_| shown.is_some()).map(|_| now + DROP_SAMPLE))
             .chain(shown.and_then(|w| w.cursor.reassert_at(now)))
             .chain(self.rest.deadline())
+            .chain(wayland_drop_deadline(win))
+            .chain(self.window_script.as_ref().and_then(|s| s.next_at()))
             .min()
     }
 
@@ -82,11 +86,16 @@ impl AnyHost for Host {
         if let Some(w) = self.shown_win() { w.hide(); }
     }
     fn cancel_menus(&mut self) { self.in_turn(Self::cancel_menus_in_turn) }
+    #[cfg(target_os = "macos")]
+    fn stop_pacing(&mut self) {
+        if let Some(w) = &mut self.win { w.stop_pacing(); }
+    }
     fn reopen_hook(&mut self, event_loop: &ActiveEventLoop, has_visible_windows: bool) -> bool {
         self.in_turn(|h| h.reopen_hook_in_turn(event_loop, has_visible_windows))
     }
     fn apply_pending(&mut self, event_loop: &ActiveEventLoop) { self.in_turn(|h| h.apply_pending_in_turn(event_loop)) }
     fn reopen(&mut self, event_loop: &ActiveEventLoop) { self.in_turn(|h| h.reopen_in_turn(event_loop)) }
+    fn apply_app_color_scheme(&mut self) { self.apply_window_color_scheme(); }
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) { self.in_turn(|h| h.new_events_in_turn(event_loop, cause)) }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) -> bool { self.in_turn(|h| h.about_to_wait_in_turn(event_loop)) }
     fn resumed(&mut self, event_loop: &ActiveEventLoop) { self.in_turn(|h| h.resumed_in_turn(event_loop)) }
@@ -120,6 +129,52 @@ impl Host {
                 self.paint(event_loop);
             }
         }
+        // Guard: never let the event loop rest with user input still queued for a drawable
+        // window when neither a redraw nor an active display link is already on its way.
+        if let Some(w) = self.shown_win()
+            && queued_input_needs_redraw(
+                self.app.rt().has_input_waiting(),
+                self.life.uncovered() && !w.minimized() && !w.backing_off(now) && !w.waits_for_slot(),
+                w.paced(),
+                w.redraw.get(),
+            )
+        {
+            w.request_redraw();
+        }
+        #[cfg(target_os = "windows")]
+        self.sync_poll_pace(now);
+    }
+
+    /// Windows: whether the window is shown, uncovered, not minimized and not waiting on a
+    /// swap-chain slot, so poll-driven frames pace to the display's vblank grid.
+    #[cfg(target_os = "windows")]
+    fn poll_pace_active(&self) -> bool {
+        self.shown_win().is_some_and(|w| self.life.uncovered() && !w.minimized() && !w.waits_for_slot())
+    }
+
+    /// Windows: syncs the window's poll pacer with the runtime's current poll wake before the
+    /// loop sleeps.
+    #[cfg(target_os = "windows")]
+    fn sync_poll_pace(&mut self, now: Instant) {
+        let active = self.poll_pace_active();
+        let rt = self.app.rt();
+        let Some(w) = self.win.as_mut() else { return };
+        let window = &w.window;
+        w.native.poll_pace.sync_with(rt, now, active, |previous| {
+            let mhz = window.current_monitor().and_then(|m| m.refresh_rate_millihertz());
+            crate::platform::win32::vsync_grid(now, mhz, previous)
+        });
+    }
+
+    /// The runtime's next timer as the loop waits for it and checks it on wake. On Windows, a
+    /// shown uncovered window's sub-frame poll wake snaps to the display's vblank grid
+    /// (`poll_pace`) instead of the 60 Hz `TIMER_FRAME` floor.
+    fn poll_deadline(&self) -> Option<Instant> {
+        #[cfg(target_os = "windows")]
+        if let Some(w) = &self.win {
+            return w.native.poll_pace.deadline_for(self.app.rt(), self.poll_pace_active());
+        }
+        timer_deadline_core(self.app.rt())
     }
 
     /// Runs `f` inside the app's turn scope, entered once however deep the turn's calls go.
@@ -142,10 +197,9 @@ impl Host {
     }
 
     fn quit_hook_in_turn(&mut self) {
-        if self.life.finished() || !self.app.run_on_quit() { return; }
-        // Before the loop ends or the session does: a lock or clear must reach the worker.
-        self.clipboard.flush_core(self.app.rt_mut());
-        if let Some(w) = self.shown_win() { w.request_redraw(); }
+        if quit_hook_core(&mut *self.app, &mut self.clipboard, self.life) && let Some(w) = self.shown_win() {
+            w.request_redraw();
+        }
     }
 
     fn cancel_menus_in_turn(&mut self) {
@@ -180,13 +234,26 @@ impl Host {
 
     fn new_events_in_turn(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
         #[cfg(target_os = "macos")]
-        if let Some(shadow) = self.win.as_ref().and_then(|w| w.native.shadow.as_ref()) { shadow.turn(); }
+        {
+            if let Some(shadow) = self.win.as_ref().and_then(|w| w.native.shadow.as_ref()) { shadow.turn(); }
+            self.frame_presented.drain();
+        }
         self.meter.turn(matches!(cause, StartCause::ResumeTimeReached { .. } | StartCause::Poll), crate::frame::surface_stats::slept(cause));
         if matches!(cause, StartCause::ResumeTimeReached { .. }) && let Some(w) = &self.win { w.cursor.reassert(); }
+        if self.window_script.is_some() { self.replay_window_script(crate::time::now()); }
         #[cfg(target_os = "windows")]
         if let Some(w) = &self.win { w.native.cloak.lift_if_due(&w.window, crate::time::now()); }
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         self.watch_handover(crate::time::now());
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        if let Some(attempt) = self.win.as_ref().and_then(|w| w.native.drop_binding.grace_attempt())
+            && self.win.as_ref().and_then(|w| w.native.drop_binding.deadline()).is_some_and(|due| due <= crate::time::now())
+        {
+            self.step_wayland_drop_binding(crate::platform::wayland_drop::binding::Event::GraceDue {
+                attempt,
+                now: crate::time::now(),
+            });
+        }
         #[cfg(target_os = "windows")]
         if let Some(w) = &mut self.win && w.covered_draw.due(crate::time::now()) {
             w.covered_draw = w.covered_draw.step(CoveredDrawEvent::Due);
@@ -224,11 +291,11 @@ impl Host {
         // A covered window with motion on screen looks again whether it's still covered (`look`),
         // without a frame: asked for while covered, one would draw (`CoveredDraw`) for no one.
         #[cfg(target_os = "windows")]
-        if self.win.as_ref().is_some_and(|w| look_deadline(Some(w)).is_some_and(|at| at <= crate::time::now())) && self.life.covered() {
+        if look_deadline(self.win.as_ref(), self.life).is_some_and(|at| at <= crate::time::now()) {
             self.look();
         }
         if matches!(cause, StartCause::ResumeTimeReached { .. } | StartCause::Poll)
-            && timer_deadline_core(self.app.rt()).is_some_and(|deadline| deadline <= crate::time::now())
+            && self.poll_deadline().is_some_and(|deadline| deadline <= crate::time::now())
             && !self.win.as_ref().is_some_and(Win::waits_for_slot)
         {
             let hidden = self.shown_win().is_none();
@@ -283,7 +350,10 @@ impl Host {
 
     fn about_to_wait_in_turn(&mut self, event_loop: &ActiveEventLoop) -> bool {
         #[cfg(target_os = "macos")]
-        self.fn_key();
+        {
+            self.fn_key();
+            self.media_keys();
+        }
         self.flush_files(event_loop);
         // Another window switched the font families (`Tx::set_font_families`).
         if self.app.rt_mut().follow_font_families() && let Some(w) = &mut self.win {
@@ -302,6 +372,9 @@ impl Host {
         #[cfg(target_os = "windows")]
         return self.post_frame_turn();
         // Elsewhere `on_ready` ran with the first frame; a view asked to be prepared since runs now.
+        // Linux: a window that opened on the CPU starts its GPU in the first of these turns.
+        #[cfg(target_os = "linux")]
+        self.cpu_idle();
         #[cfg(not(target_os = "windows"))]
         { !crate::marks::counting() && self.app.text_idle_owed() && self.app.text_idle_turn() }
     }
@@ -332,10 +405,40 @@ impl Host {
     }
 }
 
+/// Whether a window whose turn is ending must request a redraw rather than rest: user input is
+/// still queued (`RuntimeCore::has_input_waiting`), the window can draw now, and neither a
+/// redraw nor an active display link is already on its way.
+pub(in crate::window) fn queued_input_needs_redraw(
+    has_input: bool,
+    can_draw: bool,
+    paced: bool,
+    redraw: Redraw,
+) -> bool {
+    has_input && can_draw && !paced && matches!(redraw, Redraw::Idle | Redraw::Satisfied)
+}
+
+/// Runs a window's `App::on_quit`, flushes clipboard requests made there, and reports whether
+/// a still-shown window should request a redraw. Runs even when `life` is `Life::Finished`
+/// because the window whose close ended the app has already finished when the quit starts.
+pub(in crate::window) fn quit_hook_core(app: &mut dyn WindowApp, clipboard: &mut crate::clipboard::Client, life: Life) -> bool {
+    if !app.run_on_quit() { return false; }
+    // Before the loop ends or the session does: a lock or clear must reach the worker.
+    clipboard.flush_core(app.rt_mut());
+    life.shown()
+}
+
 /// When a covered window looks again whether it's still covered (`look`).
-fn look_deadline(win: Option<&Win>) -> Option<Instant> {
+fn look_deadline(win: Option<&Win>, life: Life) -> Option<Instant> {
     #[cfg(target_os = "windows")]
-    return win.and_then(|w| w.native.look.deadline());
+    return win.and_then(|w| w.native.look.deadline(life));
     #[cfg(not(target_os = "windows"))]
+    { let _ = (win, life); None }
+}
+
+/// When a Wayland window's lazy `wl_data_device` teardown grace timer expires.
+fn wayland_drop_deadline(win: Option<&Win>) -> Option<Instant> {
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+    return win.and_then(|w| w.native.drop_binding.deadline());
+    #[cfg(not(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
     { let _ = win; None }
 }

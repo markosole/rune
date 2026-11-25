@@ -4,10 +4,13 @@ use super::*;
 use rune_text::paragraph_ranges as paragraphs;
 
 impl El {
-    /// Lays out each newline-ended line as its own [`Layout`](crate::text::Layout), reusing
+    /// Lays out each newline-ended line as its own `Layout`, reusing
     /// unchanged lines across commits (shaping only changed lines; per-commit keying still hashes
-    /// each line when spans are present, and long plain/colour-only ASCII interiors wait as runs)
-    /// while staying one selectable text element in its own direction.
+    /// each line when spans are present, and long plain/colour-only ASCII interiors in a
+    /// start-aligned, LTR, fixed-pitch monospace face wait as runs even when other lines carry
+    /// layout spans; if the monospace slot resolves to a proportional fallback—such as on a host
+    /// with no monospace font installed and none bundled—lines shape eagerly instead) while staying
+    /// one selectable text element in its own direction.
     ///
     /// Silently falls back to a single layout when the text does not wrap, is truncated or
     /// line-clamped, is live (`El::live` / `El::advance_in`), is redacted, or is a shared-run
@@ -102,11 +105,33 @@ fn paragraph(t: &TextSpec, k: usize, (a, b): (usize, usize), last: bool, e: &mut
         cold.uncopied = t.cold.uncopied.iter().filter_map(|&(s, e)| clip(s, e)).collect();
         cold.rings = t.cold.rings.iter().filter_map(|&(s, e, c, w)| clip(s, e).map(|(s, e)| (s, e, c, w))).collect();
         cold.strikes = t.cold.strikes.iter().filter_map(|&(s, e, c)| clip(s, e).map(|(s, e)| (s, e, c))).collect();
+        cold.overlines = t.cold.overlines.iter().filter_map(|&(s, e, c)| clip(s, e).map(|(s, e)| (s, e, c))).collect();
+        cold.span_boxes = t.cold.span_boxes.iter().filter_map(|b| {
+            let (start, end) = clip(b.start, b.end)?;
+            let (cs, ce) = (b.start < a32, b.end > b32);
+            let mut style = b.style;
+            if cs || ce {
+                let c = style.corner_radii();
+                style = style
+                    .pad_x(if cs { 0.0 } else { style.pad_left() }, if ce { 0.0 } else { style.pad_right() })
+                    .corners([
+                        if cs { 0.0 } else { c[0] },
+                        if ce { 0.0 } else { c[1] },
+                        if ce { 0.0 } else { c[2] },
+                        if cs { 0.0 } else { c[3] },
+                    ]);
+            }
+            Some(crate::text::SpanBoxRun { start, end, style })
+        }).collect();
         cold.highlights = t.cold.highlights.iter().filter_map(|h| clip(h.start, h.end).map(|(start, end)| crate::text::TextHighlight { start, end, ..h.clone() })).collect();
+        cold.line_fills = t.cold.line_fills.iter().filter_map(|f| clip(f.start, f.end).map(|(start, end)| crate::el::LineFill { start, end, ..*f })).collect();
         // A chip lies inside one line; one across a newline has no paragraph to sit in.
         cold.pills = t.cold.pills.iter().filter(|c| a32 <= c.start && c.end <= b32).map(|c| crate::text::PillChip { start: c.start - a32, end: c.end - a32, ..c.clone() }).collect();
         cold.blocks = t.cold.blocks.get(k).copied().into_iter().collect();
         cold.soft_breaks.clear();
+        if k > 0 {
+            cold.text_indent = 0.0;
+        }
         cold.copy_breaks = [if k == 0 { t.cold.copy_breaks[0] } else { 1 }, if last { t.cold.copy_breaks[1] } else { 1 }];
         cold.copy_prefix = if k == 0 { t.cold.copy_prefix.clone() } else { None };
     }

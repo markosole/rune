@@ -65,10 +65,12 @@ mod presence;
 use presence::{Presence, Release};
 mod requests;
 use requests::{Requests, Update, Visibility};
+mod retire;
+use retire::Retire;
 #[path = "overlay/surface.rs"]
 mod surface;
 #[path = "overlay/xwayland.rs"]
-mod xwayland;
+pub(crate) mod xwayland;
 
 pub(crate) use app::OverlayHost;
 use app::OverlayApp;
@@ -106,11 +108,15 @@ pub struct OverlaySpec<T: 'static> {
 }
 
 /// Whether the platform could show the overlay, known after its first `show`.
+///
+/// Use [`ConfiguredOverlay::on_availability`](crate::ConfiguredOverlay::on_availability) to react
+/// to transitions without polling [`OverlayHandle::availability`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Availability {
     Unknown,
     Available,
-    /// Wayland without layer-shell, or its window, surface or show failed (`OverlayHandle::failure`).
+    /// Wayland without layer-shell, a Wayland compositor close or display connection failure, or a
+    /// window, surface or show failure (`OverlayHandle::failure`).
     Unavailable,
 }
 
@@ -342,6 +348,10 @@ impl<T: 'static> OverlayHandle<T> {
 /// An overlay before the event loop runs: the shell gives it a wake-up and the GPU pool.
 pub(crate) trait PendingOverlay: AnyHost {
     fn connect(&mut self, wake: Waker, frame_wake: Waker, slot_wake: Waker, gpu: Rc<RefCell<Weak<Gpu>>>);
+    fn inherit_font_smoothing(&mut self, mode: crate::FontSmoothing);
+    fn set_prewarm_effects(&mut self, effects: crate::PrewarmEffects);
+    #[cfg(test)]
+    fn font_smoothing(&self) -> crate::FontSmoothing;
 }
 
 enum Backing {
@@ -379,10 +389,16 @@ struct Live {
     /// Fn presses, which winit doesn't send, while the overlay wants modifier keys.
     #[cfg(target_os = "macos")]
     fn_key: Option<crate::input::fn_key::FnKey>,
+    /// Hardware media keys (`NSEventTypeSystemDefined`), while the overlay opts into `media_keys`.
+    #[cfg(target_os = "macos")]
+    media_keys: Option<crate::input::media_keys::MediaKeys>,
     /// Whether the swap chain can take the next frame, and the wait when it can't
     /// (`window::slot`). Before the surface so an outstanding wait goes first.
     #[cfg(target_os = "windows")]
     slot: Slot,
+    /// Paces sub-frame `poll` wakes onto the display's vblank grid (`window::poll_pace`).
+    #[cfg(target_os = "windows")]
+    poll_pace: crate::window::poll_pace::PollPace,
     alpha: Option<crate::render::surface_alpha::AlphaSurface>,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
@@ -423,10 +439,12 @@ pub(in crate::overlay) struct OverlayCore {
     cursor: Option<crate::cursor::os::OsCursor>,
     mods: winit::keyboard::ModifiersState,
     control_click: bool,
-    ime_allowed: bool,
+    ime: crate::input::host_events::ImeSync,
     renderer: Option<Renderer>,
     gpu: Option<Arc<Gpu>>,
     gpu_pool: Rc<RefCell<Weak<Gpu>>>,
+    rest: crate::window::Rest,
+    retire: Retire,
     dark: bool,
     dirty: bool,
     idle: bool,
@@ -439,6 +457,9 @@ pub(in crate::overlay) struct OverlayCore {
     /// This loop turn already read the panel's occlusion (`sync_occlusion`).
     #[cfg(target_os = "macos")]
     occlusion_read: bool,
+    /// The frames right after a show, which may draw before AppKit reports the panel on screen.
+    #[cfg(target_os = "macos")]
+    prime: crate::window::Prime,
     /// When to try a frame again that had no drawable, or the next frame of motion with no
     /// display link to pace it, and the waits behind it (`window::Backoff`).
     backoff: crate::window::Backoff,
@@ -452,6 +473,17 @@ pub(in crate::overlay) struct OverlayCore {
     meter: crate::frame::surface_stats::SurfaceMeter,
     /// The display `refollow_pointer` last found the pointer on, away from the overlay's.
     refollow_away: Option<winit::monitor::MonitorHandle>,
+    /// Whether placement requests or a user window drag owns this overlay's position.
+    position_owner: input::PositionOwner,
+    /// The effect pipelines this overlay's renderer compiles ahead of their first use.
+    prewarm_effects: crate::PrewarmEffects,
+    /// Test hooks for Wayland frame callbacks and headless window-backed drag assertions.
+    #[cfg(test)]
+    layer_frame_pending: bool,
+    #[cfg(test)]
+    test_window_backing: bool,
+    #[cfg(test)]
+    test_window_drags: u32,
 }
 
 impl OverlayCore {
@@ -471,6 +503,8 @@ impl OverlayCore {
         let meter = crate::frame::surface_stats::SurfaceMeter::new(name, shared.stats.clone());
         rt.set_system_reduced_motion(crate::platform::preferences::reduced_motion());
         rt.set_system_text_scale(crate::platform::preferences::text_scale());
+        #[cfg(target_os = "linux")]
+        { rt.double_click_interval = crate::platform::preferences::double_click_interval(); }
         crate::platform::accent::watch();
         rt.set_system_accent(crate::system_accent());
         crate::platform::scroll_bars::watch();
@@ -505,10 +539,12 @@ impl OverlayCore {
             x11: None,
             mods: Default::default(),
             control_click: false,
-            ime_allowed: false,
+            ime: Default::default(),
             renderer: None,
             gpu: None,
             gpu_pool: Rc::default(),
+            rest: Default::default(),
+            retire: Default::default(),
             dark: true,
             dirty: true,
             idle: true,
@@ -518,6 +554,8 @@ impl OverlayCore {
             clock: FrameClock::new(crate::time::now()),
             #[cfg(target_os = "macos")]
             occlusion_read: false,
+            #[cfg(target_os = "macos")]
+            prime: crate::window::Prime::Steady,
             backoff: Default::default(),
             hidden_pace: Default::default(),
             #[cfg(target_os = "macos")]
@@ -526,23 +564,28 @@ impl OverlayCore {
             slot_wake: None,
             meter,
             refollow_away: None,
+            position_owner: input::PositionOwner::Managed,
+            prewarm_effects: crate::PrewarmEffects::NONE,
+            #[cfg(test)]
+            layer_frame_pending: false,
+            #[cfg(test)]
+            test_window_backing: false,
+            #[cfg(test)]
+            test_window_drags: 0,
         }
     }
 
-    fn set_availability(&self, a: Availability) {
-        let v = match a {
+    pub(super) fn availability_code(a: Availability) -> u8 {
+        match a {
             Availability::Unknown => 0,
             Availability::Available => 1,
             Availability::Unavailable => 2,
-        };
-        self.shared.availability.store(v, Ordering::Release);
+        }
     }
 
-    /// Marks the overlay `Unavailable` and keeps why, for `OverlayHandle::failure`.
-    fn fail(&self, reason: String) {
-        eprintln!("rune: overlay {} can't show: {reason}", self.name);
-        *self.shared.failure.lock().unwrap() = Some(reason);
-        self.set_availability(Availability::Unavailable);
+    /// Silent availability store (used on `Drop` so dropping never invokes user callbacks).
+    pub(super) fn set_availability(&self, a: Availability) {
+        self.shared.availability.store(Self::availability_code(a), Ordering::Release);
     }
 
     pub(super) fn accent_changed(&mut self, rt: &mut RuntimeCore, accent: crate::SystemAccent) {
@@ -614,9 +657,10 @@ impl OverlayCore {
     }
 
     /// Puts the window on screen without focusing it or activating the app.
-    fn show_window(&mut self, window: &Window, fade: Duration) {
+    fn show_window(&mut self, app: &mut dyn OverlayApp, window: &Window, fade: Duration) {
         #[cfg(target_os = "macos")]
         if let Some(panel) = &self.panel {
+            let _ = app;
             panel.show(fade);
             return;
         }
@@ -626,13 +670,19 @@ impl OverlayCore {
             let _ = window;
             if let Some(native) = &mut self.native {
                 match native.show() {
-                    Ok(()) => if self.shared.failure.lock().unwrap().take().is_some() { self.set_availability(Availability::Available) },
-                    Err(error) => self.fail(error),
+                    Ok(()) => {
+                        let recovered = self.shared.failure.lock().unwrap().take().is_some();
+                        if recovered { self.set_availability_notify(app, Availability::Available); }
+                    }
+                    Err(error) => self.fail(app, error),
                 }
             }
         }
         #[cfg(not(target_os = "windows"))]
-        window.set_visible(true);
+        {
+            let _ = app;
+            window.set_visible(true);
+        }
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
         if let Some(x11) = &self.x11 { x11.show(self.options.level); }
     }
@@ -642,7 +692,9 @@ impl OverlayCore {
         if let Some(Backing::Window(w)) = self.surface.parked() {
             let w = w.clone();
             let _size = w.request_inner_size(LogicalSize::new(self.at.size.0 as f64, self.at.size.1 as f64));
-            return self.place_window(app.rt_mut(), event_loop, &w);
+            if self.position_owner.is_managed() { self.place_window(app.rt_mut(), event_loop, &w); }
+            else { self.sync_origin(app.rt_mut(), &w); }
+            return;
         }
         let Some(live) = self.surface.live_mut() else { return };
         match &mut live.backing {
@@ -664,7 +716,12 @@ impl OverlayCore {
         }
         if let Some(Backing::Window(w)) = self.surface.live().map(|l| &l.backing) {
             let w = w.clone();
-            self.place_window(app.rt_mut(), event_loop, &w);
+            if self.position_owner.is_managed() { self.place_window(app.rt_mut(), event_loop, &w); }
+            else {
+                #[cfg(target_os = "macos")]
+                if let Some(panel) = &self.panel { panel.resize(self.at.size); }
+                self.sync_origin(app.rt_mut(), &w);
+            }
             if let Some(gpu) = self.gpu.clone() { self.rescale(app, &gpu, crate::window::backing_scale(&w)); }
         }
     }
@@ -685,7 +742,7 @@ impl OverlayCore {
 
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
     fn follow_pointer(&mut self, app: &mut dyn OverlayApp, event_loop: &ActiveEventLoop, point: (i32, i32)) {
-        if !self.options.follow_pointer { return; }
+        if !self.position_owner.is_managed() || !self.options.follow_pointer { return; }
         self.move_to_pointer_display(app, event_loop, point);
     }
 
@@ -741,8 +798,16 @@ impl OverlayCore {
 }
 
 #[cfg(test)]
+#[path = "overlay/availability_tests.rs"]
+mod availability_tests;
+
+#[cfg(test)]
 #[path = "overlay/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "overlay/rest_tests.rs"]
+mod rest_tests;
 
 #[cfg(test)]
 #[path = "overlay/state_walk_tests.rs"]

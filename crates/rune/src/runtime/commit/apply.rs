@@ -7,9 +7,12 @@ mod growth;
 
 impl RuntimeCore {
     /// The mutation phase cannot accept an El or an unfinished measurement pass.
-    pub(in crate::runtime) fn apply(&mut self, app: &mut dyn AppDriver, measured: Measured, tx: &Tx) {
+    /// Returns whether `sync_modals` or `sync_follows` ran a focus-change callback that dirtied
+    /// state (or latched a follow-up focus request), so `commit` can reflect it in the same frame.
+    pub(in crate::runtime) fn apply(&mut self, app: &mut dyn AppDriver, measured: Measured, tx: &Tx) -> bool {
         let _apply_time = crate::frame::profile::Scope::new(crate::frame::profile::Phase::Apply);
         let Measured { layout: mut taffy, mut nodes, reduced_motion, time_scale, defaults, titlebar, caret_read, memo_flattened, memo_reused, taken_paths, .. } = measured;
+        let rebound_press = self.rebound_press_path(&nodes);
         self.commit.defaults = defaults;
         if crate::tooling::interaction::active() { self.interaction_reused(&memo_reused); }
         let mut scratch = std::mem::take(&mut self.commit.apply_scratch);
@@ -41,6 +44,18 @@ impl RuntimeCore {
                 }
             }
         }
+        // A path reused by a non-virtual element is no longer a virtual list; drop its stale
+        // metadata before `apply` shifts child frames or skips spans against `v.before`.
+        // Lists removed from `nodes` stay until their exiting node prunes.
+        if !self.commit.virtuals.is_empty() {
+            let Self { commit, tree, .. } = self;
+            commit.virtuals.retain(|path, _| {
+                !tree.path_ids.get(path)
+                    .and_then(|id| tree.node_index.get(id))
+                    .and_then(|&i| nodes.get(i))
+                    .is_some_and(|n| !n.virtual_list)
+            });
+        }
         for v in self.commit.virtuals.values_mut() {
             v.shown = v.keys[v.range.clone()].iter().cloned().collect();
             v.mounted = v.indexed.then(|| crate::el::virtual_list::Mounted::of(v));
@@ -54,7 +69,12 @@ impl RuntimeCore {
             }
         }
         let first = self.commit.commits == 0;
+        // The first frame's own reads, for the next launch's first view (`layout_seed`).
+        if first { self.commit.layout_first = self.layout_seed(); }
         self.commit.commits += 1;
+        if first || self.commit.watch.cause != CommitWhy::VIRTUAL {
+            self.commit.non_virtual_commits += 1;
+        }
         self.stats.commits = self.commit.commits;
         // Concealing is a security boundary: old geometry must not disclose the revealed
         // line count through a height spring, displaced siblings, or a lingering scroll glide.
@@ -194,8 +214,15 @@ impl RuntimeCore {
             let row_like = nodes[i].in_row == RowLayout::Snaps || nodes[i].parent.is_some_and(|p| nodes[p].growth.is_some());
             // An `El::instant_changes` element lands its changes, and those of what it holds;
             // its own entrance and exit, and colours, stay with the commit, as do the entrances of
-            // an `El::animated_changes` subtree inside it.
-            let enters_at_once = cut || (nodes[i].parent.is_some_and(|p| nodes[p].instant_changes) && nodes[i].instant_changes);
+            // an `El::animated_changes` subtree inside it. `El::enter_in_instant` lets a new
+            // element's entrance play during a `Tx::instant` commit while layout and exits still
+            // snap, and first frames, `Tx::settle`, concealing and unprompted commits still land.
+            let cut_for_enter = if nodes[i].enter_in_instant {
+                first || concealing || tx.commit.lands() || tx.unprompted
+            } else {
+                cut
+            };
+            let enters_at_once = cut_for_enter || (nodes[i].parent.is_some_and(|p| nodes[p].instant_changes) && nodes[i].instant_changes);
             let lands = instant || nodes[i].instant_changes;
             let layout_instant = lands || row_like || tx.relayout || is_virtual
                 || (!self.tree.aspect_snap.is_empty() && self.tree.aspect_snap.contains(&id));
@@ -235,6 +262,10 @@ impl RuntimeCore {
                     && !was_exiting
                     && !self.reduced_motion;
                 let mount = if enters_at_once || nodes[i].virtual_mount || quiet_row || self.enters_unseen(&nodes, &unseen, i) { Mount::Initial } else { Mount::Animated };
+                match nodes[i].transition_motion.as_deref() {
+                    Some(&(enter, exit)) => self.scene.set_transition_motion(id, enter, exit),
+                    None => self.scene.clear_transition_motion(id),
+                }
                 self.scene.insert_delayed(id, spec, mount, nodes[i].vis.enter_delay);
             } else if tx.commit.lands() { self.scene.land_waiting(id); }
             self.scene.set_ride_trailing(id, nodes[i].vis_flags.ride_trailing());
@@ -251,6 +282,10 @@ impl RuntimeCore {
                 // As in SwiftUI, a node leaves with the transition of its last render.
                 if !was_exiting {
                     self.scene.set_transition(id, nodes[i].transition.as_deref().copied().unwrap_or_else(Transition::opacity));
+                    match nodes[i].transition_motion.as_deref() {
+                        Some(&(enter, exit)) => self.scene.set_transition_motion(id, enter, exit),
+                        None => self.scene.clear_transition_motion(id),
+                    }
                 }
                 let stack_row = nodes[i].parent.is_some_and(|p| nodes[p].growth.is_some()) || is_virtual
                     || (nodes[i].in_row == RowLayout::Horizontal && (self.tree.aspect_snap.is_empty() || !self.tree.aspect_snap.contains(&id)));
@@ -264,6 +299,7 @@ impl RuntimeCore {
                 if !out_of_sight && !nodes[i].instant_changes && live_row.is_some_and(|(root, _)| root == i) {
                     reorder_jump = shift.unwrap_or(0.0);
                 }
+                let frame_motion = nodes[i].frame_motion.as_deref().copied();
                 let layout_anim = if out_of_sight || held.get(i).copied().unwrap_or(false) {
                     LayoutAnim::INSTANT
                 } else if stack_row && !lands && !tx.relayout && !follows_window {
@@ -275,13 +311,19 @@ impl RuntimeCore {
                         if let Some(drawn) = self.scene.get(id, prop::FRAME) { row_jump = drawn.y - scene_rect.y; }
                         reorder_jump = self.reorder_jump(&nodes, i);
                     }
-                    let mut la = LayoutAnim::axes(anim_l, Anim::INSTANT);
-                    if tx.motion.is_none() && nodes[i].width_leads {
-                        la = la.width_leads();
+                    if let Some(anim) = frame_motion {
+                        LayoutAnim::axes(anim, Anim::INSTANT)
+                    } else {
+                        let mut la = LayoutAnim::axes(anim_l, Anim::INSTANT);
+                        if tx.motion.is_none() && nodes[i].width_leads {
+                            la = la.width_leads();
+                        }
+                        la
                     }
-                    la
                 } else if layout_instant || follows_window {
                     LayoutAnim::INSTANT
+                } else if let Some(anim) = frame_motion {
+                    LayoutAnim::new(anim)
                 } else {
                     let mut la = LayoutAnim::new(anim_l);
                     if tx.motion.is_none() {
@@ -331,7 +373,13 @@ impl RuntimeCore {
                     if self.motion.flying[f].1 != nodes[i].local || nodes[i].parent.is_some_and(|p| slid.get(p).copied().unwrap_or(false)) {
                         self.motion.flying[f].1 = nodes[i].local;
                         // A growth row's instant vertical place would land the whole flight.
-                        let la = if layout_anim.x == Anim::INSTANT || layout_anim.y == Anim::INSTANT { LayoutAnim::new(spring_l) } else { layout_anim };
+                        let la = if let Some(&anim) = nodes[i].matched_motion.as_deref() {
+                            LayoutAnim::new(anim)
+                        } else if layout_anim.x == Anim::INSTANT || layout_anim.y == Anim::INSTANT {
+                            LayoutAnim::new(anim_l)
+                        } else {
+                            layout_anim
+                        };
                         let [drawn, speed] = self.motion.launches_mut().restart(&self.scene, id);
                         self.scene.retarget_drawn(id, scene_rect, la.screen(), drawn, speed);
                     }
@@ -401,10 +449,20 @@ impl RuntimeCore {
             let k = nodes[i].static_scale;
             nodes[i].scale_track = k != 1.0 || self.scene.store().has(id, P_SCALE);
             if nodes[i].scale_track {
-                self.snap_or_animate(id, P_SCALE, k, rest_quiet, 1.0, nodes[i].vis.scale_motion.as_deref().copied(), spring_l);
+                let motion = nodes[i].vis.scale_motion.as_deref().copied();
+                let anim = motion.unwrap_or_else(|| spring_l.into());
+                let starting = !rest_quiet && anim.curve != rune_motion::Curve::Instant
+                    && self.scene.store().target(id, P_SCALE) != Some(k);
+                self.snap_or_animate(id, P_SCALE, k, rest_quiet, 1.0, motion, spring_l);
+                if starting && !nodes[i].live.iter().any(|b| b.property == crate::live::Property::Scale) {
+                    let target = self.scene.store().target(id, P_SCALE).unwrap_or(k);
+                    self.paint.record_static_scale_target(id, target);
+                }
             }
             let turn = nodes[i].vis.rotate;
-            if turn != 0.0 || self.scene.store().has(id, prop::ROTATION) {
+            if !nodes[i].live.iter().any(|b| b.property == crate::live::Property::Rotation)
+                && (turn != 0.0 || self.scene.store().has(id, prop::ROTATION))
+            {
                 self.snap_or_animate(id, prop::ROTATION, turn, rest_quiet, 0.0, nodes[i].vis.rotate_motion.as_deref().copied(), spring_l);
             }
             let (instant, vis) = ((instant && !riding) || self.enters_unseen(&nodes, &unseen, i), &nodes[i].vis);
@@ -459,7 +517,7 @@ impl RuntimeCore {
             {
                 let content = spec.content.as_str();
                 let now = if time_scaled { self.scene.store().node_time(id) } else { now };
-                let fade = if self.reduced_motion { 0.15 } else { spec.reveal };
+                let fade = if self.reduced_motion { spec.reveal.min(0.15) } else { spec.reveal };
                 self.motion.commit_reveal(id, content, fade, now, time_scaled, was_present, instant, tx.unprompted, nodes[i].virtual_mount, self.reduced_motion);
             }
         }
@@ -505,7 +563,8 @@ impl RuntimeCore {
         } else {
             let mut pruned = Vec::new();
             exits::retire_removed_nodes(
-                &mut self.tree.node_index, &mut self.scene, &self.motion.flying, &mut self.text, self.env.scale,
+                &mut self.tree.node_index, &mut self.scene, &taffy, &self.commit.virtuals, &self.motion.flying,
+                &mut self.text, self.env.scale, self.reduced_motion,
                 &mut nodes, &mut old_nodes, present_len, tx, instant, &drew_nothing, &exit_parents, &mut scratch, &mut pruned,
             );
             for old in &pruned { self.hover_pruned(old); }
@@ -533,12 +592,14 @@ impl RuntimeCore {
         self.find_app_root();
         self.commit.commit_gen = self.commit.commit_gen.wrapping_add(1);
         let any_loop = self.prune_detached_tables(true);
-        if self.tree.nodes.len() > present_len || !self.motion.flying.is_empty() || landed || self.tree.has_sticky || self.tree.has_raise || self.tree.has_paint_order { self.update_layer_paint_order(); }
+        if self.tree.nodes.len() > present_len || !self.motion.flying.is_empty() || landed || self.tree.has_sticky || self.tree.has_raise || self.tree.has_paint_order || self.tree.has_above { self.update_layer_paint_order(); }
         else { self.paint.clear_layer_paint_order(); }
         self.tree.built = false;
         self.subscribe_live();
-        self.sync_modals(app);
-        self.sync_follows(app);
+        if let Some(path) = rebound_press { self.pointer.rebind_press_path(&path); }
+        let modal_cb = self.sync_modals(app);
+        self.sync_held_drag();
+        let follows_cb = self.sync_follows(app);
         self.motion.sync_loops(&self.tree.nodes, &self.scene, self.t, self.clock, self.time_scale, time_scaled, any_loop, tx.commit.lands() || self.reduced_motion);
         taffy.compact_if_sparse(|me, slot| self.tree.nodes[me as usize].taffy = slot);
         self.commit.layout = taffy;
@@ -546,11 +607,13 @@ impl RuntimeCore {
         self.text.end_commit();
         self.commit.dirty = false;
         self.commit.relayout = false;
+        self.clear_a11y_activation_build();
         self.tree.aspect_snap.clear();
         self.commit.viewport_stepped = false;
         self.commit.settle = false;
         // After the commit: a new height changes the insets, which the next frame's view reads.
         self.set_titlebar(titlebar);
+        modal_cb || follows_cb || self.kbd.focus_request.is_some()
     }
 
     /// Sets `prop` to `to` when `quiet`, or animates it from `identity` when its target changed.

@@ -72,6 +72,7 @@ pub use controls::segmented::SegmentedControl;
 pub use controls::shortcut_recorder::ShortcutRecorder;
 pub use controls::shortcut_recorder::ShortcutRecorderState;
 pub use controls::shortcut_recorder::shortcut_error_message;
+pub use controls::slider::Slider;
 pub use controls::switch::Switch;
 pub use controls::text_input::TextArea;
 pub use controls::text_input::TextField;
@@ -91,6 +92,8 @@ pub use markdown::CodeFrame;
 #[cfg(feature = "mermaid")]
 pub use markdown::DiagramFrame;
 #[cfg(feature = "markdown")]
+pub use markdown::DiffFrame;
+#[cfg(feature = "markdown")]
 pub use markdown::Highlight;
 #[cfg(feature = "markdown")]
 pub use markdown::ImageFrame;
@@ -109,11 +112,11 @@ pub use overlays::combobox::ComboboxOption;
 pub use overlays::combobox::ComboboxPhase;
 pub use overlays::combobox::ComboboxState;
 pub use overlays::dialog::Dialog;
+pub use overlays::hover_card::HoverCard;
 pub use overlays::menu::Menu;
 pub use overlays::menu::MenuEntry;
 pub use overlays::menu::MenuItem;
 pub use overlays::menu::context_menu;
-pub use overlays::overlay::HoverCard;
 pub use overlays::overlay::Placement;
 pub use overlays::overlay::Popover;
 pub use overlays::overlay::Tooltip;
@@ -122,6 +125,7 @@ pub use overlays::overlay::TooltipStyle;
 pub use overlays::overlay::body_text;
 pub use overlays::overlay::overlay_text;
 pub use overlays::overlay::scrim;
+pub use overlays::overlay::scrim_tx;
 pub use overlays::popover;
 pub use overlays::popup_list::PopupItem;
 pub use overlays::popup_list::PopupList;
@@ -143,6 +147,8 @@ pub use scroll_bar::ScrollBarStyle;
 pub use scroll_bar::scroll_bar;
 pub use shell::Page;
 pub use shell::PaneState;
+pub use shell::Reorder;
+pub use shell::ReorderLanding;
 pub use shell::Sidebar;
 pub use shell::SidebarHeader;
 pub use shell::SidebarRow;
@@ -259,7 +265,7 @@ pub(crate) fn over(top: Color, bottom: Color) -> Color {
 }
 
 /// Mounts overlays above `base`: `base` fills the window and each overlay follows it in paint
-/// and hit order. Place popover/menu/select/tooltip contents and toast regions here.
+/// and hit order. Place dialog/popover/menu/select/tooltip contents and toast regions here.
 pub fn root(base: El, overlays: impl IntoIterator<Item = El>) -> El {
     let within = base.hover_within_curves();
     let root = rune::el().key("kit-root").w_full().h_full().child(base.w_full().h_full()).children(overlays);

@@ -15,6 +15,8 @@ thread_local! {
     /// The empty app menu of a menu bar `App::standard_menus` made, filled when the app
     /// first shows its Dock icon.
     static PENDING: RefCell<Option<Retained<NSMenu>>> = const { RefCell::new(None) };
+    /// The app menu's standard About item hidden while a `MenuItem::about` replaces it.
+    static HIDDEN_ABOUT: RefCell<Option<Retained<NSMenuItem>>> = const { RefCell::new(None) };
 }
 
 /// Preserve any existing menu, including an app-supplied empty menu. AppKit owns
@@ -27,6 +29,7 @@ pub(crate) fn ensure(app: &NSApplication) -> Retained<NSMenu> {
         let root = empty_root(app);
         let menu = PENDING.with(|p| p.borrow_mut().take()).expect("empty_root leaves its app menu");
         add_app_items(app, &menu);
+        sync_standard(app);
         root
     }
 }
@@ -38,6 +41,7 @@ pub(crate) fn promote(app: &NSApplication) {
     unsafe {
         if let Some(menu) = PENDING.with(|p| p.borrow_mut().take()) { add_app_items(app, &menu); }
     }
+    sync_standard(app);
 }
 
 /// Lays `menu` and its submenus out the way the app's language reads
@@ -88,7 +92,9 @@ unsafe fn add_app_items(app: &NSApplication, menu: &NSMenu) {
             hide_others,
             item(mtm, "", Some(sel!(unhideAllApplications:)), ""),
             NSMenuItem::separatorItem(mtm),
-            item(mtm, "", Some(sel!(terminate:)), "q"),
+            // Added without "q" so promoting an accessory app never disturbs an existing custom
+            // ⌘Q item; `sync_standard` assigns "q" when no other item claims ⌘Q.
+            item(mtm, "", Some(sel!(terminate:)), ""),
         ] {
             entry.setTag(APP_ITEM);
             menu.addItem(&entry);
@@ -98,21 +104,42 @@ unsafe fn add_app_items(app: &NSApplication, menu: &NSMenu) {
     }
 }
 
-/// The app menu items `add_app_items` made, titled with the app's labels (`rune::set_labels`).
+/// The app menu items `add_app_items` made, and winit's own About, Hide and Quit (titled with the
+/// process name, `opencode-desktop` for a bundled app), titled with the app's labels (`rune::set_labels`).
 unsafe fn relabel_app_items(menu: &NSMenu) {
-    let name = NSProcessInfo::processInfo().processName().to_string();
-    for entry in (0..menu.numberOfItems()).filter_map(|i| menu.itemAtIndex(i)).filter(|i| i.tag() == APP_ITEM) {
+    let name = app_name();
+    let process = format!(" {}", NSProcessInfo::processInfo().processName());
+    let ours = |i: &NSMenuItem| i.tag() == APP_ITEM || i.title().to_string().ends_with(&process);
+    for entry in (0..menu.numberOfItems()).filter_map(|i| menu.itemAtIndex(i)).filter(|i| ours(i)) {
         let label = match entry.action().and_then(|a| a.name().to_str().ok()) {
             Some("orderFrontStandardAboutPanel:") => Label::About(&name),
             Some("hide:") => Label::Hide(&name),
             Some("hideOtherApplications:") => Label::HideOthers,
             Some("unhideAllApplications:") => Label::ShowAll,
             Some("terminate:") => Label::Quit(&name),
-            _ if !entry.isSeparatorItem() && entry.submenu().is_some() => Label::Services,
+            _ if entry.tag() == APP_ITEM && !entry.isSeparatorItem() && entry.submenu().is_some() => Label::Services,
             _ => continue,
         };
         entry.setTitle(&NSString::from_str(&crate::labels::label(label)));
     }
+}
+
+/// The app's name in its menu items (About, Hide, Quit), as macOS shows it elsewhere (Dock, Force
+/// Quit, the menu bar): the bundle's `CFBundleDisplayName`, else its `CFBundleName`, else the
+/// process name, which for a bundled app is its executable's file name (`opencode-desktop`).
+fn app_name() -> String {
+    use objc2::{class, runtime::AnyObject};
+    // SAFETY: NSBundle reads, on the main thread; an Info.plist name key holds a string.
+    unsafe {
+        let bundle: Option<Retained<AnyObject>> = msg_send![class!(NSBundle), mainBundle];
+        if let Some(bundle) = bundle {
+            for key in ["CFBundleDisplayName", "CFBundleName"] {
+                let value: Option<Retained<NSString>> = msg_send![&*bundle, objectForInfoDictionaryKey: &*NSString::from_str(key)];
+                if let Some(value) = value.map(|v| v.to_string()).filter(|v| !v.trim().is_empty()) { return value; }
+            }
+        }
+    }
+    NSProcessInfo::processInfo().processName().to_string()
 }
 
 /// Retitles the menus and items Rune made with the app's current labels (`rune::set_labels`),
@@ -132,6 +159,11 @@ pub(crate) fn relabel(app: &NSApplication) {
             for entry in (0..menu.numberOfItems()).filter_map(|i| menu.itemAtIndex(i)).filter(|i| i.tag() == STANDARD) {
                 if let Some(standard) = entry.action().and_then(|a| a.name().to_str().ok()).and_then(super::standard::by_action) {
                     entry.setTitle(&NSString::from_str(&crate::labels::label(standard.label())));
+                }
+            }
+            for entry in (0..menu.numberOfItems()).filter_map(|i| menu.itemAtIndex(i)).filter(|i| i.tag() == SYSTEM && !i.isSeparatorItem()) {
+                if let Some(label) = entry.action().and_then(|a| system_label(a.name().to_str().ok()?)) {
+                    entry.setTitle(&NSString::from_str(&crate::labels::label(label)));
                 }
             }
         }
@@ -166,6 +198,10 @@ pub(crate) fn is_winit_default(app: &NSApplication) -> bool {
 const STANDARD: isize = 0x5255_4e45;
 /// Tags the app menu items `add_app_items` makes.
 const APP_ITEM: isize = 0x5255_4e46;
+/// Tags the Edit menu's system items `system_edit_items` makes.
+const SYSTEM: isize = 0x5255_4e47;
+/// Tags a custom `MenuItem::about` item replacing the app menu's standard About item.
+pub(crate) const ABOUT_REPLACEMENT: isize = 0x5255_4e48;
 
 /// The standard items, into menus of their titles (made if absent) in the menu bar, or in a
 /// new one whose empty app menu waits for `promote`. An action a menu already has is skipped.
@@ -175,6 +211,10 @@ pub(crate) fn add_standard(app: &NSApplication) {
     // SAFETY: main-thread AppKit calls on retained menus; nil-target items keep no target.
     unsafe {
         let root = app.mainMenu().unwrap_or_else(|| empty_root(app));
+        // winit's default app menu names the process; the app's name is the bundle's.
+        if let Some(first) = (root.numberOfItems() > 0).then(|| root.itemAtIndex(0)).flatten().and_then(|i| i.submenu()) {
+            relabel_app_items(&first);
+        }
         for standard in &super::standard::ITEMS {
             let menu = top(mtm, &root, standard.menu);
             let action = Sel::register(&std::ffi::CString::new(standard.action).expect("selector"));
@@ -187,8 +227,92 @@ pub(crate) fn add_standard(app: &NSApplication) {
             entry.setTag(STANDARD);
             menu.addItem(&entry);
         }
+        system_edit_items(mtm, &top(mtm, &root, "Edit"));
+        system_window_items(mtm, &top(mtm, &root, "Window"));
+        // AppKit's windows menu: it lists the app's windows and takes the items macOS adds there
+        // (Fill, Center, Move & Resize, Full-Screen Tile), as Electron's `windowMenu` role does.
+        if let Some(window) = (0..root.numberOfItems()).filter_map(|i| root.itemAtIndex(i)).find(|i| name(i) == "Window").and_then(|i| i.submenu()) {
+            app.setWindowsMenu(Some(&window));
+        }
     }
     sync_standard(app);
+}
+
+/// The items AppKit puts at the end of an Edit menu the app has when it finishes launching,
+/// which Rune's, made at the first window, misses: Start Dictation and Emoji & Symbols (⌃⌘Space),
+/// after a separator, as in every Mac app's Edit menu. AppKit implements both actions. Skipped
+/// when the menu already has one.
+unsafe fn system_edit_items(mtm: MainThreadMarker, edit: &NSMenu) {
+    let has = |action: Sel| (0..edit.numberOfItems()).filter_map(|i| edit.itemAtIndex(i)).any(|i| i.action() == Some(action));
+    if has(sel!(startDictation:)) || has(sel!(orderFrontCharacterPalette:)) { return; }
+    let dictation = item(mtm, &crate::labels::label(Label::StartDictation), Some(sel!(startDictation:)), "");
+    let emoji = item(mtm, &crate::labels::label(Label::EmojiAndSymbols), Some(sel!(orderFrontCharacterPalette:)), " ");
+    emoji.setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Control);
+    for entry in [NSMenuItem::separatorItem(mtm), dictation, emoji] {
+        entry.setTag(SYSTEM);
+        edit.addItem(&entry);
+    }
+}
+
+/// The Window menu's Zoom, after Minimize, and Bring All to Front at its end, as Electron's
+/// `windowMenu` role and AppKit's template give a Mac app; AppKit puts its tiling items after
+/// Zoom and its window list after the end. AppKit implements both actions. Each is skipped when
+/// the menu already has it.
+unsafe fn system_window_items(mtm: MainThreadMarker, window: &NSMenu) {
+    let items = || (0..window.numberOfItems()).filter_map(|i| window.itemAtIndex(i));
+    if !items().any(|i| i.action() == Some(sel!(performZoom:))) {
+        let zoom = item(mtm, &crate::labels::label(Label::Zoom), Some(sel!(performZoom:)), "");
+        zoom.setTag(SYSTEM);
+        let after = items().position(|i| i.action() == Some(sel!(performMiniaturize:))).map_or(0, |i| i + 1);
+        window.insertItem_atIndex(&zoom, after as isize);
+    }
+    if !items().any(|i| i.action() == Some(sel!(arrangeInFront:))) {
+        let front = item(mtm, &crate::labels::label(Label::BringAllToFront), Some(sel!(arrangeInFront:)), "");
+        for entry in [NSMenuItem::separatorItem(mtm), front] {
+            entry.setTag(SYSTEM);
+            window.addItem(&entry);
+        }
+    }
+}
+/// The Edit menu's AutoFill submenu. AppKit adds it, after a separator of its own, at the end
+/// of an Edit menu the app has as it finishes launching: one made with the first window in
+/// `applicationWillFinishLaunching:`, not one made after the launch.
+const AUTOFILL: &str = "_NSMenuItemAutoFillIdentifier";
+
+fn is_autofill(item: &NSMenuItem) -> bool {
+    // SAFETY: NSMenuItem implements NSUserInterfaceItemIdentification; main thread.
+    let id: Option<Retained<NSString>> = unsafe { msg_send![item, identifier] };
+    id.is_some_and(|id| id.to_string() == AUTOFILL)
+}
+
+/// Keeps the `system_edit_items` at the end of the Edit menu after the app added its own, and
+/// AppKit's AutoFill with them, in the order of every Mac app's Edit menu: a separator,
+/// AutoFill, Start Dictation, Emoji & Symbols. AppKit's own separator before AutoFill goes.
+unsafe fn system_edit_last(edit: &NSMenu) {
+    let items: Vec<_> = (0..edit.numberOfItems()).filter_map(|i| edit.itemAtIndex(i)).collect();
+    let mut last: Vec<_> = items.iter().filter(|i| i.tag() == SYSTEM).collect();
+    if last.is_empty() { return; }
+    let autofill = items.iter().position(|i| is_autofill(i));
+    let stray = autofill.and_then(|at| at.checked_sub(1)).filter(|&at| items[at].isSeparatorItem() && items[at].tag() != SYSTEM);
+    if let Some(at) = autofill {
+        last.insert(last.iter().position(|i| i.isSeparatorItem()).map_or(0, |i| i + 1), &items[at]);
+    }
+    if stray.is_none() && items[items.len() - last.len()..].iter().zip(&last).all(|(a, b)| std::ptr::eq(&**a, &***b)) { return; }
+    if let Some(at) = stray { edit.removeItem(&items[at]); }
+    for entry in last {
+        edit.removeItem(entry);
+        edit.addItem(entry);
+    }
+}
+
+fn system_label(action: &str) -> Option<Label<'static>> {
+    match action {
+        "startDictation:" => Some(Label::StartDictation),
+        "orderFrontCharacterPalette:" => Some(Label::EmojiAndSymbols),
+        "performZoom:" => Some(Label::Zoom),
+        "arrangeInFront:" => Some(Label::BringAllToFront),
+        _ => None,
+    }
 }
 
 /// Adds an app's own items in `add`: AppKit drops the key equivalent of an item added while
@@ -201,40 +325,113 @@ pub(crate) fn adding<R>(app: &NSApplication, add: impl FnOnce() -> R) -> R {
     added
 }
 
-/// After the menu bar's items change: each standard item keeps its key equivalent unless
-/// another item in the menu bar has the same one, so an app's own item (Close Tab ⌘W) wins
-/// whichever was added first.
+/// Hides the app menu's standard About item while a `MenuItem::about` (`ABOUT_REPLACEMENT`)
+/// sits in the app menu, and restores the item Rune hid once that replacement leaves.
+fn sync_about(app: &NSApplication) {
+    let app_menu = app.mainMenu()
+        .filter(|root| root.numberOfItems() > 0)
+        .and_then(|root| root.itemAtIndex(0))
+        .and_then(|top| top.submenu());
+    let has_replacement = app_menu.as_ref().is_some_and(|menu| {
+        (0..menu.numberOfItems())
+            .filter_map(|i| menu.itemAtIndex(i))
+            .any(|i| i.tag() == ABOUT_REPLACEMENT)
+    });
+    if has_replacement {
+        let standard_about = app_menu.as_ref().and_then(|menu| {
+            (0..menu.numberOfItems())
+                .filter_map(|i| menu.itemAtIndex(i))
+                .find(|i| i.tag() != ABOUT_REPLACEMENT
+                    && i.target().is_none()
+                    && i.action() == Some(sel!(orderFrontStandardAboutPanel:)))
+        });
+        HIDDEN_ABOUT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if let Some(found) = standard_about {
+                if slot.as_ref().is_some_and(|old| !std::ptr::eq(&**old, &*found)) {
+                    if let Some(old) = slot.take() { old.setHidden(false); }
+                }
+                if slot.is_none() && !found.isHidden() {
+                    found.setHidden(true);
+                    *slot = Some(found);
+                }
+            } else if let Some(old) = slot.take() {
+                old.setHidden(false);
+            }
+        });
+    } else {
+        HIDDEN_ABOUT.with(|slot| {
+            if let Some(hidden) = slot.borrow_mut().take() {
+                hidden.setHidden(false);
+            }
+        });
+    }
+}
+
+/// After the menu bar's items change: hides or restores the standard About item, keeps Edit's
+/// system items last, and restores each yieldable standard item's (and built-in Quit's) key
+/// equivalent unless another item in the menu bar claims it, so an app's own item (Close Tab
+/// ⌘W, custom ⌘Q) wins whichever was added first.
 pub(crate) fn sync_standard(app: &NSApplication) {
+    sync_about(app);
+    if let Some(edit) = app.mainMenu().and_then(|root| (0..root.numberOfItems()).filter_map(|i| root.itemAtIndex(i)).find(|i| name(i) == "Edit")).and_then(|i| i.submenu()) {
+        // SAFETY: main thread; moving retained items within their menu.
+        unsafe { system_edit_last(&edit) };
+    }
     let mut claimed = HashSet::new();
-    // SAFETY: main thread; reading retained menus.
-    if let Some(root) = app.mainMenu() { unsafe { claims(&root, &mut claimed) }; }
+    if let Some(root) = app.mainMenu() {
+        // SAFETY: main thread; reading retained menus.
+        unsafe {
+            for i in 0..root.numberOfItems() {
+                if let Some(sub) = root.itemAtIndex(i).and_then(|top| top.submenu()) {
+                    claims(&sub, i == 0, &mut claimed);
+                }
+            }
+        }
+    }
     set_standard_keys(app, |equivalent| !claimed.contains(equivalent));
 }
 
 fn set_standard_keys(app: &NSApplication, keep: impl Fn(&Equivalent) -> bool) {
     let Some(root) = app.mainMenu() else { return };
-    for menu in (0..root.numberOfItems()).filter_map(|i| root.itemAtIndex(i)?.submenu()) {
-        for entry in (0..menu.numberOfItems()).filter_map(|i| menu.itemAtIndex(i)).filter(|i| i.tag() == STANDARD) {
-            let Some(standard) = entry.action().and_then(|a| a.name().to_str().ok()).and_then(super::standard::by_action) else { continue };
-            let equivalent = standard.equivalent();
+    for (index, menu) in (0..root.numberOfItems()).filter_map(|i| root.itemAtIndex(i)?.submenu().map(|m| (i, m))) {
+        let in_app_menu = index == 0;
+        for entry in (0..menu.numberOfItems()).filter_map(|i| menu.itemAtIndex(i)) {
+            let action = entry.action();
+            let action_name = action.as_ref().and_then(|a| a.name().to_str().ok());
+            let Some(equivalent) = super::standard::yieldable_equivalent(
+                in_app_menu,
+                entry.tag() == STANDARD,
+                entry.target().is_some(),
+                action_name,
+            ) else { continue };
             entry.setKeyEquivalent(&NSString::from_str(if keep(&equivalent) { &equivalent.key } else { "" }));
         }
     }
 }
 
-/// The key equivalents of every item but the standard ones, submenus included.
-unsafe fn claims(menu: &NSMenu, out: &mut HashSet<Equivalent>) {
+/// The key equivalents of every item except the yieldable standard items and the app menu's
+/// built-in nil-target `terminate:` item, submenus included.
+unsafe fn claims(menu: &NSMenu, in_app_menu: bool, out: &mut HashSet<Equivalent>) {
     // SAFETY: as `sync_standard`.
     unsafe {
         for entry in (0..menu.numberOfItems()).filter_map(|i| menu.itemAtIndex(i)) {
-            if entry.tag() != STANDARD {
+            let action = entry.action();
+            let action_name = action.as_ref().and_then(|a| a.name().to_str().ok());
+            let yields = super::standard::yieldable_equivalent(
+                in_app_menu,
+                entry.tag() == STANDARD,
+                entry.target().is_some(),
+                action_name,
+            ).is_some();
+            if !yields {
                 let flags = entry.keyEquivalentModifierMask();
                 let has = |f| flags.contains(f);
                 out.extend(Equivalent::new(&entry.keyEquivalent().to_string(),
                     has(NSEventModifierFlags::Command), has(NSEventModifierFlags::Shift),
                     has(NSEventModifierFlags::Option), has(NSEventModifierFlags::Control)));
             }
-            if let Some(sub) = entry.submenu() { claims(&sub, out); }
+            if let Some(sub) = entry.submenu() { claims(&sub, false, out); }
         }
     }
 }

@@ -2,7 +2,7 @@
 use super::*;
 
 mod layers;
-mod pose;
+pub(in crate::runtime) mod pose;
 mod primitives;
 
 impl RuntimeCore {
@@ -12,12 +12,8 @@ impl RuntimeCore {
         let snap_px = |v: f32| grid(v, s) * s;
         self.keep_swap();
         self.instances.clear();
-        self.paint.quads_frame += 1;
         // Quads a text hasn't drawn with for a while go, with the layouts they hold.
-        if self.paint.quads_frame % 64 == 0 {
-            let frame = self.paint.quads_frame;
-            self.paint.text_quads.retain(|_, (_, used)| frame - *used < 64);
-        }
+        self.paint.text_quads.begin_frame();
         let mut pinned_pages = 0u32;
         for f in self.motion.flights() {
             for q in &f.glyphs {
@@ -33,6 +29,7 @@ impl RuntimeCore {
         self.paint.icon_aprons.clear();
         self.surfaces.clear();
         self.paint.materials.clear();
+        self.paint.material_fallbacks.clear();
         self.hit.hits.clear();
         self.hit.wheel_hits.clear();
         self.clear_help_hits();
@@ -73,11 +70,10 @@ impl RuntimeCore {
         let sel_ranges = self.selection_ranges();
         let mark_ranges = self.mark_ranges();
         self.ime_area = None;
-        self.edit.ime_option_as_alt = false;
+        self.edit.ime_option_as_alt = crate::OptionAsAlt::None;
         let now = self.t;
         let vp = [0.0, 0.0, self.viewport.0 * s, self.viewport.1 * s];
         let mut glyph_count = 0usize;
-        let mut backdrop_blurs = 0usize;
         let mut ambient: Option<f32> = None;
         // Retain scope capacity across frames. Records preserve absolute instance indices
         // for images, video insertions, retained springs and compositor list ranges.
@@ -107,8 +103,11 @@ impl RuntimeCore {
             }
             let node_id = self.tree.nodes[i].id;
             let node_parent = self.tree.nodes[i].parent;
-            // A flight paints outside every ancestor's layer, above the whole window.
-            let lift = flying && self.motion.flying.iter().any(|f| f.0 == node_id);
+            // A lifted flight paints outside every ancestor's layer, above the whole window.
+            // `El::matched_in_place` keeps the flight in its destination's paint order and layers.
+            let is_flight = flying && self.motion.flying.iter().any(|f| f.0 == node_id);
+            let flight_in_place = is_flight && self.tree.nodes[i].vis.flight_in_place && !self.motion.launches().launched(node_id);
+            let lift = is_flight && !flight_in_place;
             let raised = (self.tree.nodes[i].vis_flags.raise() || (tree_order && self.paint.is_lifted_anchor(i))) && !lift;
             if lift || raised {
                 self.paint.close_all_layers(&self.tree.nodes, &mut self.instances, &mut self.surfaces, &mut self.marks, self.track_marks, &mut self.text, self.commit.commit_gen(), &mut layers, &mut active_cache, &mut glyph_count);
@@ -148,9 +147,9 @@ impl RuntimeCore {
                     let saved = self.anchored_inh(i, j, &a, &p, &mut pinh);
                     self.paint.last_anchor_targets.insert(node_id, saved);
                 } else if self.subtree_exiting(i)
-                    && let Some((target, k)) = self.paint.last_anchor_targets.get(&node_id).copied()
+                    && let Some((target, k, bounds)) = self.paint.last_anchor_targets.get(&node_id).copied()
                 {
-                    self.anchored_inh_at(i, &a, target, k, ScaleMotion::Still, &p, &mut pinh);
+                    self.anchored_inh_at(i, &a, target, k, bounds, ScaleMotion::Still, &p, &mut pinh);
                 } else {
                     // Never draw an anchored overlay at (0, 0) when its anchor cannot be resolved.
                     let path = self.tree.nodes[i].path.clone();
@@ -180,16 +179,18 @@ impl RuntimeCore {
             if raised {
                 self.paint.reopen_raised_layers(&self.tree.nodes, &self.scene, &mut self.instances, self.surfaces.len(), node_parent, &mut pinh, &mut layers, s);
             }
-            if lift {
-                self.motion.lift_flight_inh(&self.paint, &self.scene, self.commit.commit_gen(), node_id, node_parent, &mut pinh);
-            }
+            let flight_dest = if is_flight {
+                self.motion.flight_inh(&self.tree.nodes, &self.paint, &self.scene, self.commit.commit_gen(), node_id, node_parent, !flight_in_place, &mut pinh)
+            } else {
+                None
+            };
             let n = &self.tree.nodes[i];
             let mark = if n.vis.mark != 0 { n.vis.mark } else { pinh.mark };
             let mut own = p.opacity;
             let mut hit_own = own * group_factor(&self.scene, self.kbd.focus.keyboard(), self.kbd.focus.path(), n, 1.0);
             own *= group_factor(&self.scene, self.kbd.focus.keyboard(), self.kbd.focus.path(), n, pinh.group);
             let base_opacity = (own * pinh.opacity).clamp(0.0, 1.0);
-            let hover_owner = n.vis.hover().a > 0.0 || n.vis_flags.hover_group();
+            let hover_owner = n.vis.tracks_hover_paint() || n.vis_flags.hover_group();
             let group = if hover_owner {
                 self.scene.get(n.id, P_HOVER).unwrap_or(0.0).clamp(0.0, 1.0)
             } else {
@@ -227,23 +228,46 @@ impl RuntimeCore {
             let mut rounded = pinh.rounded;
             let has_press_scale = n.handlers.get().is_some_and(|h| h.press_scale.is_some());
             let press_k = if has_press_scale { self.scene.get(n.id, P_PRESS_SCALE).unwrap_or(1.0) } else { 1.0 };
+            let has_press_offset = n.handlers.get().is_some_and(|h| h.press_offset.is_some());
+            let press_off = if has_press_offset {
+                [self.scene.get(n.id, P_PRESS_OX).unwrap_or(0.0), self.scene.get(n.id, P_PRESS_OY).unwrap_or(0.0)]
+            } else {
+                [0.0; 2]
+            };
             let sequence = track
                 .filter(|_| matches!(n.looping.as_ref().map(|l| l.kind), Some(rune_motion::LoopKind::Sequence(_))));
             let static_k = if n.scale_track { self.scene.get(n.id, P_SCALE).unwrap_or(n.static_scale) } else { n.static_scale };
-            let own_sc = p.transform.scale.x * press_k * static_k
+            let own_sc_rest = p.transform.scale.x * press_k
                 * sequence.and_then(|l| l.pose(lnow, self.reduced_motion)).map_or(1.0, |p| p.scale);
+            let own_sc = own_sc_rest * static_k;
             // An `El::scale` or `El::live_scale` an app drives from a slider, wheel or pinch
             // counts as moving until it holds still, then rasterizes crisp at its resting scale.
+            // When Rune's own `P_SCALE` track drives the scale (without `live_scale`), the target
+            // is known ahead of time: record `Still(target)` while it animates so the landing frame
+            // rests immediately without starting a `STATIC_SCALE_SETTLE` tail.
             let has_live_scale = n.live.iter().any(|b| b.property == crate::live::Property::Scale);
             let tracked_scale = if has_live_scale { static_k * p.transform.scale.x } else { static_k };
-            let scale_settling = if tracked_scale != 1.0 || has_live_scale || self.paint.static_scales.contains_key(&n.id) {
+            let store = self.scene.store();
+            let p_scale_anim = n.scale_track && store.is_animating(n.id, P_SCALE);
+            let p_scale_target = if !has_live_scale && p_scale_anim {
+                Some(store.target(n.id, P_SCALE).unwrap_or(tracked_scale))
+            } else {
+                None
+            };
+            let scale_settling = if let Some(target) = p_scale_target {
+                self.paint.static_scales.insert(n.id, ScaleSettle::Still(target));
+                false
+            } else if tracked_scale != 1.0 || has_live_scale || self.paint.static_scales.contains_key(&n.id) {
                 pose::step_static_scale(&mut self.paint.static_scales, &mut self.paint.scale_frame, n.id, tracked_scale, self.t, self.settled, has_live_scale)
             } else { false };
-            let store = self.scene.store();
-            let scale_animating = store.is_animating(n.id, prop::SCALE) || store.is_animating(n.id, prop::PRESENCE)
-                || (has_press_scale && store.is_animating(n.id, P_PRESS_SCALE))
-                || (n.scale_track && store.is_animating(n.id, P_SCALE))
+            let own_scale_anim = (has_press_scale && store.is_animating(n.id, P_PRESS_SCALE))
+                || p_scale_anim
                 || sequence.is_some_and(|l| !self.reduced_motion && l.active(lnow));
+            let presence_anim = store.is_animating(n.id, prop::PRESENCE);
+            let scale_animating = store.is_animating(n.id, prop::SCALE) || presence_anim || own_scale_anim;
+            let presence_scales = presence_anim
+                && n.transition.as_deref().is_some_and(|t| t.insertion.scale != 1.0 || t.removal.scale != 1.0);
+            let own_scale_moving = presence_scales || own_scale_anim;
             let scale_motion = pinh.scale_motion.max(
                 if !has_live_scale && (scale_animating || scale_settling) {
                     ScaleMotion::Moving
@@ -255,6 +279,33 @@ impl RuntimeCore {
             // Scale about this node's centre where its ancestors' scales put it, so a scaled child
             // of a scaled parent stays in place.
             let sc = pinh.scale * own_sc;
+            let p_scale_tracked = !has_live_scale && pinh.scale_motion != ScaleMotion::Live && (p_scale_target.is_some() || pinh.scale_tracked);
+            let scale_target = if p_scale_tracked {
+                pinh.scale_target * own_sc_rest * p_scale_target.unwrap_or(static_k)
+            } else {
+                sc
+            };
+            let press_target = if has_press_offset {
+                [store.target(n.id, P_PRESS_OX).unwrap_or(0.0), store.target(n.id, P_PRESS_OY).unwrap_or(0.0)]
+            } else {
+                [0.0; 2]
+            };
+            let press_off_anim = has_press_offset
+                && (store.is_animating(n.id, P_PRESS_OX) || store.is_animating(n.id, P_PRESS_OY));
+            let own_press_by = if press_off_anim {
+                [press_off[0] - press_target[0], press_off[1] - press_target[1]]
+            } else {
+                [0.0; 2]
+            };
+            let press_off_by = [pinh.press_off_by[0] + own_press_by[0], pinh.press_off_by[1] + own_press_by[1]];
+            let hit_press_off = [press_off[0] * pinh.scale, press_off[1] * pinh.scale];
+            if press_off != [0.0; 2] {
+                pinh.dx += press_off[0];
+                pinh.dy += press_off[1];
+            }
+            if press_target != [0.0; 2] {
+                pinh.snap.shifted = true;
+            }
             let pivot = match n.vis.origin {
                 Some([ox, oy]) => [p.rect.x + ox * p.rect.w, p.rect.y + oy * p.rect.h],
                 None => [p.anchor.x, p.anchor.y],
@@ -281,7 +332,9 @@ impl RuntimeCore {
                 pose::update_sticky_frame(&mut self.scroll.sticky_frame, i, n, raw_edges);
             }
             // A product of 1 (0.5 inside 2.0) can still move the box.
-            let mut rect_pt = if (sc - 1.0).abs() > 1e-5 || anchor != anchor_to {
+            let mut rect_pt = if let Some(dest) = flight_dest {
+                pose::flight_frame(&self.scene, n, &p, own_sc, self.paint.row_h[i], dest)
+            } else if (sc - 1.0).abs() > 1e-5 || anchor != anchor_to {
                 [
                     anchor_to[0] + (raw_edges[0] - anchor[0]) * sc,
                     anchor_to[1] + (raw_edges[1] - anchor[1]) * sc,
@@ -301,8 +354,8 @@ impl RuntimeCore {
             }
             // A matched flight scales its laid-out content uniformly to cover the moving rect,
             // centred: `k` and the centring offset in points. A launch flies at its own size.
-            let cover = if lift && n.local.w > 0.0 && n.local.h > 0.0 {
-                pose::flight_cover(self.motion.launches(), node_id, n, rect_pt)
+            let cover = if is_flight && n.local.w > 0.0 && n.local.h > 0.0 {
+                pose::flight_cover(self.motion.launches(), node_id, n, rect_pt, sc)
             } else { None };
             let r_exact = rect_pt.map(snap_px);
             // A node the visibility test below culls paints nothing, and any clip it hands down is
@@ -331,13 +384,15 @@ impl RuntimeCore {
             };
             let steps = pinh.snap.steps || n.vis.cold.get().is_some_and(|c| c.motion_snaps);
             let rest = if snaps && animating && !steps { self.scene.rest(n.id) } else { None };
-            let gliding = snaps && (rest.is_some() || !unscaled);
+            let press_gliding = snaps && !steps && press_off_by != [0.0; 2];
+            let gliding = snaps && (rest.is_some() || press_gliding || !unscaled);
             let (mut r, snap_rest) = if !snaps {
                 (r_exact, None)
-            } else if rest.is_none() && unscaled {
+            } else if rest.is_none() && !press_gliding && unscaled {
                 self.paint.pixel_snap.at_rest(n.id, r_exact, rigid, pinh.snap.parent)
             } else {
                 let motion = pixel_snap::motion(&p, rest, s, n.above.is_some(), self.paint.row_h[i] >= 0.0);
+                let motion = pixel_snap::with_offset_motion(motion, raw_edges, press_off_by, s);
                 let raw = if unscaled { r_exact } else { raw_edges.map(snap_px) };
                 self.paint.pixel_snap.snapped(n.id, motion, (r_exact, raw), rigid, (snap_layer, sc), pinh.snap.parent)
             };
@@ -352,7 +407,7 @@ impl RuntimeCore {
             // `El::rotate`: this subtree draws into a layer turned about its origin.
             // The layer takes the clips from above; the node's own clips apply inside, upright.
             let own_turn = p.transform.rotate;
-            let own_turn = (own_turn != 0.0 && own_turn.is_finite() && own_turn.abs() > 1e-6 && !lift).then_some(own_turn);
+            let own_turn = (own_turn != 0.0 && own_turn.is_finite() && own_turn.abs() > 1e-6 && !is_flight).then_some(own_turn);
             let turn_pivot = [centre_to[0] * s, centre_to[1] * s];
             let (node_turn, turn_index) = if pinh.turn == 0 && own_turn.is_none() {
                 (None, 0)
@@ -463,12 +518,13 @@ impl RuntimeCore {
                 w,
                 h,
                 sc,
+                p_scale_tracked.then_some(scale_target),
                 m,
                 effective_opacity,
                 paint_own,
                 visible,
                 dissolve,
-                lift,
+                is_flight,
                 own_turn,
                 node_turn.as_ref(),
                 next,
@@ -481,7 +537,6 @@ impl RuntimeCore {
                 &mut fade_origin,
                 &mut rounded,
                 &mut isolate,
-                &mut backdrop_blurs,
                 &mut layers,
                 &mut active_cache,
             );
@@ -490,13 +545,19 @@ impl RuntimeCore {
             let n = &self.tree.nodes[i];
             // Native input readiness follows focus, not entrance opacity. An input
             // mounting at opacity zero still needs its IME area in this frame.
-            let input_caret = n.input.as_ref().filter(|input| input.edit.focused && self.can_focus(i))
+            let input_caret = n.input.as_ref().filter(|input| input.edit.focused && self.can_focus(i) && !self.node_disabled(i))
                 .filter(|_| !self.motion.flights().iter().any(|f| n.key.as_deref() == Some(&f.source_key)
                     && f.alphas(f.destination, now, self.reduced_motion).0 > 0.0))
                 .and_then(|_| input_caret(n, r, sc, s, gliding, &mut self.edit.input_scroll));
-            if let Some((_, area)) = input_caret
-                && n.input.as_ref().is_some_and(|input| !input.edit.is_secure()) { self.ime_area = Some(area); }
-            else if n.ime_cursor && self.ime_area.is_none() && self.allowed(i) && !self.subtree_exiting(i) { self.ime_area = Some(app_ime::area(r, s)); self.edit.ime_option_as_alt = n.ime_option_as_alt; }
+            if let Some((_, area)) = input_caret {
+                if n.input.as_ref().is_some_and(|input| !input.edit.is_secure()) && !self.is_node_read_only(i) {
+                    self.ime_area = Some(area);
+                    self.edit.ime_option_as_alt = crate::OptionAsAlt::None;
+                }
+            } else if n.ime_cursor && self.ime_area.is_none() && self.allowed(i) && !self.subtree_exiting(i) {
+                self.ime_area = Some(app_ime::area(r, s));
+                self.edit.ime_option_as_alt = n.ime_option_as_alt;
+            }
             let paint_visible = if in_cache {
                 r[2] >= clip[0] - filter_margin - 2.0
                     && r[0] <= clip[2] + filter_margin + 2.0
@@ -561,9 +622,18 @@ impl RuntimeCore {
             };
             let packed_fade = crate::render::pack_fade(fade, fade_origin, clip);
             for instance in &mut self.instances[first_instance..] {
-                instance.fade = packed_fade;
+                instance.fade = if instance.clip == clip {
+                    packed_fade
+                } else {
+                    crate::render::pack_fade(fade, fade_origin, instance.clip)
+                };
             }
-            self.clip_text_instances(i, first_instance, (r, r_exact), sc, clip, fade, fade_origin);
+            let text_clip = if self.tree.nodes[i].collapsing && self.tree.nodes[i].vis.clip.is_none() && self.tree.nodes[i].scroll.is_none() {
+                intersect(clip, r)
+            } else {
+                clip
+            };
+            self.clip_text_instances(i, first_instance, (r, r_exact), sc, text_clip, fade, fade_origin);
             let n = &self.tree.nodes[i];
             if let Some((_, radii)) = rounded {
                 for instance in &mut self.instances[primitive_start..] {
@@ -590,6 +660,8 @@ impl RuntimeCore {
                 inherit_fade(&mut fade, &mut fade_origin, origin, own);
                 let root_inh = self.root_inh();
                 self.paint.note_slide(&self.tree.nodes, &self.motion, &self.scene, self.instances.len(), s, self.viewport, self.reduced_motion, root_inh, i, outer, rect_pt, rs, (if unscaled { 1.0 } else { sc }, sc));
+            } else if n.collapsing {
+                clip = intersect(r, clip);
             }
             let n = &self.tree.nodes[i];
             let mask = self.paint.row_mask[i];
@@ -650,24 +722,31 @@ impl RuntimeCore {
                 }
                 self.paint.unturned_drawn[i] = (r.map(|v| v / s), full_clip);
             }
-            let group_rect = if hover_owner { rect_pt } else { pinh.group_rect };
+            let group_rect = if hover_owner {
+                if effective_opacity > 0.001 { rect_pt } else { intersect(rect_pt, pinh.group_rect) }
+            } else { pinh.group_rect };
             self.paint.inh_scratch[i] = Inh { opacity: effective_opacity, paint_opacity: o, first_fade: kids_fade,
                 clip: full_clip, fade: hit_fade, fade_origin: hit_origin,
                 paint_clip: clip, paint_fade: fade, paint_fade_origin: fade_origin, rounded, scale, anchor, anchor_to, blur, dy, dx,
                 cover: cover_offset, outer, mark, group, pressed, press_to,
                 hit_opacity: hit_opacity * kids_fade, group_rect,
                 scale_motion, still: if scale_motion == ScaleMotion::Still { (scale, anchor, anchor_to) } else { pinh.still },
+                held_moving: pinh.held_moving || own_scale_moving || cover.is_some(),
+                held: if !(pinh.held_moving || own_scale_moving || cover.is_some()) { (scale, anchor, anchor_to) } else { pinh.held },
+                scale_target: if cover.is_some() { scale } else { scale_target },
+                scale_tracked: p_scale_tracked && cover.is_none(),
                 in_cache, skip_paint, anchor_hidden: false, turn: turn_index,
+                press_off_by: if cover.is_some() { [0.0; 2] } else { press_off_by },
                 snap: pixel_snap::Inherit { off: snap_off, steps, shifted: pinh.snap.shifted || n.vis.offset != [0.0; 2], layer: if cover.is_some() { 0 } else { snap_layer }, parent: snap_rest.filter(|_| cover.is_none() && snap.rigid == pinh.snap.rigid && pixel_snap::frames(&n.vis)), ..snap } };
             // Shown only under its group's hover, it takes presses where the pointer hovers the
             // group: a press in the same frame as the move that reveals it finds it, as a page's
             // `:hover` applies before the press does.
             let (hit_opacity, hit_rect) = if effective_opacity > 0.001 { (effective_opacity, rect_pt) } else { (hit_opacity, intersect(rect_pt, pinh.group_rect)) };
-            self.register_node_hits(i, pinh.clip, (hit_opacity, visible), hit_rect, (press_k, press_anchor));
+            self.register_node_hits(i, pinh.clip, (hit_opacity, visible), hit_rect, (press_k, press_anchor, hit_press_off));
             if self.tree.has_sticky {
                 self.fade_below_header(i, s);
             }
-            self.keep_painted(i, !self.paint.node_animated_icon && own_turn.is_none() && !opens_snap_layer && snap_layer == 0 && !in_cache && !skip_paint && cover.is_none() && !lift && !raised);
+            self.keep_painted(i, !self.paint.node_animated_icon && own_turn.is_none() && !opens_snap_layer && snap_layer == 0 && !in_cache && !skip_paint && cover.is_none() && !is_flight && !raised);
         }
         if !self.paint.icon_anim_mounts.is_empty() {
             self.paint.icon_anim_mounts.retain(|(id, _), _| self.tree.node_index.contains_key(id));
@@ -677,6 +756,15 @@ impl RuntimeCore {
         }
         self.keep_close(None, &mut layers, &mut active_cache, &mut glyph_count);
         self.keep_end();
+        if self.paint.native_materials
+            && !self.paint.material_fallbacks.is_empty()
+            && !self.paint.material_fallback_warned
+        {
+            self.paint.material_fallback_warned = true;
+            let fallen = self.paint.material_fallbacks.len();
+            let total = self.paint.materials.len() + fallen;
+            eprintln!("{}", crate::system_material::fallback_notice(fallen, total, self.paint.max_native_materials));
+        }
         self.paint.close_all_layers(&self.tree.nodes, &mut self.instances, &mut self.surfaces, &mut self.marks, self.track_marks, &mut self.text, self.commit.commit_gen(), &mut layers, &mut active_cache, &mut glyph_count);
         // A moving chip can enter a stationary pointer. Re-evaluate against this frame's
         // geometry without inventing pointer-move or drag events on animation frames. Tooltips

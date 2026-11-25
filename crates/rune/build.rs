@@ -540,10 +540,49 @@ fn parse_shader_consts(src: &WgslSources<'_>) -> ParsedShaderConsts {
     let (_, radial_open_off_lit) = parse_f32(shader_path, "RADIAL_OPEN_OFFSET", radial_open[2]);
     let (_, radial_stop_eps_lit) = parse_f32(shader_path, "RADIAL_STOP_EPSILON", capture_once(shader_path, "radial stop epsilon", &fs, "t1 <= t0 + {})")[0]);
     let (_, inset_sharp_lit) = parse_f32(shader_path, "INSET_SHARP_SIGMA", capture_once(shader_path, "inset sharp sigma", &fs, "if (i.params.z < {}) { lit = box_cov")[0]);
-    let (flag_on, flag_on_lit) = parse_f32(shader_path, "FLAG_ON_THRESHOLD", capture_once(shader_path, "image premultiplied flag", &fs, "let premultiplied = i.params.z > {};")[0]);
+    let (flag_on, flag_on_lit) = parse_f32(shader_path, "FLAG_ON_THRESHOLD", capture_once(shader_path, "segment round-cap flag", &fs, "segment(screen, i.radii.xy, i.radii.zw, i.params.x, i.params.z > {})")[0]);
     let img_texel = wgsl_block(shader_path, &shader_code, "fn", "image_texel");
     assert_eq!(parse_f32(shader_path, "g.flags.x", capture_once(shader_path, "g.flags.x", &img_texel, "if (g.flags.x > {})")[0]).0, flag_on);
     assert_eq!(parse_f32(shader_path, "g.flags.y", capture_once(shader_path, "g.flags.y", &fs, "if (g.flags.y > {} &&")[0]).0, flag_on);
+    let image_flag_premul = parse_u32(
+        shader_path,
+        "IMAGE_FLAG_PREMULTIPLIED",
+        capture_once(shader_path, "image premultiplied bit", &fs, "let premultiplied = (flags & {}) != 0u;")[0],
+    );
+    let image_flag_tint = parse_u32(
+        shader_path,
+        "IMAGE_FLAG_TINT",
+        capture_once(shader_path, "image tint bit", &fs, "let tinted = (flags & {}) != 0u;")[0],
+    );
+    let image_flag_nearest = parse_u32(
+        shader_path,
+        "IMAGE_FLAG_NEAREST",
+        capture_once(shader_path, "image nearest bit", &fs, "let nearest = (flags & {}) != 0u;")[0],
+    );
+    let wrap_fn = wgsl_block(shader_path, &shader_code, "fn", "wrap_texel");
+    let image_wrap_extend = parse_u32(
+        shader_path,
+        "IMAGE_WRAP_EXTEND",
+        capture_once(shader_path, "image wrap extend", &fs, "if (wrap == {}) {")[0],
+    );
+    let image_wrap_repeat = parse_u32(
+        shader_path,
+        "IMAGE_WRAP_REPEAT",
+        capture_once(shader_path, "image wrap repeat", &wrap_fn, "if (mode == {}) { var m = k % n;")[0],
+    );
+    let image_wrap_mirror = parse_u32(
+        shader_path,
+        "IMAGE_WRAP_MIRROR",
+        capture_once(shader_path, "image wrap mirror", &wrap_fn, "if (mode == {}) { let p = 2 * n;")[0],
+    );
+    assert_eq!(
+        parse_u32(
+            shader_path,
+            "fs mirror period",
+            capture_once(shader_path, "fs mirror period", &fs, "select(1.0, 2.0, wrap == {})")[0],
+        ),
+        image_wrap_mirror,
+    );
 
     let erf2 = wgsl_block(shader_path, &shader_code, "fn", "erf2");
     let erf_caps = capture_once(shader_path, "erf2 poly", &erf2, "var r = 1.0 + ({} + ({} + {} * (a * a)) * a) * a;");
@@ -737,6 +776,12 @@ fn parse_shader_consts(src: &WgslSources<'_>) -> ParsedShaderConsts {
     writeln!(out, "pub const RADIAL_OPEN_OFFSET: f32 = {radial_open_off_lit};").unwrap();
     writeln!(out, "pub const RADIAL_STOP_EPSILON: f32 = {radial_stop_eps_lit};").unwrap();
     writeln!(out, "pub const FLAG_ON_THRESHOLD: f32 = {flag_on_lit};").unwrap();
+    writeln!(out, "pub const IMAGE_FLAG_PREMULTIPLIED: u32 = {image_flag_premul};").unwrap();
+    writeln!(out, "pub const IMAGE_FLAG_TINT: u32 = {image_flag_tint};").unwrap();
+    writeln!(out, "pub const IMAGE_FLAG_NEAREST: u32 = {image_flag_nearest};").unwrap();
+    writeln!(out, "pub const IMAGE_WRAP_EXTEND: u32 = {image_wrap_extend};").unwrap();
+    writeln!(out, "pub const IMAGE_WRAP_REPEAT: u32 = {image_wrap_repeat};").unwrap();
+    writeln!(out, "pub const IMAGE_WRAP_MIRROR: u32 = {image_wrap_mirror};").unwrap();
 
     writeln!(out, "pub const OUTLINE_HINT_REACH: f32 = {outline_hint_lit};").unwrap();
     writeln!(out, "pub const OUTLINE_SUBPIXEL: bool = {outline_subpixel};").unwrap();

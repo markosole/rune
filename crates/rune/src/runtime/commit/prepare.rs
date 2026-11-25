@@ -59,6 +59,7 @@ impl RuntimeCore {
         let (mut nodes, mut spare_nodes, mut layout) = (Vec::new(), Vec::new(), LayoutEngine::new());
         let (mut node_index, mut path_ids, mut memo) = (NodeIndex::default(), HashMap::default(), crate::memo::MemoCache::default());
         let (mut next_id, mut scrolls, mut virtuals) = (0u64, HashMap::default(), HashMap::default());
+        let scroll_requests = scroll::requests::Requests::default();
         let (mut virtual_culled, mut virtual_inputs, mut stats, mut key_warnings) = (HashSet::default(), HashMap::default(), FrameStats::default(), None);
         let m = Measurement {
             app,
@@ -69,11 +70,15 @@ impl RuntimeCore {
             system_text_scale: self.host.system_text_scale,
             titlebar_inset: self.host.titlebar_inset / self.host.zoom.k,
             chrome: self.host.titlebar.insets.zoomed(self.host.zoom.k),
+            maximized: self.host.maximized,
+            full_screen: self.host.full_screen,
             caption: self.host.titlebar.caption,
             system_accent: self.host.system_accent,
             system_contrast: self.host.system_contrast,
             system_increased_contrast: self.host.system_increased_contrast,
             system_scroll_bars: self.host.scroll_bars.state,
+            system_languages: self.host.system_languages.clone(),
+            languages_gen: self.host.languages_gen,
             reduced_motion: self.reduced_motion,
             time_scale: self.time_scale,
             zoom: self.host.zoom.k,
@@ -95,6 +100,7 @@ impl RuntimeCore {
             memo: &mut memo,
             next_id: &mut next_id,
             scrolls: &mut scrolls,
+            scroll_requests: &scroll_requests,
             virtuals: &mut virtuals,
             virtual_culled: &mut virtual_culled,
             virtual_inputs: &mut virtual_inputs,

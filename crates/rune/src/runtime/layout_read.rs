@@ -33,10 +33,13 @@ use super::key_index::{self, KeyIndex};
 
 #[path = "selection/rects.rs"]
 mod selection_rects;
-pub(crate) use selection_rects::{SELECTION, SelectedRange, boxes_moved};
+pub(crate) use selection_rects::{
+    FieldSelection, SELECTION, SelectedRange, boxes_moved, field_selection_key,
+    field_selection_of, field_selection_read_key,
+};
 
 /// Extra measurements one commit may take while a read moves.
-const PASSES: usize = 2;
+pub(super) const PASSES: usize = 2;
 /// Commits in a row that layout feedback alone may cause.
 const ECHOES: u32 = 4;
 
@@ -176,12 +179,15 @@ pub(crate) fn note_read_at(reads: &mut LayoutReads, key: &str, same: Option<Same
     if !counted { reads.push(LayoutRead { key: key.to_owned(), same, at }); }
 }
 
-/// What each key a view read resolved to, as last given to the view, and the selection's line
-/// boxes when it read them ([`SELECTION`]).
+/// What each key a view read resolved to, as last given to the view, resolved anchor placements
+/// ([`Cx::anchor_placement`]), and the selection's line boxes when it read them ([`SELECTION`]
+/// and [`Cx::field_selection_rects`]).
 #[derive(Clone, Default)]
 pub(crate) struct LayoutRects {
     rects: HashMap<String, Option<[f32; 4]>>,
+    pub(crate) placements: HashMap<String, Option<(crate::Side, crate::Align)>>,
     pub(crate) selection: Rc<[[f32; 4]]>,
+    pub(crate) field_selection: FieldSelection,
 }
 
 impl std::ops::Deref for LayoutRects {
@@ -198,6 +204,8 @@ impl std::ops::DerefMut for LayoutRects {
 pub(crate) struct LayoutSeen {
     pub(crate) rects: LayoutRects,
     pub(super) reads: LayoutReads,
+    /// Whether `rects` are the last launch's, for the first view (`layout_seed`).
+    pub(super) seeded: super::layout_seed::Seeded,
 }
 
 impl LayoutSeen {
@@ -209,6 +217,11 @@ impl LayoutSeen {
 /// The rect `rects` holds for `key`, when the view read it.
 pub(crate) fn seen_rect(rects: &LayoutRects, key: &str) -> Option<[f32; 4]> {
     rects.get(key).copied().flatten()
+}
+
+/// The resolved anchor placement `rects` holds for `key`, when the view read it.
+pub(crate) fn seen_placement(rects: &LayoutRects, key: &str) -> Option<(crate::Side, crate::Align)> {
+    rects.placements.get(key).copied().flatten()
 }
 
 impl cx::CxCore {
@@ -243,6 +256,14 @@ impl cx::CxCore {
     #[track_caller]
     pub(crate) fn window_layout_with<T: PartialEq + 'static>(&self, key: &str, f: impl Fn([f32; 4]) -> T + 'static) -> Option<T> {
         self.layout_with(&window_key(key), f)
+    }
+
+    #[track_caller]
+    pub(crate) fn anchor_placement(&self, key: &str) -> Option<(crate::Side, crate::Align)> {
+        note_read_at(&mut self.layout_reads.borrow_mut(), &anchor_key(key), None, Some(std::panic::Location::caller()));
+        let placement = seen_placement(&self.layout, key);
+        crate::memo::read_anchor_placement(key, placement);
+        placement
     }
 }
 
@@ -321,6 +342,29 @@ impl<S> Cx<S> {
     pub fn window_layout_with<T: PartialEq + 'static>(&self, key: &str, f: impl Fn([f32; 4]) -> T + 'static) -> Option<T> {
         self.core.window_layout_with(key, f)
     }
+
+    /// The resolved `(Side, Align)` of the [`El::anchored`](crate::El::anchored) overlay keyed
+    /// `key` (or named by a key path) after flip clamping, or `None` when no anchored overlay with
+    /// that key is mounted or its anchor is unresolved. Follows Floating UI's resolved
+    /// `placement`. In right-to-left subtrees, this is the physical side and alignment after
+    /// mirroring and flipping.
+    ///
+    /// Participates in the same settle loop and `memo` invalidation as [`Self::layout_with`]:
+    /// the view (or enclosing `memo`) re-runs only when the resolved `(Side, Align)` changes,
+    /// never on scrolls or resizes that do not flip the overlay.
+    ///
+    /// ```no_run
+    /// use rune::{Align, Cx, El, Side, col};
+    /// fn view(_: &(), cx: &mut Cx<()>) -> El {
+    ///     let submenu_side = cx.anchor_placement("parent-menu").map_or(Side::Right, |(s, _)| s);
+    ///     col().key("submenu").w(120.0).h(80.0).anchored("item", submenu_side, Align::Start, 4.0)
+    /// }
+    /// ```
+    #[track_caller]
+    #[inline(always)]
+    pub fn anchor_placement(&self, key: &str) -> Option<(crate::Side, crate::Align)> {
+        self.core.anchor_placement(key)
+    }
 }
 
 /// The layout-read key a window-position read of `key` is noted under.
@@ -334,8 +378,21 @@ pub(crate) fn window_read_key(key: &str) -> Option<&str> {
     key.strip_prefix(WINDOW)
 }
 
+/// The layout-read key an [`Cx::anchor_placement`] read of `key` is noted under.
+pub(crate) fn anchor_key(key: &str) -> String {
+    format!("{ANCHOR}{key}")
+}
+
+/// The element key an anchor-placement read's key stands for, or `None` for another read.
+#[cfg(debug_assertions)]
+pub(crate) fn anchor_read_key(key: &str) -> Option<&str> {
+    key.strip_prefix(ANCHOR)
+}
+
 /// The prefix of a window-position read's key, which no element key starts with.
 const WINDOW: &str = "\u{1}window:";
+/// The prefix of an anchor-placement read's key, which no element key starts with.
+const ANCHOR: &str = "\u{1}anchor:";
 
 /// `[w, h]` of `rect`.
 pub(crate) fn size(rect: [f32; 4]) -> [f32; 2] {
@@ -392,8 +449,10 @@ impl RuntimeCore {
             && let Some(k) = anchor_index(&nodes, anc, a)
         {
             let at = sticky::anchored_target(nodes, scrolls, k, self.viewport);
+            let b = anchor::boundary_index(nodes, anc);
+            let bounds = anchor::anchor_bounds(nodes, scrolls, b, self.viewport);
             let (w, h) = (nodes[anc].target[2] - nodes[anc].target[0], nodes[anc].target[3] - nodes[anc].target[1]);
-            let (ax, ay) = anchor_position(a, at, (w, h), self.viewport);
+            let (ax, ay, _, _) = anchor_position(a, at, (w, h), bounds);
             dx -= ax - nodes[anc].target[0];
             dy -= ay - nodes[anc].target[1];
         }
@@ -402,7 +461,7 @@ impl RuntimeCore {
     }
 
     fn layout_of(&self, nodes: &[Node], index: Option<&KeyIndex>, key: &str) -> Option<[f32; 4]> {
-        if key == SELECTION { return None; }
+        if key == SELECTION || key.starts_with(ANCHOR) || field_selection_read_key(key).is_some() { return None; }
         let (key, scrolled) = key.strip_prefix(WINDOW).map_or((key, false), |key| (key, true));
         let first = match index {
             Some(index) => index.first(nodes, key),
@@ -415,6 +474,25 @@ impl RuntimeCore {
         let node_rect = self.placed(nodes, i, scrolled);
         let t = nodes[i].target;
         Some([node_rect[0] + (x0 - t[0]), node_rect[1] + (y0 - t[1]), x1 - x0, y1 - y0])
+    }
+
+    /// The resolved `(Side, Align)` of the anchored node named `key`; when `live_scroll` is true
+    /// and a viewport is scrolled, re-evaluates against current scroll offsets so a scroll that
+    /// flips the overlay wakes readers while a non-flipping scroll does not.
+    fn anchor_placement_of(&self, nodes: &[Node], index: Option<&KeyIndex>, key: &str, live_scroll: bool) -> Option<(crate::Side, crate::Align)> {
+        let i = match index {
+            Some(index) => index.first(nodes, key),
+            None => key_index::scan_first(nodes, key),
+        }?;
+        let n = &nodes[i];
+        let placed = n.resolved_anchor?;
+        if !live_scroll || self.scroll.scrolls.is_empty() {
+            return Some(placed);
+        }
+        let a = n.above.as_ref()?;
+        let j = anchor_index(nodes, i, a)?;
+        let b = anchor::boundary_index(nodes, i);
+        Some(anchor::resolved_placement(nodes, &self.scroll.scrolls, i, j, b, a, (n.local.w, n.local.h), self.viewport))
     }
 
     /// Checks `reads` (the last view's when `None`) against `nodes` (the current frame's when
@@ -438,38 +516,96 @@ impl RuntimeCore {
             }
         };
         let now: Vec<Option<[f32; 4]>> = reads.iter().map(|r| self.layout_of(nodes, index, &r.key)).collect();
+        let has_anchor = reads.iter().any(|r| r.key.starts_with(ANCHOR));
+        let now_placements = has_anchor.then(|| {
+            reads.iter()
+                .map(|r| r.key.strip_prefix(ANCHOR).and_then(|k| self.anchor_placement_of(nodes, index, k, pass.is_none())))
+                .collect::<Vec<_>>()
+        });
         let boxes = reads.iter().any(|r| r.key == SELECTION).then(|| match pass {
             Some((nodes, ranges)) => self.selection_boxes_in(nodes, ranges),
             None => self.selection_boxes(),
         });
+        let field_boxes = reads.iter().any(|r| field_selection_read_key(&r.key).is_some())
+            .then(|| self.field_selection_boxes_in(nodes));
+        // The first commit's layout, checking rects the last launch read (`layout_seed`).
+        let seed = self.seed_unchecked();
         let rects = &mut self.commit.layout_seen.rects;
-        let moved = reads.iter().zip(&now).position(|(r, rect)| rects.get(&r.key).is_none_or(|old| r.moved(*old, *rect)));
-        let changed = moved.is_some() || boxes.as_ref().is_some_and(|b| boxes_moved(&rects.selection, b));
+        let moved = reads.iter().enumerate().position(|(idx, r)| {
+            if field_selection_read_key(&r.key).is_some() {
+                false
+            } else if let Some(k) = r.key.strip_prefix(ANCHOR) {
+                let p = now_placements.as_ref().and_then(|v| v[idx]);
+                seen_placement(rects, k) != p
+            } else {
+                let rect = now[idx];
+                rects.get(&r.key).is_none_or(|old| r.moved(*old, rect))
+            }
+        });
+        let field_moved = field_boxes.as_ref().is_some_and(|now_fs| {
+            reads.iter().filter_map(|r| field_selection_read_key(&r.key)).any(|k| {
+                boxes_moved(field_selection_of(&rects.field_selection, k), field_selection_of(now_fs, k))
+            })
+        });
+        let changed = moved.is_some()
+            || boxes.as_ref().is_some_and(|b| boxes_moved(&rects.selection, b))
+            || field_moved;
+        if seed && moved.is_some() {
+            for (r, rect) in reads.iter().zip(&now) {
+                if r.key.starts_with(ANCHOR) || field_selection_read_key(&r.key).is_some() { continue; }
+                let seeded = rects.get(&r.key).copied();
+                if seeded.is_none_or(|old| r.moved(old, *rect)) { super::layout_seed::log_moved(&r.key, seeded, *rect); }
+            }
+        }
         // The once-a-frame check names the read for the scroll warning.
         #[cfg(debug_assertions)]
         if !nodes_given && let Some(k) = moved { self.commit.watch.meter.read(&reads[k].key, reads[k].at); }
         if changed || force {
             if let Some(b) = boxes { rects.selection = b.into(); }
-            for (r, rect) in reads.iter().zip(now) {
-                match rects.get_mut(&r.key) {
-                    Some(seen) => *seen = rect,
-                    None => { rects.insert(r.key.clone(), rect); }
+            if let Some(fs) = field_boxes { rects.field_selection = fs; }
+            for (idx, (r, rect)) in reads.iter().zip(now).enumerate() {
+                if field_selection_read_key(&r.key).is_some() { continue; }
+                if let Some(k) = r.key.strip_prefix(ANCHOR) {
+                    let p = now_placements.as_ref().and_then(|v| v[idx]);
+                    match rects.placements.get_mut(k) {
+                        Some(seen) => *seen = p,
+                        None => { rects.placements.insert(k.to_owned(), p); }
+                    }
+                } else {
+                    match rects.get_mut(&r.key) {
+                        Some(seen) => *seen = rect,
+                        None => { rects.insert(r.key.clone(), rect); }
+                    }
                 }
             }
         }
         self.commit.layout_seen.reads = reads;
+        if seed { self.seed_checked(!changed); }
         changed
     }
 
     /// Before a commit runs the view: what it is given for each key it read becomes the
     /// current rect, since it re-runs anyway.
     pub(super) fn refresh_layout_seen(&mut self) {
-        if self.commit.layout_seen.rects.is_empty() { return; }
-        self.tree.prepare_key_index(self.commit.commit_gen(), self.commit.layout_seen.rects.len());
-        let index = self.tree.key_index_for(&self.tree.nodes, self.commit.commit_gen());
-        let now: Vec<_> = self.commit.layout_seen.rects.keys().map(|k| self.layout_of(&self.tree.nodes, index, k)).collect();
-        for (seen, rect) in self.commit.layout_seen.rects.values_mut().zip(now) { *seen = rect; }
-        if self.commit.layout_seen.rects.contains_key(SELECTION) { self.commit.layout_seen.rects.selection = self.selection_boxes().into(); }
+        let has_field_sel = self.commit.layout_seen.reads.iter().any(|r| field_selection_read_key(&r.key).is_some());
+        let len = self.commit.layout_seen.rects.len() + self.commit.layout_seen.rects.placements.len();
+        if len == 0 && !has_field_sel { return; }
+        if len > 0 {
+            self.tree.prepare_key_index(self.commit.commit_gen(), len);
+            let index = self.tree.key_index_for(&self.tree.nodes, self.commit.commit_gen());
+            let now: Vec<_> = self.commit.layout_seen.rects.keys().map(|k| self.layout_of(&self.tree.nodes, index, k)).collect();
+            for (seen, rect) in self.commit.layout_seen.rects.values_mut().zip(now) { *seen = rect; }
+            if !self.commit.layout_seen.rects.placements.is_empty() {
+                let now_p: Vec<_> = self.commit.layout_seen.rects.placements.keys()
+                    .map(|k| self.anchor_placement_of(&self.tree.nodes, index, k, true))
+                    .collect();
+                for (seen, p) in self.commit.layout_seen.rects.placements.values_mut().zip(now_p) { *seen = p; }
+            }
+            if self.commit.layout_seen.rects.contains_key(SELECTION) { self.commit.layout_seen.rects.selection = self.selection_boxes().into(); }
+        }
+        if has_field_sel {
+            self.commit.layout_seen.rects.field_selection = self.field_selection_boxes_in(&self.tree.nodes);
+        }
     }
 
     /// Once a frame: whether a layout read moved, so the view re-runs. Scrolling reopens
@@ -477,7 +613,7 @@ impl RuntimeCore {
     pub(super) fn layout_reads_moved(&mut self) -> bool {
         if self.commit.layout_seen.is_empty() { return false; }
         if self.scrolling() { self.commit.step_feedback(FeedbackEvent::Reopened); }
-        if self.selection_read_moved() { self.commit.dirty = true; }
+        if self.selection_read_moved() || self.field_selection_read_moved() { self.commit.dirty = true; }
         self.layout_feedback_open() && self.layout_moved(None, None, false)
     }
 
@@ -500,9 +636,11 @@ impl RuntimeCore {
             measured = self.measure(app, tx);
         }
         if !settled { self.layout_moved(Some(std::mem::take(&mut measured.layout_reads)), Some((&measured.nodes, &measured.selection)), true); }
-        let LayoutSeen { rects, reads } = &mut self.commit.layout_seen;
+        let LayoutSeen { rects, reads, seeded: _ } = &mut self.commit.layout_seen;
         rects.retain(|k, _| reads.iter().any(|r| r.key == *k));
+        rects.placements.retain(|k, _| reads.iter().any(|r| r.key.strip_prefix(ANCHOR) == Some(k.as_str())));
         if !rects.contains_key(SELECTION) { rects.selection = Rc::default(); }
+        if !reads.iter().any(|r| field_selection_read_key(&r.key).is_some()) { rects.field_selection = None; }
         measured
     }
 
@@ -541,14 +679,16 @@ impl RuntimeCore {
         self.report_rects(false, true)
     }
 
-    /// Queues `on_drawn_layout` for elements whose drawn rect moved since it last reported,
-    /// once their own and their ancestors' springs rest. A move its laid-out rect explains is
-    /// layout feedback and falls quiet with the rest of it; one it doesn't (a live value) always
-    /// reports, as scrolling reopens feedback. True when it queued any.
+    /// Queues `on_drawn_layout` for elements whose drawn rect moved or whose display scale
+    /// changed since it last reported, once their own and their ancestors' springs rest. A move
+    /// its laid-out rect explains is layout feedback and falls quiet with the rest of it; one it
+    /// doesn't (a live value) always reports, as scrolling reopens feedback. True when it queued
+    /// any.
     pub(super) fn report_drawn(&mut self) -> bool {
         if !self.tree.has_drawn_layout() && self.commit.drawn_fired_empty() { return false; }
         let mut queued = false;
         let quiet = !self.layout_feedback_open();
+        let scale = self.env.scale.to_bits();
         let last = self.commit.take_drawn_fired();
         let mut fired = HashMap::with_capacity_and_hasher(last.len(), Default::default());
         for i in 0..self.tree.nodes.len() {
@@ -562,19 +702,21 @@ impl RuntimeCore {
             }
             let laid = self.tree.static_layout(i);
             let old = last.get(&id).copied();
-            if !moved(old.map(|o| o.0), Some(drawn)) {
-                fired.insert(id, old.unwrap_or((drawn, laid)));
+            let rect_moved = moved(old.map(|o| o.0), Some(drawn));
+            let scale_changed = old.is_some_and(|o| o.2 != scale);
+            if !rect_moved && !scale_changed {
+                fired.insert(id, old.unwrap_or((drawn, laid, scale)));
                 continue;
             }
-            let external = old.is_some_and(|(_, l)| !moved(Some(l), Some(laid)));
+            let external = rect_moved && old.is_some_and(|(_, l, _)| !moved(Some(l), Some(laid)));
             if quiet && !external {
-                fired.insert(id, (drawn, laid));
+                fired.insert(id, (drawn, laid, scale));
                 continue;
             }
             let path = n.path.clone();
             self.frame.queue.retain(|a| !matches!(a, Action::DrawnLayout(p, ..) if *p == path));
             self.frame.queue.push(Action::DrawnLayout(path, drawn, external));
-            fired.insert(id, (drawn, laid));
+            fired.insert(id, (drawn, laid, scale));
             queued = true;
         }
         self.commit.set_drawn_fired(fired);
@@ -599,10 +741,10 @@ impl RuntimeCore {
         let store = self.scene.store();
         let n = &self.tree.nodes[i];
         self.motion.flights().iter().any(|f| f.lands(&n.path, n.key.as_deref()))
-            || std::iter::successors(Some(i), |&p| step_up(&self.tree.nodes, p)).any(|p| {
+            || anchor_ancestors(&self.tree.nodes, i).any(|p| {
                 let id = self.tree.nodes[p].id;
                 store.is_animating(id, prop::FRAME) || store.is_animating(id, prop::TRAVEL) || store.is_animating(id, prop::PRESENCE)
-                    || store.is_animating(id, prop::OFFSET) || store.is_animating(id, prop::SCALE) || store.is_animating(id, P_PRESS_SCALE)
+                    || store.is_animating(id, prop::OFFSET) || store.is_animating(id, prop::SCALE) || store.is_animating(id, P_PRESS_SCALE) || store.is_animating(id, P_PRESS_OX) || store.is_animating(id, P_PRESS_OY)
                     || store.is_animating(id, P_SCALE) || store.is_animating(id, prop::ROTATION)
                     || self.motion.grows.get(&id).is_some_and(|g| g.moving())
                     || self.motion.stacks.get(&id).is_some_and(|s| s.moving)
@@ -610,12 +752,13 @@ impl RuntimeCore {
             })
     }
 
-    /// Queues `on_layout`, or `on_screen_layout` when `screen`, for rects that moved; true when
-    /// it queued any.
+    /// Queues `on_layout`, or `on_screen_layout` when `screen`, for rects that moved (or, for
+    /// `on_layout`, whose display scale changed); true when it queued any.
     fn report_rects(&mut self, quiet: bool, screen: bool) -> bool {
         let last = self.commit.take_layout_fired(screen);
         // On screen, the view's points are the window's over its zoom.
         let ((ox, oy), k) = if screen { (self.host.window_origin(), self.host.zoom()) } else { ((0.0, 0.0), 1.0) };
+        let scale = self.env.scale.to_bits();
         let mut fired = HashMap::with_capacity_and_hasher(last.len(), Default::default());
         let mut queued = false;
         for i in 0..self.tree.nodes.len() {
@@ -624,7 +767,9 @@ impl RuntimeCore {
             let id = n.id;
             let [x, y, w, h] = self.laid_out(&self.tree.nodes, i);
             let r = [x * k + ox, y * k + oy, w * k, h * k];
-            if !quiet && moved(last.get(&id).copied(), Some(r)) {
+            let old = last.get(&id).copied();
+            let scale_changed = !screen && old.is_some_and(|(_, s)| s != scale);
+            if !quiet && (moved(old.map(|(r, _)| r), Some(r)) || scale_changed) {
                 let path = self.tree.nodes[i].path.clone();
                 queued = true;
                 if screen {
@@ -634,12 +779,12 @@ impl RuntimeCore {
                 } else {
                     self.frame.queue.push(Action::Layout(path, r));
                 }
-            } else if let Some(old) = last.get(&id).filter(|_| !quiet) {
+            } else if let Some(old) = old.filter(|_| !quiet) {
                 // Unchanged: keep the rect last reported, so drift below the threshold adds up.
-                fired.insert(id, *old);
+                fired.insert(id, old);
                 continue;
             }
-            fired.insert(id, r);
+            fired.insert(id, (r, scale));
         }
         self.commit.set_layout_fired(screen, fired);
         queued

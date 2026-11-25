@@ -84,21 +84,64 @@ impl PopupItem {
     pub fn title(&self) -> &str { &self.title }
     pub fn is_enabled(&self) -> bool { self.enabled }
     pub fn is_checked(&self) -> bool { self.checked }
+
+    /// The shortcut hint shown beside the title, if one was set with [`PopupItem::key_equivalent`].
+    ///
+    /// ```
+    /// # use rune::{PopupItem, Shortcut};
+    /// let shortcut: Shortcut = "mod+c".parse().unwrap();
+    /// let item = PopupItem::new("copy", "Copy").key_equivalent(shortcut.clone());
+    /// assert_eq!(item.key_equivalent_shortcut(), Some(&shortcut));
+    /// assert_eq!(PopupItem::new("plain", "Plain").key_equivalent_shortcut(), None);
+    /// ```
+    pub fn key_equivalent_shortcut(&self) -> Option<&Shortcut> { self.key_equivalent.as_ref() }
+
+    /// The macOS SF Symbol name set with [`PopupItem::symbol`], if any.
+    ///
+    /// ```
+    /// # use rune::PopupItem;
+    /// let item = PopupItem::new("copy", "Copy").symbol("doc.on.doc");
+    /// assert_eq!(item.symbol_name(), Some("doc.on.doc"));
+    /// assert_eq!(PopupItem::new("plain", "Plain").symbol_name(), None);
+    /// ```
+    pub fn symbol_name(&self) -> Option<&str> { self.symbol.as_deref() }
 }
 
+/// One entry in a [`PopupMenu`]: an item, a separator, or a nested submenu.
+///
+/// Returned as a slice by [`PopupMenu::entries`] so headless tests and in-app fallback menus can
+/// inspect an open menu without cloning it.
+///
+/// ```
+/// # use rune::{PopupEntry, PopupItem, PopupMenu};
+/// let menu = PopupMenu::new()
+///     .item(PopupItem::new("copy", "Copy"))
+///     .separator()
+///     .submenu("More", PopupMenu::new().item(PopupItem::new("share", "Share")));
+/// assert!(matches!(&menu.entries()[0], PopupEntry::Item(i) if i.id() == "copy"));
+/// assert!(matches!(&menu.entries()[1], PopupEntry::Separator));
+/// assert!(matches!(&menu.entries()[2], PopupEntry::Submenu { title, enabled: true, .. } if title == "More"));
+/// ```
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum Entry {
+#[non_exhaustive]
+pub enum PopupEntry {
+    /// A selectable item.
     Item(PopupItem),
+    /// A divider between groups of items.
     Separator,
     /// A titled submenu, and whether it opens.
-    Submenu(String, PopupMenu, bool),
+    Submenu {
+        title: String,
+        menu: PopupMenu,
+        enabled: bool,
+    },
 }
 
 /// The items of a native pop-up or context menu. Ids must be unique across the menu and its
 /// submenus.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PopupMenu {
-    pub(crate) entries: Vec<Entry>,
+    pub(crate) entries: Vec<PopupEntry>,
     pub(crate) selected: Option<String>,
 }
 
@@ -117,19 +160,19 @@ impl PopupMenu {
         Self::new().items(items).selected(selected)
     }
 
-    pub fn item(mut self, item: PopupItem) -> Self { self.entries.push(Entry::Item(item)); self }
+    pub fn item(mut self, item: PopupItem) -> Self { self.entries.push(PopupEntry::Item(item)); self }
     pub fn items(mut self, items: impl IntoIterator<Item = PopupItem>) -> Self {
-        self.entries.extend(items.into_iter().map(Entry::Item));
+        self.entries.extend(items.into_iter().map(PopupEntry::Item));
         self
     }
-    pub fn separator(mut self) -> Self { self.entries.push(Entry::Separator); self }
+    pub fn separator(mut self) -> Self { self.entries.push(PopupEntry::Separator); self }
     pub fn submenu(mut self, title: impl Into<String>, menu: PopupMenu) -> Self {
-        self.entries.push(Entry::Submenu(title.into(), menu, true));
+        self.entries.push(PopupEntry::Submenu { title: title.into(), menu, enabled: true });
         self
     }
-    /// A submenu shown greyed out and closed unless nabled.
+    /// A submenu shown greyed out and closed unless `enabled`.
     pub fn submenu_enabled(mut self, title: impl Into<String>, menu: PopupMenu, enabled: bool) -> Self {
-        self.entries.push(Entry::Submenu(title.into(), menu, enabled));
+        self.entries.push(PopupEntry::Submenu { title: title.into(), menu, enabled });
         self
     }
     /// The top-level item that opens over an element anchor, like a pop-up button's current
@@ -137,11 +180,34 @@ impl PopupMenu {
     /// anchor, this item opens under the point instead of the menu's top-left corner.
     pub fn selected(mut self, id: impl Into<String>) -> Self { self.selected = Some(id.into()); self }
 
+    /// The menu's entries in order: items, separators, and nested submenus.
+    ///
+    /// ```
+    /// # use rune::{PopupEntry, PopupItem, PopupMenu};
+    /// let menu = PopupMenu::new()
+    ///     .item(PopupItem::new("copy", "Copy"))
+    ///     .separator()
+    ///     .item(PopupItem::new("paste", "Paste").enabled(false));
+    /// assert_eq!(menu.entries().len(), 3);
+    /// assert!(matches!(&menu.entries()[2], PopupEntry::Item(i) if !i.is_enabled()));
+    /// ```
+    pub fn entries(&self) -> &[PopupEntry] { &self.entries }
+
+    /// The item id set with [`PopupMenu::selected`] or [`PopupMenu::picker`], if any.
+    ///
+    /// ```
+    /// # use rune::PopupMenu;
+    /// let menu = PopupMenu::picker([("light", "Light"), ("dark", "Dark")], "dark");
+    /// assert_eq!(menu.selected_id(), Some("dark"));
+    /// assert_eq!(PopupMenu::new().selected_id(), None);
+    /// ```
+    pub fn selected_id(&self) -> Option<&str> { self.selected.as_deref() }
+
     /// The item with this id, in this menu or a submenu.
     pub fn find(&self, id: &str) -> Option<&PopupItem> {
         self.entries.iter().find_map(|entry| match entry {
-            Entry::Item(item) if item.id == id => Some(item),
-            Entry::Submenu(_, menu, _) => menu.find(id),
+            PopupEntry::Item(item) if item.id == id => Some(item),
+            PopupEntry::Submenu { menu, .. } => menu.find(id),
             _ => None,
         })
     }
@@ -149,18 +215,18 @@ impl PopupMenu {
     /// The selected id when it names a top-level item, the only kind AppKit can position.
     pub(crate) fn positioned(&self) -> Option<&str> {
         let selected = self.selected.as_deref()?;
-        self.entries.iter().any(|e| matches!(e, Entry::Item(item) if item.id == selected)).then_some(selected)
+        self.entries.iter().any(|e| matches!(e, PopupEntry::Item(item) if item.id == selected)).then_some(selected)
     }
 
     fn validate(&self, ids: &mut std::collections::HashSet<String>) -> Result<(), String> {
         for entry in &self.entries {
             match entry {
-                Entry::Item(item) => {
+                PopupEntry::Item(item) => {
                     if item.id.is_empty() { return Err("an item has an empty id".into()); }
                     if !ids.insert(item.id.clone()) { return Err(format!("duplicate item id {:?}", item.id)); }
                 }
-                Entry::Submenu(_, menu, _) => menu.validate(ids)?,
-                Entry::Separator => {}
+                PopupEntry::Submenu { menu, .. } => menu.validate(ids)?,
+                PopupEntry::Separator => {}
             }
         }
         Ok(())
@@ -168,15 +234,15 @@ impl PopupMenu {
 
     pub(crate) fn to_json(&self) -> Value {
         let entries: Vec<Value> = self.entries.iter().map(|entry| match entry {
-            Entry::Item(item) => {
+            PopupEntry::Item(item) => {
                 let mut v = json!({ "id": item.id, "title": item.title, "enabled": item.enabled, "checked": item.checked });
                 if let Some(shortcut) = &item.key_equivalent { v["keyEquivalent"] = shortcut.to_string().into(); }
                 if let Some(symbol) = &item.symbol { v["symbol"] = symbol.clone().into(); }
                 v
             }
-            Entry::Separator => json!({ "separator": true }),
-            Entry::Submenu(title, menu, true) => json!({ "submenu": title, "menu": menu.to_json() }),
-            Entry::Submenu(title, menu, false) => json!({ "submenu": title, "enabled": false, "menu": menu.to_json() }),
+            PopupEntry::Separator => json!({ "separator": true }),
+            PopupEntry::Submenu { title, menu, enabled: true } => json!({ "submenu": title, "menu": menu.to_json() }),
+            PopupEntry::Submenu { title, menu, enabled: false } => json!({ "submenu": title, "enabled": false, "menu": menu.to_json() }),
         }).collect();
         let mut v = json!({ "items": entries });
         if let Some(selected) = &self.selected { v["selected"] = selected.clone().into(); }
@@ -198,7 +264,54 @@ impl From<&String> for PopupAnchor { fn from(key: &String) -> Self { Self::Key(k
 impl From<PointerPress> for PopupAnchor { fn from(p: PointerPress) -> Self { Self::Point(p.x, p.y) } }
 impl From<(f32, f32)> for PopupAnchor { fn from((x, y): (f32, f32)) -> Self { Self::Point(x, y) } }
 
-/// Why [`Runtime::resolve_popup`] could not answer a menu.
+/// A text field's context-menu request handed to [`App::on_field_menu`](crate::App::on_field_menu)
+/// on platforms where [`popup_menu_supported`] is false (such as Linux).
+///
+/// Inspect [`Self::menu`] with [`PopupMenu::entries`] to build an in-window menu at
+/// [`Self::point`], then answer with [`Tx::resolve_field_menu`](crate::Tx::resolve_field_menu).
+///
+/// ```
+/// use rune::{App, AppSpec, FieldMenuRequest, PopupEntry, Tx, el};
+///
+/// struct S { open_menu: Option<FieldMenuRequest> }
+/// let _app = App::new(AppSpec::new("demo", (480.0, 320.0), || S { open_menu: None }, |_, _| el()))
+///     .on_field_menu(|s: &mut S, req: FieldMenuRequest, _tx: &mut Tx| {
+///         let _entries: &[PopupEntry] = req.menu().entries();
+///         s.open_menu = Some(req);
+///     });
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+pub struct FieldMenuRequest {
+    field_key: Option<String>,
+    field_path: String,
+    point: PointerPress,
+    menu: PopupMenu,
+}
+
+impl FieldMenuRequest {
+    pub(crate) fn new(field_key: Option<String>, field_path: String, point: PointerPress, menu: PopupMenu) -> Self {
+        Self { field_key, field_path, point, menu }
+    }
+
+    /// The text field's element key (`El::key`), if one was set.
+    pub fn field_key(&self) -> Option<&str> { self.field_key.as_deref() }
+
+    /// The text field's full tree path.
+    pub fn field_path(&self) -> &str { &self.field_path }
+
+    /// Where the menu was requested, in view points (the secondary-press point, or the focused
+    /// field's bottom-left for keyboard Menu / Shift+F10).
+    pub fn point(&self) -> PointerPress { self.point }
+
+    /// The ready-built field menu (spelling suggestions, Cut, Copy, Paste, Select All,
+    /// Spellcheck, Spellcheck Languages). Read its items with [`PopupMenu::entries`].
+    pub fn menu(&self) -> &PopupMenu { &self.menu }
+
+    /// Consumes the request and returns its [`PopupMenu`].
+    pub fn into_menu(self) -> PopupMenu { self.menu }
+}
+
+/// Why [`crate::Runtime::resolve_popup`] could not answer a menu.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PopupMenuError {
     NotOpen,
@@ -272,6 +385,25 @@ impl Tx {
         });
         let request = Request { menu, anchor: anchor.into(), on_pick, field: None };
         self.popups.push(Call(Rc::new(RefCell::new(Some(request)))));
+    }
+
+    /// Answers the pending text-field menu delivered to
+    /// [`App::on_field_menu`](crate::App::on_field_menu).
+    ///
+    /// Pass `Some(id)` with the picked [`PopupItem::id`] to run that field action (Cut, Copy,
+    /// Paste, Select All, a spelling suggestion, Learn Spelling, or a spellcheck setting), or
+    /// `None` to dismiss it. Unknown or disabled item ids are ignored, and calls with no
+    /// pending fallback menu do nothing.
+    ///
+    /// ```
+    /// use rune::{Tx, el};
+    ///
+    /// let _copy = el().on_press_tx(|_: &mut (), tx: &mut Tx| {
+    ///     tx.resolve_field_menu(Some("copy"));
+    /// });
+    /// ```
+    pub fn resolve_field_menu(&mut self, id: Option<&str>) {
+        self.field_menu_resolution = Some(id.map(str::to_owned));
     }
 }
 

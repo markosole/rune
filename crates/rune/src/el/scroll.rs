@@ -58,7 +58,7 @@ impl El {
     /// [`El::scroll_x`] in place.
     #[cfg_attr(debug_assertions, track_caller)]
     pub fn set_scroll_x(&mut self) -> &mut Self {
-        self.viewport(ScrollSpec { stick_bottom: false }, ScrollAxes::X, taffy::Overflow::Scroll, taffy::Overflow::Hidden);
+        self.viewport(ScrollSpec::default(), ScrollAxes::X, taffy::Overflow::Scroll, taffy::Overflow::Hidden);
         self
     }
     /// A viewport that scrolls both ways over its children (a wide timeline, a large
@@ -76,7 +76,7 @@ impl El {
     /// [`El::scroll_xy`] in place.
     #[cfg_attr(debug_assertions, track_caller)]
     pub fn set_scroll_xy(&mut self) -> &mut Self {
-        let spec = self.cold.scroll.unwrap_or(ScrollSpec { stick_bottom: false });
+        let spec = self.cold.scroll.unwrap_or_default();
         self.viewport(spec, ScrollAxes::Both, taffy::Overflow::Scroll, taffy::Overflow::Scroll);
         self
     }
@@ -142,14 +142,43 @@ impl El {
     }
     /// On a vertical scroll viewport, keep the row at the top of the view where it is when a
     /// commit changes the content above it (rows inserted, removed, grown or reflowed by a new
-    /// width), as CSS `overflow-anchor: auto` does in a browser. The row is the first child
-    /// drawn in the view, or within a child that starts above the view, the first of its
-    /// children, and so on down. It holds only while the viewport is still and scrolled off
-    /// its top, and not following its bottom (`stick_bottom`): at the very top new content
-    /// above shows. A [`Tx::keep_on_screen`] in the same commit wins, and so does a scroll.
-    /// [`El::virtual_rows`] lists already keep their first visible row this way.
+    /// width), as CSS `overflow-anchor: auto` does in a browser. The anchor is the first
+    /// eligible child drawn in the view, or within a child that starts above the view (including
+    /// a tall mounted [`El::virtual_rows`] row), its first surviving visible descendant, and so
+    /// on down. Elements marked [`El::no_scroll_anchor`] and their subtrees are skipped. It
+    /// holds only while the viewport is still and scrolled off its top, and not following its
+    /// bottom (`stick_bottom`): at the very top new content above shows. A
+    /// [`Tx::keep_on_screen`] in the same commit wins, and so does a scroll. Whole-row
+    /// [`El::virtual_rows`] lists keep their first visible row on their own unless opted out
+    /// with [`El::no_scroll_anchor`].
     pub fn scroll_anchor(mut self) -> Self {
-        self.cold_mut().scroll_edges.anchor = true;
+        let edges = &mut self.cold_mut().scroll_edges;
+        edges.anchor = true;
+        edges.no_anchor = false;
+        self
+    }
+    /// Opts this element out of scroll anchoring, like CSS `overflow-anchor: none`.
+    ///
+    /// - On a row or descendant inside an [`El::scroll_anchor`] viewport or a virtual list
+    ///   ([`El::virtual_rows`] / [`El::virtualize`]), excludes this element and its subtree from
+    ///   anchor selection (for example, a top loading placeholder so prepending older rows
+    ///   anchors to the first real row beneath it).
+    /// - On a [`El::virtual_rows`] / [`El::virtualize`] container or its scroll viewport,
+    ///   disables automatic scroll anchoring for that list (for example, a live search list that
+    ///   streams new hits in at the top at offset 0).
+    ///
+    /// ```
+    /// # use rune::{GrowthSpec, ScrollSpec, col, el};
+    /// let loading = el().key("loading").h(32.0).no_scroll_anchor();
+    /// let list = col().scroll(ScrollSpec::default()).child(
+    ///     col().growth(GrowthSpec::default()).no_scroll_anchor().virtualize(32.0).child(loading),
+    /// );
+    /// # let _ = list;
+    /// ```
+    pub fn no_scroll_anchor(mut self) -> Self {
+        let edges = &mut self.cold_mut().scroll_edges;
+        edges.anchor = false;
+        edges.no_anchor = true;
         self
     }
     /// A wheel over this element turns the scroll viewport keyed `key` (or the nearest one
@@ -332,7 +361,17 @@ impl ScrollFade {
 }
 
 /// A vertical scroll viewport.
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// Use [`ScrollSpec::default`] for a plain vertical scroll view and [`ScrollSpec::stick_bottom`]
+/// for a chat or log transcript that follows its bottom:
+///
+/// ```
+/// # use rune::{ScrollSpec, col};
+/// let list = col().scroll(ScrollSpec::default());
+/// let log = col().scroll(ScrollSpec::stick_bottom());
+/// # let _ = (list, log);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ScrollSpec {
     /// Follow the end: while scrolled to the bottom, growth keeps the bottom in view, and a new
     /// viewport opens at the bottom on its first frame. When the content is a growth stack, room
@@ -342,8 +381,22 @@ pub struct ScrollSpec {
     pub stick_bottom: bool,
 }
 
-/// A scroll viewport's content-aware edges: `El::scroll_edge_fade`, `El::scroll_margin` and
-/// `El::scroll_anchor`.
+impl ScrollSpec {
+    /// A vertical scroll viewport that follows its content's bottom, for chat and log
+    /// transcripts (`ScrollSpec { stick_bottom: true }`).
+    ///
+    /// ```
+    /// # use rune::{ScrollSpec, col};
+    /// let transcript = col().scroll(ScrollSpec::stick_bottom());
+    /// # let _ = transcript;
+    /// ```
+    pub const fn stick_bottom() -> Self {
+        Self { stick_bottom: true }
+    }
+}
+
+/// A scroll viewport's content-aware edges: `El::scroll_edge_fade`, `El::scroll_margin`,
+/// `El::scroll_anchor` and `El::no_scroll_anchor`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct ScrollEdges {
     /// Fade width (points) for the top and bottom edges; 0 for none.
@@ -354,6 +407,9 @@ pub(crate) struct ScrollEdges {
     pub(crate) margin: f32,
     /// The viewport keeps its top row where it is when content above it changes.
     pub(crate) anchor: bool,
+    /// Excludes this element and its subtree from anchor selection, or disables automatic scroll
+    /// anchoring on a scroll viewport or virtual list (`El::no_scroll_anchor`).
+    pub(crate) no_anchor: bool,
 }
 
 /// The axes a scroll viewport moves on: `El::scroll` (vertical), `El::scroll_x`, `El::scroll_xy`.
@@ -374,3 +430,7 @@ impl ScrollAxes {
 
 pub(crate) type AtBottomFn = Rc<dyn Fn(crate::states::States<'_>, bool) -> bool>;
 pub(crate) type VisibleRowsFn = Rc<dyn Fn(crate::states::States<'_>, std::ops::Range<usize>) -> bool>;
+
+#[cfg(test)]
+#[path = "scroll_tests.rs"]
+mod tests;

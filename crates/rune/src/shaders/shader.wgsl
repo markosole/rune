@@ -121,10 +121,11 @@ fn erf2(x: vec2<f32>) -> vec2<f32> {
     return s - s / (r * r);
 }
 
-fn shadow_x(x: f32, y: f32, sigma: f32, corner: f32, half: vec2<f32>) -> f32 {
-    let delta = min(half.y - corner - abs(y), 0.0);
-    let curved = half.x - corner + sqrt(max(0.0, corner * corner - delta * delta));
-    let integral = 0.5 + 0.5 * erf2((x + vec2<f32>(-curved, curved)) * (sqrt(0.5) / sigma));
+fn shadow_x(x: f32, y: f32, sigma: f32, radii: vec4<f32>, half: vec2<f32>) -> f32 {
+    let corner = select(radii.xy, radii.wz, y > 0.0);
+    let delta = min(vec2<f32>(half.y) - corner - vec2<f32>(abs(y)), vec2<f32>(0.0));
+    let curved = vec2<f32>(half.x) - corner + sqrt(max(vec2<f32>(0.0), corner * corner - delta * delta));
+    let integral = 0.5 + 0.5 * erf2((x + vec2<f32>(-curved.y, curved.x)) * (sqrt(0.5) / sigma));
     return integral.y - integral.x;
 }
 
@@ -132,9 +133,10 @@ fn shadow_x(x: f32, y: f32, sigma: f32, corner: f32, half: vec2<f32>) -> f32 {
 // four midpoint weights of the ±3σ window, 3·(g(0.75) + g(2.25)) for a unit Gaussian g.
 const SHADOW_INSIDE: f32 = 0.99863125;
 
-fn shadow(p: vec2<f32>, half: vec2<f32>, sigma: f32, corner: f32) -> f32 {
+fn shadow(p: vec2<f32>, half: vec2<f32>, sigma: f32, radii: vec4<f32>) -> f32 {
     // A big panel's shadow is mostly interior, and its erf rows there cost a 5K frame
     // milliseconds. 6σ in, each row is within 1e-6 of fully covered.
+    let corner = max(max(radii.x, radii.y), max(radii.z, radii.w));
     if (abs(p.x) <= half.x - 6.0 * sigma && abs(p.y) <= half.y - corner - 6.0 * sigma) {
         return SHADOW_INSIDE;
     }
@@ -146,7 +148,7 @@ fn shadow(p: vec2<f32>, half: vec2<f32>, sigma: f32, corner: f32) -> f32 {
     var y = start + step * 0.5;
     var v = 0.0;
     for (var i = 0; i < 4; i = i + 1) {
-        v = v + shadow_x(p.x, p.y - y, sigma, corner, half) * gaussian(y, sigma) * step;
+        v = v + shadow_x(p.x, p.y - y, sigma, radii, half) * gaussian(y, sigma) * step;
         y = y + step;
     }
     return v;
@@ -256,6 +258,30 @@ fn image_texel(t: vec2<i32>, premultiplied: bool) -> vec4<f32> {
     }
     if premultiplied { return c; }
     return vec4<f32>(c.rgb * c.a, c.a);
+}
+
+// Wraps integer texel index `k` into `[0, n)` (`n >= 1`) so wrapped images never bleed into
+// neighbouring atlas slots: 3 = Repeat, 4 = Mirror (period 2n), otherwise Extend (2, clamp).
+fn wrap_texel(k: i32, n: i32, mode: u32) -> i32 {
+    if (mode == 3u) {
+        var m = k % n;
+        if (m < 0) {
+            m = m + n;
+        }
+        return m;
+    }
+    if (mode == 4u) {
+        let p = 2 * n;
+        var m = k % p;
+        if (m < 0) {
+            m = m + p;
+        }
+        if (m >= n) {
+            return p - 1 - m;
+        }
+        return m;
+    }
+    return clamp(k, 0, n - 1);
 }
 
 // Arc length to the point nearest `p` (rect-local) on the centre line of a `bw`-wide ring inside
@@ -403,7 +429,7 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
             discard;
         } else if (i.uv.z > 0.0) {
             let local = p * i.uv.zw / i.rect.zw - vec2<f32>(0.5);
-            let hi = vec2<i32>(i.uv.zw) - vec2<i32>(1);
+            let hi = max(vec2<i32>(i.uv.zw) - vec2<i32>(1), vec2<i32>(0));
             let base = floor(local);
             let f = local - base;
             let t0 = clamp(vec2<i32>(base), vec2<i32>(0), hi);
@@ -447,8 +473,8 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
         }
     } else if (kind < 1.5) {
         let sigma = max(i.params.z, 0.01);
-        let corner = min(abs(i.radii.x), min(half.x, half.y));
-        col = i.fill * shadow(screen - center, half, sigma, corner);
+        let radii = min(abs(select(i.radii, i.radii.xxxx, i.uv.z > 0.0)), vec4<f32>(min(half.x, half.y)));
+        col = i.fill * shadow(screen - center, half, sigma, radii);
         // A shadow under a native system material leaves its interior clear: `uv` holds the
         // hole relative to this rect and `radii.w` its corner radius.
         if (i.uv.z > 0.0) {
@@ -491,18 +517,72 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
             let arc = ring_arc(screen - i.rect.xy, i.rect.zw, i.radii, bw);
             col = mix(i.fill, i.border, t) * (ring * dash_cov(arc.x, arc.y, i.uv.xyz));
         } else {
-            // Bilinear, clamped to the image's own texels so neighbours in the atlas never bleed.
-            let local = (screen - i.rect.xy) * i.uv.zw / i.rect.zw - vec2<f32>(0.5);
+            // Image (kind 7): params.z is a bitmask: bit 0 = premultiplied, bit 1 = alpha tint in
+            // fill, bit 2 = nearest-neighbour sampling. params.w selects wrap mode: <= 1.5 uses
+            // i.rect clamped to [lo, hi] (border unused); 2 = Extend, 3 = Repeat, 4 = Mirror
+            // against the placed rect in i.border.
+            let flags = u32(max(i.params.z, 0.0) + 0.5);
+            let premultiplied = (flags & 1u) != 0u;
+            let tinted = (flags & 2u) != 0u;
+            let nearest = (flags & 4u) != 0u;
+            let wrap = u32(max(i.params.w, 0.0) + 0.5);
             let lo = vec2<i32>(i.uv.xy);
-            let hi = lo + vec2<i32>(i.uv.zw) - vec2<i32>(1);
-            let base = floor(local);
-            let f = local - base;
-            let t0 = clamp(lo + vec2<i32>(base), lo, hi);
-            let t1 = clamp(lo + vec2<i32>(base) + vec2<i32>(1, 1), lo, hi);
-            let premultiplied = i.params.z > 0.5;
-            let c = mix(mix(image_texel(t0, premultiplied), image_texel(vec2<i32>(t1.x, t0.y), premultiplied), f.x),
-                        mix(image_texel(vec2<i32>(t0.x, t1.y), premultiplied), image_texel(t1, premultiplied), f.x), f.y);
-            col = c * (i.fill.a * clamp(0.5 - d, 0.0, 1.0));
+            let hi = max(lo + vec2<i32>(i.uv.zw) - vec2<i32>(1), lo);
+            var c: vec4<f32>;
+            if (wrap <= 1u) {
+                let uv_pos = (screen - i.rect.xy) * i.uv.zw / i.rect.zw;
+                if (nearest) {
+                    let t = clamp(lo + vec2<i32>(floor(uv_pos)), lo, hi);
+                    c = image_texel(t, premultiplied);
+                } else {
+                    // Bilinear, clamped to the image's own texels so neighbours in the atlas never bleed.
+                    let local = uv_pos - vec2<f32>(0.5);
+                    let base = floor(local);
+                    let f = local - base;
+                    let t0 = clamp(lo + vec2<i32>(base), lo, hi);
+                    let t1 = clamp(lo + vec2<i32>(base) + vec2<i32>(1, 1), lo, hi);
+                    c = mix(mix(image_texel(t0, premultiplied), image_texel(vec2<i32>(t1.x, t0.y), premultiplied), f.x),
+                            mix(image_texel(vec2<i32>(t0.x, t1.y), premultiplied), image_texel(t1, premultiplied), f.x), f.y);
+                }
+            } else if (i.border.z > 0.0 && i.border.w > 0.0) {
+                let dim = hi - lo + vec2<i32>(1);
+                var uv_pos = (screen - i.border.xy) * i.uv.zw / i.border.zw;
+                if (wrap == 2u) {
+                    uv_pos = clamp(uv_pos, vec2<f32>(-1.0), vec2<f32>(dim) + vec2<f32>(1.0));
+                } else {
+                    let period = vec2<f32>(dim) * select(1.0, 2.0, wrap == 4u);
+                    if (abs(uv_pos.x) > 1048576.0) {
+                        uv_pos.x = uv_pos.x - period.x * floor(uv_pos.x / period.x);
+                    }
+                    if (abs(uv_pos.y) > 1048576.0) {
+                        uv_pos.y = uv_pos.y - period.y * floor(uv_pos.y / period.y);
+                    }
+                }
+                if (nearest) {
+                    let b = vec2<i32>(floor(uv_pos));
+                    let t = lo + vec2<i32>(wrap_texel(b.x, dim.x, wrap), wrap_texel(b.y, dim.y, wrap));
+                    c = image_texel(t, premultiplied);
+                } else {
+                    let local = uv_pos - vec2<f32>(0.5);
+                    let base = floor(local);
+                    let f = local - base;
+                    let b = vec2<i32>(base);
+                    let tx0 = lo.x + wrap_texel(b.x, dim.x, wrap);
+                    let ty0 = lo.y + wrap_texel(b.y, dim.y, wrap);
+                    let tx1 = lo.x + wrap_texel(b.x + 1, dim.x, wrap);
+                    let ty1 = lo.y + wrap_texel(b.y + 1, dim.y, wrap);
+                    c = mix(mix(image_texel(vec2<i32>(tx0, ty0), premultiplied), image_texel(vec2<i32>(tx1, ty0), premultiplied), f.x),
+                            mix(image_texel(vec2<i32>(tx0, ty1), premultiplied), image_texel(vec2<i32>(tx1, ty1), premultiplied), f.x), f.y);
+                }
+            } else {
+                c = vec4<f32>(0.0);
+            }
+            let cov = clamp(0.5 - d, 0.0, 1.0);
+            if (tinted) {
+                col = i.fill * (c.a * cov);
+            } else {
+                col = c * (i.fill.a * cov);
+            }
         }
     } else if (kind > 4.5 && kind < 5.5) {
         col = i.fill * segment(screen, i.radii.xy, i.radii.zw, i.params.x, i.params.z > 0.5);
@@ -520,7 +600,8 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
             if (i.params.z < 0.3) {
                 lit = box_cov(q, ih, sign(i.radii) * max(abs(i.radii) - vec4<f32>(spread), vec4<f32>(0.0)));
             } else {
-                lit = shadow(q, ih, i.params.z, max(min(abs(i.radii.x) - spread, min(ih.x, ih.y)), 0.0));
+                let radii = max(min(abs(i.radii) - vec4<f32>(spread), vec4<f32>(min(ih.x, ih.y))), vec4<f32>(0.0));
+                lit = shadow(q, ih, i.params.z, radii);
             }
             col = i.fill * box_cov(screen - center, half, i.radii) * (1.0 - clamp(lit, 0.0, 1.0));
         } else {

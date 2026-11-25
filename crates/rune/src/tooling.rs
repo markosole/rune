@@ -24,8 +24,9 @@ pub struct AppSpec<S: 'static> {
     /// Named states for snapshots: each modifies the initial state.
     pub scenes: &'static [(&'static str, fn(&mut S))],
     /// Font files replacing the built-in Inter (empty keeps it), and the sans/mono family names
-    /// (CSS lists; `ui-monospace` stands for [`Family::SystemMono`](crate::Family::SystemMono)'s
-    /// families, so mono spans can be SF Mono).
+    /// (CSS lists; defaults to `("Inter", "ui-monospace")` on native, where `ui-monospace` stands
+    /// for [`Family::SystemMono`](crate::Family::SystemMono)'s families loaded lazily on first
+    /// mono use, and `("Inter", "IBM Plex Mono")` on web when `fonts` is empty).
     pub fonts: &'static [&'static [u8]],
     pub families: (&'static str, &'static str),
     /// Called once with a waker other threads use when new data arrives.
@@ -51,7 +52,7 @@ impl<S: 'static> AppSpec<S> {
             view,
             scenes: &[],
             fonts: &[],
-            families: ("Inter", "Inter"),
+            families: ("Inter", "ui-monospace"),
             setup: None,
             poll: None,
             on_key: None,
@@ -88,11 +89,22 @@ impl Chrome {
     /// Where macOS will draw the three buttons (x, y, w, h in points), assuming macOS 26 metrics
     /// and AppKit's default origin (7, 6) when unpositioned.
     pub fn traffic_light_rects(&self) -> Option<[[f32; 4]; 3]> {
+        self.traffic_light_rects_in(0.0, false)
+    }
+
+    /// Where macOS will draw the three buttons (x, y, w, h in points) inside a window `width`
+    /// points wide; right to left mirrors them to the right edge with Close outermost, matching
+    /// native macOS placement and [`Chrome::titlebar_inset`].
+    pub(crate) fn traffic_light_rects_in(&self, width: f32, rtl: bool) -> Option<[[f32; 4]; 3]> {
         if !self.full_size_content && self.traffic_lights.is_none() {
             return None;
         }
         let (x, y) = self.traffic_lights.unwrap_or((7.0, 6.0));
-        Some(std::array::from_fn(|i| [x + i as f32 * Self::TRAFFIC_PITCH, y, Self::TRAFFIC_LIGHT, Self::TRAFFIC_LIGHT]))
+        Some(std::array::from_fn(|i| {
+            let at = x + i as f32 * Self::TRAFFIC_PITCH;
+            let left = if rtl { width - at - Self::TRAFFIC_LIGHT } else { at };
+            [left, y, Self::TRAFFIC_LIGHT, Self::TRAFFIC_LIGHT]
+        }))
     }
 
     /// The trailing edge of [`Chrome::traffic_light_rects`]' zoom button, or 0 without them:
@@ -125,8 +137,9 @@ pub(crate) fn app_id() -> Option<&'static str> {
 /// Command-line arguments Rune didn't recognise, in order, for the app to interpret. Ready
 /// before any window: called before `run` (to pick the file a window opens, say), it reads
 /// Rune's flags from the process's arguments as `run` will, `--help` and a malformed flag
-/// included. The first read wins, so an app that passes `App::args` reads this after `run`
-/// starts.
+/// included. In a release build without Rune's `tooling` feature, Rune parses no process flags
+/// and returns every argument untouched. The first read wins, so an app that passes `App::args`
+/// reads this after `run` starts.
 pub fn extra_args() -> &'static [String] {
     if EXTRA.get().is_none() { Args::parse(); }
     EXTRA.get().map_or(&[], |v| v.as_slice())
@@ -181,8 +194,11 @@ mod strip;
 mod trace;
 
 pub use args::{Args, is_headless};
+pub use args::{RELAUNCH_DROPS, without_relaunch_drops};
 pub(crate) use args::*;
 pub use headless::headless;
+#[cfg(not(target_arch = "wasm32"))]
+pub use perf_warn::launch::process_age;
 pub(crate) use headless::*;
 pub(crate) use key_names::{key_named, script_key_base, script_mods};
 use script::parse_script;
@@ -195,9 +211,6 @@ use trace::r2;
 /// Opens the app's window and quits when it closes (`App` for other lifetimes), or renders
 /// headless for the tooling arguments.
 pub fn run<S: 'static>(spec: AppSpec<S>) {
-    #[cfg(feature = "hot")]
-    crate::hot::run(spec, Args::parse());
-    #[cfg(not(feature = "hot"))]
     crate::app::App::new(spec).run();
 }
 
@@ -210,31 +223,49 @@ pub fn run_windows<I: IntoIterator<Item: Into<crate::AnyWindowSpec>>>(factory: i
 
 /// Run a window factory with process-level options, such as macOS accessory activation.
 pub fn run_windows_with<I: IntoIterator<Item: Into<crate::AnyWindowSpec>>>(options: crate::RunOptions, factory: impl FnOnce(&[crate::Display]) -> I + 'static) {
-    started(try_run_windows_with(options, factory));
+    finish_start(run_window_factory(options, window_args(None, Args::parse), erase(factory)));
 }
 
 /// `run_windows_with`, returning an error instead of exiting when the event loop can't start
-/// (no display over ssh or in CI, no Wayland or X11 server) or fails.
+/// (no display over ssh or in CI, no Wayland or X11 server), fails, or no initial window can
+/// be created.
 pub fn try_run_windows_with<I: IntoIterator<Item: Into<crate::AnyWindowSpec>>>(options: crate::RunOptions, factory: impl FnOnce(&[crate::Display]) -> I + 'static) -> Result<(), String> {
-    run_window_factory(options, window_args(None, Args::parse), erase(factory))
+    run_window_factory(options, window_args(None, Args::parse), erase(factory)).map_err(StartError::message)
 }
 
 /// Run a window factory with explicit Rune arguments, without reading the host CLI.
 /// Pass `[]` to isolate an embedding application's flags before display discovery.
 pub fn run_windows_with_args<I: IntoIterator<Item: Into<crate::AnyWindowSpec>>>(options: crate::RunOptions, args: impl IntoIterator<Item = String>, factory: impl FnOnce(&[crate::Display]) -> I + 'static) {
-    started(try_run_windows_with_args(options, args, factory));
+    finish_start(run_window_factory(options, window_args(Some(args.into_iter().collect()), Args::parse), erase(factory)));
 }
 
 /// `run_windows_with_args`, returning an error instead of exiting when the event loop can't
-/// start or fails.
+/// start, fails, or no initial window can be created.
 pub fn try_run_windows_with_args<I: IntoIterator<Item: Into<crate::AnyWindowSpec>>>(options: crate::RunOptions, args: impl IntoIterator<Item = String>, factory: impl FnOnce(&[crate::Display]) -> I + 'static) -> Result<(), String> {
-    run_window_factory(options, window_args(Some(args.into_iter().collect()), Args::parse), erase(factory))
+    run_window_factory(options, window_args(Some(args.into_iter().collect()), Args::parse), erase(factory)).map_err(StartError::message)
 }
 
 /// What `run` says to a release build without the `tooling` feature asked for a headless run.
 #[cfg(not(any(feature = "tooling", debug_assertions)))]
 pub(crate) const WITHOUT_TOOLING: &str = "this build has no agent tooling (--snap, --tree, --script, --trace, --strip, --video, ...): \
     a release build has it with Rune's `tooling` feature (rune = { ..., features = [\"tooling\"] }); debug builds always do";
+
+/// Distinguishes window startup errors (CLI exit 1) from headless tooling errors (CLI exit 2)
+/// so fallible `try_run*` paths return `Err(String)` without terminating a test process while
+/// CLI `run*` entry points keep their exit codes.
+pub(crate) enum StartError {
+    Window(String),
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    Headless(String),
+}
+
+impl StartError {
+    pub(crate) fn message(self) -> String {
+        match self {
+            Self::Window(error) | Self::Headless(error) => error,
+        }
+    }
+}
 
 /// Reports a failed startup and exits the process on native targets. wasm32 has no process
 /// exit, so there it panics.
@@ -251,6 +282,21 @@ pub(crate) fn started(result: Result<(), String>) {
     if let Err(error) = result { panic!("{error}"); }
 }
 
+/// Like `started`, preserving exit code 2 for headless tooling failures.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn finish_start(result: Result<(), StartError>) {
+    match result {
+        Ok(()) => {}
+        Err(StartError::Window(error)) => started(Err(error)),
+        Err(StartError::Headless(error)) => die(&error),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn finish_start(result: Result<(), StartError>) {
+    started(result.map_err(StartError::message));
+}
+
 type Factory = Box<dyn FnOnce(&[crate::Display]) -> Vec<crate::AnyWindowSpec>>;
 
 fn erase<I: IntoIterator<Item: Into<crate::AnyWindowSpec>>>(factory: impl FnOnce(&[crate::Display]) -> I + 'static) -> Factory {
@@ -261,7 +307,7 @@ pub(crate) fn window_args(args: Option<Vec<String>>, process: impl FnOnce() -> A
     args.map_or_else(process, Args::parse_from)
 }
 
-fn run_window_factory(options: crate::RunOptions, args: Args, factory: Factory) -> Result<(), String> {
+fn run_window_factory(options: crate::RunOptions, args: Args, factory: Factory) -> Result<(), StartError> {
     if args.headless() {
         #[cfg(any(feature = "tooling", debug_assertions))]
         {
@@ -270,15 +316,15 @@ fn run_window_factory(options: crate::RunOptions, args: Args, factory: Factory) 
             headless_window(factory(&displays), &displays, args, options)
         }
         #[cfg(not(any(feature = "tooling", debug_assertions)))]
-        Err(WITHOUT_TOOLING.into())
+        Err(StartError::Window(WITHOUT_TOOLING.into()))
     } else {
-        crate::window::run_windows(factory, args, options)
+        crate::window::run_windows(factory, args, options).map_err(StartError::Window)
     }
 }
 
 /// Lists the windows, or renders the one `--window KEY` selects (the first by default) with its
 /// own state. Windows that apps added with `App::window` are selectable too.
-fn headless_window(windows: Vec<crate::AnyWindowSpec>, displays: &[crate::Display], args: Args, options: crate::RunOptions) -> Result<(), String> {
+fn headless_window(windows: Vec<crate::AnyWindowSpec>, displays: &[crate::Display], args: Args, options: crate::RunOptions) -> Result<(), StartError> {
     let mut windows = crate::windows::flatten(windows);
     crate::windows::validate(&windows).unwrap_or_else(|e| die(&e));
     if args.list_windows {
@@ -292,17 +338,15 @@ fn headless_window(windows: Vec<crate::AnyWindowSpec>, displays: &[crate::Displa
     };
     if args.desktop.is_some() {
         crate::tooling::interaction::gate::headless();
-        crate::desktop::run(windows, index, args, options.accessory);
-        return Ok(());
+        return crate::desktop::run(windows, index, args, options.accessory).map_err(StartError::Headless);
     }
     let mut window = windows.remove(index);
     let args = window.resolve_args(args);
     if !args.headless() {
-        return crate::window::run_windows(Box::new(move |_| vec![window]), args, options);
+        return crate::window::run_windows(Box::new(move |_| vec![window]), args, options).map_err(StartError::Window);
     }
     let scale = displays.iter().find(|d| d.primary).unwrap_or(&displays[0]).scale;
-    window.headless(args, scale as f32);
-    Ok(())
+    window.headless(args, scale as f32)
 }
 
 /// `run` with a compositor drawing every frame (see `compose`); `App::compositor` for other lifetimes.
@@ -344,13 +388,19 @@ pub(crate) enum Kind {
     Focus(bool),
     /// The app reopened (macOS: its Dock icon clicked).
     Reopen,
+    /// A user-initiated close request (`App::on_close_request`).
+    CloseRequest,
     /// A link the system opened with the app (`App::on_open_url`).
     OpenUrl(String),
+    /// Files the system opened with the app (`App::on_open_files`).
+    OpenFiles(Vec<PathBuf>),
     Menu(String),
     /// Answers the open pop-up menu: an item's id, or `None` to dismiss it.
     PopupMenu(Option<String>),
     /// Answers the open file dialog: the chosen path, or `None` to cancel it.
     FileDialog(Option<PathBuf>),
+    /// Answers the open file dialog with multiple chosen paths (`{"type": "file-dialog", "paths": [...]}`).
+    FileDialogFiles(Vec<PathBuf>),
     Physical(crate::PhysicalInput),
     /// A registered global shortcut, delivered only to its handler.
     Shortcut(crate::Shortcut),
@@ -435,10 +485,35 @@ pub(crate) fn script_input(
         Kind::ButtonUp(b) => core.button_up(app, x, y, *b),
         Kind::KeyUp(k) => { core.key_up(app, k.clone()); }
         Kind::PhysicalKey(event, k, base) => core.physical_key_input(app, *event, k.clone(), *base),
-        Kind::Mark(_) | Kind::Reopen | Kind::OpenUrl(_) | Kind::Menu(_) | Kind::PopupMenu(_)
-        | Kind::FileDialog(_) | Kind::Shortcut(_) | Kind::Resize(..) => return false,
+        Kind::Mark(_) | Kind::Reopen | Kind::CloseRequest | Kind::OpenUrl(_) | Kind::OpenFiles(_) | Kind::Menu(_) | Kind::PopupMenu(_)
+        | Kind::FileDialog(_) | Kind::FileDialogFiles(_) | Kind::Shortcut(_) | Kind::Resize(..) => return false,
     }
     true
+}
+
+/// Where a script event lands, in view points: a point over the view's zoom, the centre of the
+/// shown part of an element found when the event runs (`RuntimeCore::find_shown`: an element no
+/// part of which is shown is an error, not an event sent to a point nothing is drawn at), the
+/// pointer for a wheel-like event without a point of its own, or an offset from the last press.
+/// The headless host and `--window-script` both land events here.
+pub(crate) fn script_point(rt: &RuntimeCore, e: &Ev, last_down: (f32, f32)) -> Result<(f32, f32), String> {
+    Ok(match &e.pos {
+        // A script's points are the window's; the view's are over its zoom.
+        Pos::Xy(x, y) => (*x / rt.zoom(), *y / rt.zoom()),
+        Pos::Key(key) => rt.find_shown(key)?,
+        Pos::Rel(_, _) if e.kind.at_pointer() => rt.pointer().unwrap_or((0.0, 0.0)),
+        Pos::Rel(dx, dy) => (last_down.0 + dx, last_down.1 + dy),
+    })
+}
+
+/// The `--window-script` file's events, parsed as `--script` parses its own. An unreadable or
+/// unparsable file ends the process before any window opens.
+pub(crate) fn read_window_script(args: &Args) -> Option<Vec<Ev>> {
+    args.window_script.as_ref().map(|path| {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
+        let value: Value = serde_json::from_str(&text).unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
+        load_script(&value)
+    })
 }
 
 /// The canvas input of a script (`canvas_input.rs`) at window point (x, y); false for any
@@ -506,10 +581,13 @@ impl Ev {
             Kind::Mark(name) => ScriptEvent::Mark(name.clone()),
             Kind::Focus(focused) => ScriptEvent::Focus(*focused),
             Kind::Reopen => ScriptEvent::Reopen,
+            Kind::CloseRequest => ScriptEvent::CloseRequest,
             Kind::OpenUrl(url) => ScriptEvent::OpenUrl(url.clone()),
+            Kind::OpenFiles(paths) => ScriptEvent::OpenFiles(paths.clone()),
             Kind::Menu(item) => ScriptEvent::Menu(item.clone()),
             Kind::PopupMenu(picked) => ScriptEvent::PopupMenu(picked.clone()),
             Kind::FileDialog(path) => ScriptEvent::FileDialog(path.clone()),
+            Kind::FileDialogFiles(paths) => ScriptEvent::FileDialogFiles(paths.clone()),
             Kind::Physical(input) => ScriptEvent::Physical(*input),
             Kind::Shortcut(chord) => ScriptEvent::Shortcut(chord.clone()),
             Kind::Move => pointer(PointerAction::Move),
@@ -592,6 +670,9 @@ pub(crate) mod record;
 pub(crate) mod virtual_desktop;
 #[cfg(test)]
 pub(crate) mod test_alloc;
+#[cfg(test)]
+#[path = "tooling/args_tests.rs"]
+mod args_tests;
 #[cfg(test)]
 #[path = "tooling/window_tests.rs"]
 mod window_tests;

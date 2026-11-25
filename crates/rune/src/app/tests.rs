@@ -248,12 +248,13 @@ fn a_standard_close_or_minimize_key_acts_only_when_no_handler_takes_it() {
     };
     let mut rt = Runtime::new(0u32, |_: &u32, _: &mut Cx<u32>| el(), (100.0, 100.0), Env::default());
     press(&mut rt, Code::KeyW, 'w', Unhandled::Close);
-    assert_eq!(rt.shell_request.take(), Some(Shell::Close), "an unhandled ⌘W closes as the button would");
+    assert!(rt.take_user_close_request(), "an unhandled ⌘W requests a user close like the close button");
+    assert_eq!(rt.shell_request, None, "an unhandled ⌘W must not bypass on_close_request via Shell::Close");
     press(&mut rt, Code::KeyM, 'm', Unhandled::Minimize);
     assert!(rt.minimize_step(crate::window::MinimizeEvent::Taken) && rt.shell_request.is_none());
     rt.on_key = Some(|n, ev, _| { *n += 1; ev.is_command('w') });
     press(&mut rt, Code::KeyW, 'w', Unhandled::Close);
-    assert_eq!((rt.state, rt.shell_request), (1, None), "the app's own ⌘W wins, once");
+    assert_eq!((rt.state, rt.shell_request, rt.take_user_close_request()), (1, None, false), "the app's own ⌘W wins, once");
     press(&mut rt, Code::KeyM, 'm', Unhandled::Minimize);
     assert_eq!(rt.state, 2, "the app saw ⌘M first");
     assert!(rt.host.minimize.latched(), "and didn't take it");
@@ -407,4 +408,70 @@ fn a_hidden_timer_polls_without_building_the_view() {
         rt.frame(0.0);
         assert_eq!(rt.stats.commits, commits + 1, "the frame that shows it builds once");
     }
+}
+
+#[test]
+fn app_handle_set_color_scheme_coalesces_wakes_and_takes_independently() {
+    let app = App::new(spec());
+    let handle = app.handle();
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let w = wakes.clone();
+    app.shared.connect(Arc::new(move || { w.fetch_add(1, Ordering::Relaxed); }));
+    let before = wakes.load(Ordering::Relaxed);
+
+    handle.set_color_scheme(crate::ColorScheme::Light);
+    handle.set_color_scheme(crate::ColorScheme::Dark);
+    assert_eq!(wakes.load(Ordering::Relaxed), before + 2);
+    assert_eq!(app.shared.take().color_scheme, Some(crate::ColorScheme::Dark));
+    assert_eq!(app.shared.take().color_scheme, None);
+
+    // Startup take_color_scheme consumes only color_scheme and keeps other queued requests.
+    handle.set_color_scheme(crate::ColorScheme::System);
+    handle.set_position((12, 34));
+    assert_eq!(app.shared.core.take_color_scheme(), Some(crate::ColorScheme::System));
+    assert_eq!(app.shared.core.take_color_scheme(), None);
+    let rest = app.shared.take();
+    assert_eq!(rest.color_scheme, None);
+    assert_eq!(rest.position, Some((12, 34)));
+}
+
+#[test]
+fn on_display_close_stores_once_hook_and_replaces_previous() {
+    let ran = Arc::new(AtomicUsize::new(0));
+    let first_ran = ran.clone();
+    let second_ran = ran.clone();
+    let owned = String::from("foreign-proxy");
+    let mut app = App::new(spec())
+        .on_display_close(move || { first_ran.fetch_add(1, Ordering::Relaxed); })
+        .on_display_close(move || {
+            drop(owned);
+            second_ran.fetch_add(10, Ordering::Relaxed);
+        });
+    let hook = app.on_display_close.take().expect("hook registered");
+    assert!(app.on_display_close.is_none());
+    hook();
+    assert_eq!(ran.load(Ordering::Relaxed), 10);
+}
+
+#[test]
+fn on_close_request_defaults_to_none_and_keeps_on_close_independent() {
+    let default_app = App::new(spec());
+    assert!(default_app.on_close_request.is_none());
+    assert!(default_app.on_close.is_none());
+
+    let app = App::new(spec())
+        .on_close_request(|_, _| crate::CloseResponse::Defer)
+        .on_close_request(|n, _| {
+            *n += 1;
+            crate::CloseResponse::Close
+        })
+        .on_close(|n, _| { *n += 10; });
+    assert!(app.on_close_request.is_some());
+    assert!(app.on_close.is_some());
+    let mut rt = Runtime::new(0u32, |_: &u32, _: &mut Cx<u32>| el(), (100.0, 100.0), Env::default());
+    let mut resp = crate::CloseResponse::Defer;
+    let f = app.on_close_request.unwrap();
+    rt.update(|s, tx| resp = f(s, tx));
+    assert_eq!(resp, crate::CloseResponse::Close);
+    assert_eq!(rt.state, 1);
 }

@@ -35,7 +35,7 @@ pub struct TextSpec {
     pub wrap: bool,
     /// One line, cut with an ellipsis when wider than the element.
     pub truncate: bool,
-    /// Which part `truncate` cuts (see [`El::truncate_middle`](crate::El::truncate_middle)).
+    /// Which part `truncate` or `max_lines` cuts (see [`El::elide_middle`](crate::El::elide_middle)).
     pub(crate) elide: Elide,
     /// Fade the overflowing trailing edge rather than replacing text with an ellipsis.
     pub truncate_fade: bool,
@@ -105,10 +105,20 @@ pub(crate) struct TextCold {
     pub(crate) rings: Vec<(u32, u32, Color, f32)>,
     /// See [`El::span_radius`](crate::El::span_radius), in points.
     pub(crate) span_radius: f32,
+    /// First-line indentation in points (negative for hanging indent); see [`El::text_indent`](crate::El::text_indent).
+    pub(crate) text_indent: f32,
+    /// Vertical alignment of laid-out text inside a taller content box; see [`El::align_y`](crate::El::align_y).
+    pub(crate) align_y: Align,
     /// Strikethrough byte ranges `(start, end, color)` of `content`.
     pub(crate) strikes: Vec<(u32, u32, Option<Color>)>,
+    /// Overline byte ranges `(start, end, color)` of `content`.
+    pub(crate) overlines: Vec<(u32, u32, Option<Color>)>,
+    /// Padded inline boxes over `content` (`El::span_box`), sorted and non-overlapping.
+    pub(crate) span_boxes: Vec<crate::text::SpanBoxRun>,
     /// Paint-only highlight byte ranges of `content`.
     pub(crate) highlights: Vec<crate::text::TextHighlight>,
+    /// Display-only full-width line fills and left bars over `content` (see [`El::line_fills`](crate::El::line_fills)).
+    pub(crate) line_fills: Vec<LineFill>,
     /// Per-paragraph [`Block`](crate::Block) attributes for `content`.
     pub(crate) blocks: Vec<crate::edit::Block>,
     /// Line indices (`> 0`) created by `Shift+Return` (`<br>`).
@@ -138,8 +148,13 @@ impl Empty for TextCold {
         copy_prefix: None,
         rings: Vec::new(),
         span_radius: crate::text::SPAN_RADIUS,
+        text_indent: 0.0,
+        align_y: Align::Start,
         strikes: Vec::new(),
+        overlines: Vec::new(),
+        span_boxes: Vec::new(),
         highlights: Vec::new(),
+        line_fills: Vec::new(),
         blocks: Vec::new(),
         soft_breaks: Vec::new(),
         pills: Vec::new(),
@@ -192,6 +207,8 @@ impl TextSpec {
             spans: &self.spans,
             blocks: &self.cold.blocks,
             pills: &self.cold.pills,
+            span_boxes: &self.cold.span_boxes,
+            text_indent: self.cold.text_indent,
             style: self.style,
             shape_key: self.shape_key(scale),
             wrap_anywhere: self.wrap_anywhere,
@@ -227,13 +244,31 @@ impl std::fmt::Debug for TextSpec {
     }
 }
 
+/// Wipes `s` (its spare capacity included) and frees its allocation, matching `TextEdit`.
+pub(crate) fn wipe_string(s: &mut String) {
+    drop(crate::edit::Wiped(std::mem::take(s)));
+}
+
+/// Wipes every string owned by `links` and clears the list.
+pub(crate) fn wipe_links(links: &mut Vec<Link>) {
+    for link in links.iter_mut() {
+        wipe_string(&mut link.id);
+        if let Some(label) = &mut link.label {
+            wipe_string(label);
+        }
+        if let Some(help) = &mut link.help {
+            wipe_string(help);
+        }
+    }
+    links.clear();
+}
+
 impl Drop for TextSpec {
     fn drop(&mut self) {
         if self.redacted {
-            use zeroize::Zeroize;
-            self.content.zeroize();
+            wipe_string(&mut self.content);
             if let Some(src) = &mut self.source {
-                src.text.zeroize();
+                wipe_string(&mut src.text);
             }
         }
     }
@@ -261,6 +296,7 @@ impl TextSpec {
     /// [`crate::text::shape_key`] of this text in its direction.
     pub(crate) fn fresh_shape_key(&self, scale: f32) -> u64 {
         let key = crate::text::shape_key(&self.content, &self.spans, self.style, scale, self.wrap_anywhere, &self.cold.pills);
+        let key = crate::text::mix_span_boxes(key, &self.cold.span_boxes);
         crate::text::directed(key, self.base())
     }
 
@@ -288,10 +324,9 @@ impl TextSpec {
             && (self.by_line || matches!(self.dir, TextDir::Plaintext(_)) || self.content.contains('\n'))
     }
 
-    /// Zeroizes the shown string and shows `content` instead.
+    /// Zeroizes the shown string (spare capacity included) and shows `content` instead.
     pub(crate) fn replace_content(&mut self, content: String) {
-        use zeroize::Zeroize;
-        self.content.zeroize();
+        wipe_string(&mut self.content);
         self.content = content;
         self.shape = None;
     }
@@ -338,19 +373,22 @@ impl TextSpec {
         } else {
             crate::edit::MULTILINE_SECURE_MASK.to_owned()
         };
-        use zeroize::Zeroize;
-        self.content.zeroize();
+        wipe_string(&mut self.content);
         self.content = mask;
         if let Some(mut src) = self.source.take() {
-            src.text.zeroize();
+            wipe_string(&mut src.text);
         }
         self.case = None;
         self.spans.clear();
         if let Some(cold) = self.cold.get_mut_if_some() {
             cold.secure_revealed = false;
-            cold.links.clear();
+            wipe_links(&mut cold.links);
             cold.rings.clear();
             cold.strikes.clear();
+            cold.overlines.clear();
+            cold.span_boxes.clear();
+            cold.line_fills.clear();
+            cold.text_indent = 0.0;
             cold.blocks.clear();
             cold.soft_breaks.clear();
             cold.pills.clear();
@@ -402,8 +440,17 @@ impl TextSpec {
             for r in &mut cold.strikes {
                 (r.0, r.1) = (source.shown(r.0, false), source.shown(r.1, true));
             }
+            for r in &mut cold.overlines {
+                (r.0, r.1) = (source.shown(r.0, false), source.shown(r.1, true));
+            }
+            for b in &mut cold.span_boxes {
+                (b.start, b.end) = (source.shown(b.start, false), source.shown(b.end, true));
+            }
             for h in &mut cold.highlights {
                 (h.start, h.end) = (source.shown(h.start, false), source.shown(h.end, true));
+            }
+            for f in &mut cold.line_fills {
+                (f.start, f.end) = (source.shown(f.start, false), source.shown(f.end, true));
             }
         }
         self.content = shown;
@@ -411,14 +458,78 @@ impl TextSpec {
     }
 }
 
-/// The part of an overflowing `truncate`d text the ellipsis replaces.
+/// A display-only full-width line background fill and/or left vertical bar over the visual lines
+/// intersecting UTF-8 bytes `start..end` of a [`text_input`](crate::text_input) or
+/// [`text`](crate::text()) element (for fenced code blocks, block quotes, diff hunks, and similar
+/// line-level decorations).
+///
+/// Attach with [`El::line_fill`](crate::El::line_fill) or [`El::line_fills`](crate::El::line_fills).
+/// Drawn under the text across the full field width without altering [`TextEdit`](crate::TextEdit),
+/// undo history, selection, or line wrapping.
+///
+/// ```
+/// use rune::{Color, LineFill};
+///
+/// let code = LineFill::new(0, 24).bg(Color { r: 1.0, g: 1.0, b: 1.0, a: 0.06 });
+/// let quote = LineFill::new(25, 60).left_bar(2.0, Color { r: 0.6, g: 0.6, b: 0.6, a: 0.8 });
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LineFill {
+    pub(crate) start: u32,
+    pub(crate) end: u32,
+    pub(crate) bg: Option<Color>,
+    pub(crate) left_bar: Option<(f32, Color)>,
+    pub(crate) radius: f32,
+}
+
+impl LineFill {
+    /// A line decoration covering every visual line intersected by UTF-8 bytes `start..end`.
+    ///
+    /// The default corner radius for [`Self::bg`] is `6.0` points, matching rich `Block::Code`.
+    pub const fn new(start: usize, end: usize) -> Self {
+        let s = if start > u32::MAX as usize { u32::MAX } else { start as u32 };
+        let e = if end > u32::MAX as usize { u32::MAX } else { end as u32 };
+        Self { start: s, end: e, bg: None, left_bar: None, radius: 6.0 }
+    }
+
+    /// Full-width rounded background fill behind the covered lines.
+    pub const fn bg(mut self, color: Color) -> Self {
+        self.bg = Some(color);
+        self
+    }
+
+    /// Vertical bar `width` points wide along the left edge of the covered lines (ignored when
+    /// `width` is not finite and positive).
+    pub const fn left_bar(mut self, width: f32, color: Color) -> Self {
+        self.left_bar = if width > 0.0 && width.is_finite() { Some((width, color)) } else { None };
+        self
+    }
+
+    /// Corner radius in points for [`Self::bg`] (`6.0` by default). Non-finite or negative
+    /// values become `0.0`.
+    pub const fn radius(mut self, radius: f32) -> Self {
+        self.radius = if radius.is_finite() && radius > 0.0 { radius } else { 0.0 };
+        self
+    }
+
+    /// The UTF-8 byte range this line fill covers.
+    pub const fn range(&self) -> std::ops::Range<usize> {
+        self.start as usize..self.end as usize
+    }
+
+    pub(crate) const fn is_visible(&self) -> bool {
+        self.start < self.end && (self.bg.is_some() || self.left_bar.is_some())
+    }
+}
+
+/// The part of an overflowing `truncate`d or `max_lines`-clamped text the ellipsis replaces.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Elide {
-    /// [`El::truncate`](crate::El::truncate): keeps the start.
+    /// [`El::truncate`](crate::El::truncate) and default [`El::max_lines`](crate::El::max_lines): keeps the start.
     #[default]
     End,
-    /// [`El::truncate_middle`](crate::El::truncate_middle): keeps the start and the end.
+    /// [`El::truncate_middle`](crate::El::truncate_middle) and [`El::elide_middle`](crate::El::elide_middle): keeps the start and the end.
     Middle,
-    /// [`El::truncate_head`](crate::El::truncate_head): keeps the end.
+    /// [`El::truncate_head`](crate::El::truncate_head) and [`El::elide_head`](crate::El::elide_head): keeps the end.
     Head,
 }

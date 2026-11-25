@@ -549,3 +549,151 @@ fn a_node_without_a_presence_track_still_fades_out() {
     }
     assert!(gone);
 }
+
+#[test]
+fn exiting_tracks_nodes_leaving_across_exit_revive_unmount_and_slot_reuse() {
+    let mut s = Scene::new();
+    let (p, c, other, reused) = (NodeId(1), NodeId(2), NodeId(3), NodeId(4));
+    s.insert(p, spec(0.0, 0.0, 100.0, 40.0), Mount::Initial);
+    s.insert(c, spec(0.0, 0.0, 40.0, 20.0).parent(p), Mount::Initial);
+    s.insert(other, spec(0.0, 50.0, 100.0, 40.0), Mount::Animated);
+    s.frame_at(0.0);
+    assert!(s.exiting().is_empty(), "present and entering nodes are not exiting");
+
+    // Removing adds the node once; duplicate remove does not duplicate it.
+    s.remove(c);
+    s.remove(c);
+    assert_eq!(s.exiting(), &[c]);
+
+    // Reviving mid-exit removes it immediately.
+    s.frame_at(0.05);
+    s.insert(c, spec(0.0, 0.0, 40.0, 20.0).parent(p), Mount::Animated);
+    assert!(s.exiting().is_empty(), "revived node leaves exiting");
+
+    // Landing an exiting node via Mount::Initial removes it immediately.
+    s.remove(c);
+    assert_eq!(s.exiting(), &[c]);
+    s.insert(c, spec(0.0, 0.0, 40.0, 20.0).parent(p), Mount::Initial);
+    assert!(s.exiting().is_empty(), "landed node leaves exiting");
+
+    // Unmounting a parent drops both the parent and any exiting child from exiting.
+    s.remove(c);
+    s.remove(p);
+    let mut both = s.exiting().to_vec();
+    both.sort_by_key(|id| id.0);
+    assert_eq!(both, vec![p, c]);
+    s.unmount(p);
+    assert!(s.exiting().is_empty(), "unmount clears parent and subtree from exiting");
+
+    // Reusing a freed slot does not resurrect stale exiting state.
+    s.insert(reused, spec(0.0, 0.0, 60.0, 20.0), Mount::Initial);
+    s.frame_at(0.1);
+    assert!(s.exiting().is_empty(), "node mounted into freed slot is not exiting");
+
+    // An exit that plays out to completion clears itself when retired.
+    s.remove(reused);
+    assert_eq!(s.exiting(), &[reused]);
+    let mut t = 0.1;
+    while t < 3.0 && s.contains(reused) {
+        t += 1.0 / HZ;
+        s.frame_at(t);
+    }
+    assert!(!s.contains(reused));
+    assert!(s.exiting().is_empty(), "retired exit leaves exiting");
+}
+
+#[test]
+fn transition_motion_drives_enter_exit_revive_and_respects_reduced_motion() {
+    let mut s = Scene::new();
+    let id = NodeId(101);
+    let tr = Transition::opacity();
+
+    // Timed linear enter (0.4 s) and exit (0.2 s).
+    s.set_transition_motion(id, Curve::linear(0.4), Curve::linear(0.2));
+    s.insert(id, spec(0.0, 0.0, 80.0, 40.0).transition(tr), Mount::Animated);
+    s.frame_at(0.0);
+    assert!(s.presented(id).unwrap().opacity < 0.01);
+
+    s.frame_at(0.2);
+    let mid_enter = s.presented(id).unwrap().opacity;
+    assert!((mid_enter - 0.5).abs() < 0.05, "expected ~0.5 at 0.2s of 0.4s linear enter, got {mid_enter}");
+
+    s.frame_at(0.41);
+    assert!((s.presented(id).unwrap().opacity - 1.0).abs() < 1e-4, "settled at 1.0");
+    assert_eq!(s.phase(id), Some(Phase::Present));
+
+    // Exit runs on the 0.2 s linear curve.
+    s.remove(id);
+    s.frame_at(0.51);
+    let mid_exit = s.presented(id).unwrap().opacity;
+    assert!((mid_exit - 0.5).abs() < 0.08, "expected ~0.5 at 0.1s of 0.2s linear exit, got {mid_exit}");
+
+    // Reviving mid-exit uses the custom enter curve (0.4 s linear; settles at 0.51 + 0.4 = 0.91).
+    s.insert(id, spec(0.0, 0.0, 80.0, 40.0).transition(tr), Mount::Animated);
+    s.frame_at(0.81);
+    let mid_revive = s.presented(id).unwrap().opacity;
+    assert!((mid_revive - 0.75).abs() < 0.08, "revive interpolates on custom 0.4s enter curve (~0.75 at +0.3s), got {mid_revive}");
+    s.frame_at(0.95);
+    assert_eq!(s.phase(id), Some(Phase::Present));
+
+    // Clearing reverts to Transition::springs on the next exit, and removing cleans up.
+    s.clear_transition_motion(id);
+    s.set_transition(id, Transition::opacity().springs(SpringPair::new(Spring::new(0.3, 0.0), Spring::NONE)));
+    s.remove(id);
+    s.frame_at(1.01);
+    assert!(!s.contains(id), "cleared override falls back to Transition::springs (Spring::NONE exits at once)");
+
+    // Anim::INSTANT stays instant even under Reduce Motion (not stretched into a fade).
+    let instant_id = NodeId(102);
+    s.set_reduced_motion(true);
+    s.set_transition_motion(instant_id, Anim::INSTANT, Anim::INSTANT);
+    s.insert(instant_id, spec(0.0, 0.0, 80.0, 40.0).transition(tr), Mount::Animated);
+    s.frame_at(1.05);
+    assert!((s.presented(instant_id).unwrap().opacity - 1.0).abs() < 1e-4);
+    assert_eq!(s.phase(instant_id), Some(Phase::Present));
+    s.remove(instant_id);
+    s.frame_at(1.06);
+    assert!(!s.contains(instant_id), "Anim::INSTANT exit unmounts at once under Reduce Motion");
+
+    // A long timed curve reduces to REDUCED_FADE (~0.18 s) under Reduce Motion.
+    let reduced_id = NodeId(103);
+    s.set_transition_motion(reduced_id, Curve::linear(2.0), Curve::linear(2.0));
+    s.insert(reduced_id, spec(0.0, 0.0, 80.0, 40.0).transition(tr), Mount::Animated);
+    s.frame_at(1.06);
+    s.frame_at(1.30);
+    assert_eq!(s.phase(reduced_id), Some(Phase::Present), "2.0s timed enter reduced to ~0.18s fade settles by 0.24s");
+}
+
+#[test]
+fn reduced_motion_instant_match_geometry_and_zero_tween_transition_add_no_fade() {
+    let mut s = Scene::new();
+    s.set_reduced_motion(true);
+    s.insert(NodeId(1), spec(0.0, 0.0, 10.0, 10.0), Mount::Initial);
+    s.frame_at(0.0);
+
+    // Zero-duration timed transition must stay instant under Reduce Motion.
+    let id = NodeId(200);
+    s.set_transition_motion(id, Curve::linear(0.0), Curve::linear(0.0));
+    s.insert(id, spec(0.0, 0.0, 80.0, 40.0).transition(Transition::opacity()), Mount::Animated);
+    let out = s.frame_at(0.1);
+    assert!(!out.animating, "0 s enter tween must not animate under reduced motion");
+    assert_eq!(s.phase(id), Some(Phase::Present));
+    assert_eq!(s.presented(id).unwrap().opacity, 1.0);
+    s.remove(id);
+    let out = s.frame_at(0.2);
+    assert!(!out.animating, "0 s exit tween must not animate under reduced motion");
+    assert!(!s.contains(id));
+
+    // match_geometry with an instant LayoutAnim must not gain a crossfade under Reduce Motion.
+    let (from, to) = (NodeId(201), NodeId(202));
+    s.insert(from, spec(0.0, 0.0, 60.0, 30.0), Mount::Initial);
+    s.frame_at(0.3);
+    s.insert(to, spec(120.0, 40.0, 100.0, 50.0), Mount::Initial);
+    s.match_geometry(from, to, LayoutAnim::INSTANT);
+    let out = s.frame_at(0.3);
+    assert!(!out.animating, "instant match_geometry must not add a crossfade under reduced motion");
+    assert!(!s.contains(from), "source must unmount at once");
+    assert_eq!(s.phase(to), Some(Phase::Present));
+    assert_eq!(s.presented(to).unwrap().opacity, 1.0);
+    assert_eq!(s.presented(to).unwrap().rect, Rect::new(120.0, 40.0, 100.0, 50.0));
+}

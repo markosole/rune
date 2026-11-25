@@ -7,13 +7,52 @@ use std::rc::Rc;
 use crate::states::downcast;
 use crate::{El, Tx};
 
+/// What moved a scroll viewport's offset in the frame reported to [`El::on_scroll_offset`].
+///
+/// When more than one cause moves a viewport in the same frame, the highest-priority source wins:
+/// [`Direct`](Self::Direct) > [`Momentum`](Self::Momentum) > [`EdgeReturn`](Self::EdgeReturn) >
+/// [`Programmatic`](Self::Programmatic) > [`None`](Self::None).
+///
+/// ```
+/// use rune::{El, ScrollPos, ScrollSource, ScrollSpec, col};
+///
+/// let _list: El = col()
+///     .scroll(ScrollSpec::default())
+///     .on_scroll_offset(|pos: ScrollPos| {
+///         if pos.source == ScrollSource::Direct && pos.offset[1] < -40.0 {
+///             // Deliberate pull past the top edge, not elastic edge return after release.
+///         }
+///     });
+/// ```
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScrollSource {
+    /// No scroll motion occurred this frame (for example, initial layout, resize, or a rebuilt handler).
+    #[default]
+    None,
+    /// Direct user input: touch drag, wheel or trackpad scroll, wheel notch ease, scroll keys,
+    /// middle-click autoscroll, selection edge-scroll, or scroll-bar drag.
+    Direct,
+    /// Post-release momentum coasting inside `[0, max]`, including trackpad momentum phases and
+    /// touch or programmatic flings.
+    Momentum,
+    /// Elastic rubber-band spring returning from overscroll outside `[0, max]` back to the nearest
+    /// boundary after a touch release.
+    EdgeReturn,
+    /// App- or layout-driven motion: `Tx::scroll_*` requests (instant jumps, glides, reveals,
+    /// paging), `stick_bottom` following content growth, `El::scroll_anchor` / `Tx::keep_on_screen`
+    /// compensation, and caret follow.
+    Programmatic,
+}
+
 /// Where a scroll viewport is scrolled to, for [`El::on_scroll_offset`]: `offset` points from
 /// the top-left of its content, `[x, y]`, out of the `max` it can scroll on each axis, in a
 /// viewport `viewport` points wide and tall. `drawn` is the size the frame draws the viewport
 /// at: `viewport` at rest, and where its size has got to while a layout spring resizes it, so
 /// the handler hears every frame of that. `direction` is the way the viewport runs
 /// ([`El::dir`]), `Ltr` or `Rtl`: a right-to-left one starts at its right edge, and its scroll bar
-/// sits on its left, as a browser puts a `dir="rtl"` box's.
+/// sits on its left, as a browser puts a `dir="rtl"` box's. `source` identifies what moved
+/// `offset` this frame ([`ScrollSource`]).
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ScrollPos {
@@ -22,16 +61,18 @@ pub struct ScrollPos {
     pub viewport: [f32; 2],
     pub drawn: [f32; 2],
     pub direction: crate::Direction,
+    pub source: ScrollSource,
 }
 
 impl El {
     /// Called with this element's laid-out rect `[x, y, w, h]` in window points, after scrolling
     /// (as [`Cx::window_layout`](crate::Cx::window_layout) reads it): once after its first
-    /// layout, then when it moves or resizes by more than half a point, which inside a scroll
-    /// viewport is every frame of a scroll. Never per animation frame: the rect is where layout
-    /// puts the element, not where its spring is on the way there. Each report is a state
-    /// change, so the view runs again, unless the handler says [`Tx::live_only`] (see
-    /// [`El::on_layout_tx`]).
+    /// layout, then when it moves or resizes by more than half a point (which inside a scroll
+    /// viewport is every frame of a scroll), or when the display scale changes (even if its
+    /// logical rect is unchanged; read the new scale from [`Tx::scale`] in
+    /// [`El::on_layout_tx`]). Never per animation frame: the rect is where layout puts the
+    /// element, not where its spring is on the way there. Each report is a state change, so the
+    /// view runs again, unless the handler says [`Tx::live_only`] (see [`El::on_layout_tx`]).
     #[track_caller]
     pub fn on_layout<S: 'static>(mut self, f: impl Fn(&mut S, [f32; 4]) + 'static) -> Self {
         self.handlers.on_layout = Some(Rc::new(move |s, r, _| f(downcast::<S>(s), r)));
@@ -39,9 +80,10 @@ impl El {
         { self.handlers.sites.layout = Some(std::panic::Location::caller()); }
         self
     }
-    /// [`El::on_layout`] with a [`Tx`]. A handler that only moves live values (a marker beside
-    /// a scrolling row, by its own [`El::live_offset`]) says [`Tx::live_only`], and a scroll
-    /// runs no view.
+    /// [`El::on_layout`] with a [`Tx`]. Read [`Tx::scale`] for backing-pixel sizing when the
+    /// element resizes or the display scale changes. A handler that only moves live values (a
+    /// marker beside a scrolling row, by its own [`El::live_offset`]) says [`Tx::live_only`],
+    /// and a scroll runs no view.
     ///
     /// ```ignore
     /// .on_layout_tx(|s: &mut Board, [_, y, _, _], tx| {
@@ -52,6 +94,34 @@ impl El {
     #[track_caller]
     pub fn on_layout_tx<S: 'static>(mut self, f: impl Fn(&mut S, [f32; 4], &mut Tx) + 'static) -> Self {
         self.handlers.on_layout = Some(Rc::new(move |s, r, tx| f(downcast::<S>(s), r, tx)));
+        #[cfg(debug_assertions)]
+        { self.handlers.sites.layout = Some(std::panic::Location::caller()); }
+        self
+    }
+    /// [`El::on_layout_tx`] for a component that doesn't read the app's state, so it works in
+    /// any app.
+    ///
+    /// Receives the element's laid-out rect `[x, y, w, h]` in window points (after scrolling)
+    /// and a [`Tx`]. Re-fires on moves or resizes past half a point and on display-scale changes
+    /// (read [`Tx::scale`]). Call [`Tx::live_only`] when the handler only updates
+    /// [`Live`](crate::Live) values so scrolling runs no view.
+    ///
+    /// ```
+    /// use rune::{El, Live, Tx, el};
+    ///
+    /// let width = Live::new(0.0_f32);
+    /// let w = width.clone();
+    /// let _bar: El = el()
+    ///     .w_full()
+    ///     .h(24.0)
+    ///     .on_layout_any(move |[_, _, width, _], tx: &mut Tx| {
+    ///         w.set(width);
+    ///         tx.live_only();
+    ///     });
+    /// ```
+    #[track_caller]
+    pub fn on_layout_any(mut self, f: impl Fn([f32; 4], &mut Tx) + 'static) -> Self {
+        self.handlers.on_layout = Some(Rc::new(move |_, r, tx| f(r, tx)));
         #[cfg(debug_assertions)]
         { self.handlers.sites.layout = Some(std::panic::Location::caller()); }
         self
@@ -74,7 +144,9 @@ impl El {
     /// [`El::live_rect`] and [`El::scale`], so an element on a zoomed canvas reports where it
     /// shows (the rect hit tests use, and [`ElementInfo::rect`](crate::ElementInfo)). It runs
     /// once after the element is first drawn, then when that rect moves by more than half a
-    /// point, including on every frame a live value moves it (a camera pan, with no commit). A
+    /// point—including on every frame a live value moves it (a camera pan, with no commit)—or
+    /// when the display scale changes (read the scale from [`Tx::scale`] in
+    /// [`El::on_drawn_layout_tx`]). A
     /// spring moving it, its own or an ancestor's, reports where it comes to rest, as
     /// `on_layout` does. Its handler runs on the next frame. Keep it to the few elements
     /// something follows (a selection a toolbar floats over), not every node on a canvas: each
@@ -112,6 +184,55 @@ impl El {
     /// reader reaches it, or to stop a loop nobody can see.
     pub fn on_visible<S: 'static>(mut self, f: impl Fn(&mut S, bool, &mut Tx) + 'static) -> Self {
         self.handlers.on_visible = Some(Rc::new(move |s, on, tx| f(downcast::<S>(s), on, tx)));
+        self
+    }
+    /// [`El::on_visible`] for a component that doesn't read the app's state, so it works in any
+    /// app.
+    ///
+    /// Receives `true` when the element comes on screen and `false` when it leaves, with a
+    /// [`Tx`]. Call [`Tx::live_only`] when the handler only updates [`Live`](crate::Live) values
+    /// or schedules wakes.
+    ///
+    /// ```
+    /// use rune::{El, Live, Tx, el};
+    ///
+    /// let visible = Live::new(0.0_f32);
+    /// let v = visible.clone();
+    /// let _indicator: El = el()
+    ///     .size(120.0, 24.0)
+    ///     .on_visible_any(move |on, tx: &mut Tx| {
+    ///         v.set(if on { 1.0 } else { 0.0 });
+    ///         tx.live_only();
+    ///     });
+    /// ```
+    pub fn on_visible_any(mut self, f: impl Fn(bool, &mut Tx) + 'static) -> Self {
+        self.handlers.on_visible = Some(Rc::new(move |_, on, tx| f(on, tx)));
+        self
+    }
+    /// Called once when this element mounts into the tree, in the same frame before drawing, so
+    /// state changes it makes commit and render without a one-frame lag (like SwiftUI's
+    /// `.onAppear` or React's `useLayoutEffect(fn, [])`).
+    ///
+    /// Rebuilding the view, resizing, or moving the element does not call it again; unmounting
+    /// (with or without an exit transition) and mounting again does. An `on_mount` handler that
+    /// mounts another element with `on_mount` runs in the same frame too, up to 4 rounds per frame.
+    /// After a state update outside a frame ([`Runtime::update`](crate::Runtime::update)), it runs
+    /// in the next frame at the latest. Call [`Tx::live_only`] when the handler only updates
+    /// [`Live`](crate::Live) values or schedules work without changing what the view renders.
+    ///
+    /// ```
+    /// use rune::{El, Tx, col, text};
+    ///
+    /// struct State { show_tip: bool, shown: usize }
+    ///
+    /// fn view(s: &State) -> El {
+    ///     col().children(s.show_tip.then(|| {
+    ///         text("Tip").on_mount(|s: &mut State, _tx: &mut Tx| s.shown += 1)
+    ///     }))
+    /// }
+    /// ```
+    pub fn on_mount<S: 'static>(mut self, f: impl Fn(&mut S, &mut Tx) + 'static) -> Self {
+        self.handlers.on_mount = Some(Rc::new(move |s, tx| f(downcast::<S>(s), tx)));
         self
     }
     /// Writes where each frame draws this element into `rect`: `[x, y, w, h]` in window points,

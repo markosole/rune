@@ -187,6 +187,11 @@ pub(super) fn build(item: TabItemCore<'_>, at: Place, prev: Option<&str>, st: &S
     });
     // While its copy flies, the tab keeps only its place.
     slot = slot.child(if ghost.is_some() { el().key("pill").w_full().h(h).motion(rune::Spring::NONE) } else { pill });
+    if vertical {
+        // The row as drawn, without the half gaps the slot reaches into: what a card beside the
+        // tab lines up with, as a web hover card's `right-start` does with its trigger.
+        slot = slot.child(el().key(format!("t-{id}-pill")).pin(Some(0.0), Some(before), Some(0.0), None).h(h).a11y_hidden());
+    }
     if torn && bind.has_access() {
         // The pill's place, under a key no other strip uses: the floating copy's anchor, and,
         // mounted as the tab tears out, where it reports its width for the copy.
@@ -423,6 +428,7 @@ pub(super) fn drag_move(
     want_tear_move: bool,
     tx: &mut Tx,
 ) -> Option<TabTearMove> {
+    drag.note_travel([d.dx, d.dy]);
     // A strip that neither reorders nor lets a tab tear out (`TabStrip::tear_out`) only
     // selects: its tabs stay put under a drag.
     if !can_reorder && t.lane.tear.is_none() {
@@ -453,6 +459,7 @@ pub(super) fn drag_move(
 }
 
 pub(super) fn drag_up(drag: &mut TabDragState, d: &Drag, select_early: bool, tx: &mut Tx) -> Release {
+    drag.note_travel([d.dx, d.dy]);
     let on_tab = (0.0..=d.w).contains(&d.x) && (0.0..=d.h).contains(&d.y);
     // A press already selected the tab; its click needn't again.
     let release = drag.release(d.cancelled(), on_tab, select_early && on_tab);

@@ -36,9 +36,10 @@ pub struct VisualCold {
     pub clip_radius: Option<f32>,
     /// Per-corner clip radii override (`[tl, tr, br, bl]`, in points).
     pub(crate) clip_corners: Option<[f32; 4]>,
-    /// A round hole through this element and its subtree (`El::cutout_circle`): centre x and y
-    /// from the element's top-left, and the radii it's clear within and whole from, in points.
-    pub(crate) cutout: Option<[f32; 4]>,
+    /// Round holes through this element and its subtree (`El::cutout_circle`,
+    /// `El::cutout_circles`): centre x and y from the element's top-left, and the radii clear
+    /// within and whole from, in points.
+    pub(crate) cutouts: Vec<[f32; 4]>,
     pub icon: Option<(&'static Icon, Color)>,
     /// The icon's colour came from `El::color`; without it the icon takes the window's
     /// foreground (`Cx::foreground`) when the view sets one.
@@ -58,6 +59,14 @@ pub struct VisualCold {
     pub pixels: Option<crate::pixels::Pixels>,
     /// How `pixels` keeps its aspect ratio; `None` stretches it to the rect.
     pub pixels_fit: Option<crate::SurfaceFit>,
+    /// Placed rect `[x, y, w, h]` in element-local points and wrap mode (`El::pixels_wrap`,
+    /// `El::pixels_tile`); `None` uses `El::pixels` or `El::pixels_fit`.
+    pub(crate) pixels_wrap: Option<([f32; 4], crate::PixelsWrap)>,
+    /// Colour whose RGB and alpha tint `pixels`'s alpha mask (`El::pixels_tint`); `None` draws
+    /// the image's own colours.
+    pub(crate) pixels_tint: Option<Color>,
+    /// Sampling filter for `pixels` (`El::image_filter`); `Linear` by default.
+    pub(crate) image_filter: crate::ImageFilter,
     /// An effect slot (`El::effect`).
     pub(crate) effect: Option<crate::el::effect::EffectSlot>,
     /// Backdrop blur standard deviation in points (`El::backdrop_blur`); 0 is off.
@@ -66,6 +75,8 @@ pub struct VisualCold {
     pub hover_motion: Option<Rc<(Anim, Anim)>>,
     /// Hover curves for this element and the hover tracks below it without their own.
     pub(crate) hover_within: Option<Rc<(Anim, Anim)>>,
+    /// The press tracks' down and up curves (default: instant down, snappy/pop up).
+    pub(crate) press_motion: Option<Rc<(Anim, Anim)>>,
     /// Opacity factor (rest, hovered) following the nearest ancestor group's hover.
     pub group_opacity: Option<[f32; 2]>,
     /// Text or icon colour while the nearest ancestor group is hovered.
@@ -100,11 +111,21 @@ pub struct VisualCold {
     pub(crate) clip_to_content: bool,
     /// `El::matched_crop`: a matched flight keeps the content at its own size, cropped.
     pub(crate) flight_crop: bool,
+    /// `El::matched_in_place`: a matched flight stays in its destination's paint order and layers.
+    pub(crate) flight_in_place: bool,
     /// `El::hold_landing_width`: an animated width change lands its contents and slides them.
     pub(crate) hold_landing: bool,
     pub(crate) row_face: Option<&'static str>,
     /// `El::press_color`: its text and icons' colour while a press on it is held.
     pub(crate) press_color: Option<Color>,
+    /// `El::hover_fill`: replacement fill colour while hovered.
+    pub(crate) hover_fill: Option<Color>,
+    /// `El::press_fill`: replacement fill colour while pressed.
+    pub(crate) press_fill: Option<Color>,
+    /// `El::hover_border`: replacement border colour while hovered.
+    pub(crate) hover_border: Option<Color>,
+    /// `El::press_border`: replacement border colour while pressed.
+    pub(crate) press_border: Option<Color>,
     /// `El::paint_contained`: the origin (window points) its children snap against.
     pub(crate) paint_contain: Option<[f32; 2]>,
     /// `El::motion_snaps`: while it moves, it and its subtree snap every frame.
@@ -143,7 +164,7 @@ impl Empty for VisualCold {
         clip: None,
         clip_radius: None,
         clip_corners: None,
-        cutout: None,
+        cutouts: Vec::new(),
         icon: None,
         icon_inked: false,
         icon_one_color: false,
@@ -154,10 +175,14 @@ impl Empty for VisualCold {
         grid: None,
         pixels: None,
         pixels_fit: None,
+        pixels_wrap: None,
+        pixels_tint: None,
+        image_filter: crate::ImageFilter::Linear,
         effect: None,
         backdrop_blur: 0.0,
         hover_motion: None,
         hover_within: None,
+        press_motion: None,
         group_opacity: None,
         group_color: None,
         hover_alone: false,
@@ -174,9 +199,14 @@ impl Empty for VisualCold {
         instant_motion: false,
         clip_to_content: false,
         flight_crop: false,
+        flight_in_place: false,
         hold_landing: false,
         row_face: None,
         press_color: None,
+        hover_fill: None,
+        press_fill: None,
+        hover_border: None,
+        press_border: None,
         paint_contain: None,
         motion_snaps: false,
         hairline: false,
@@ -371,8 +401,18 @@ impl VisualFlags {
 }
 
 impl Visual {
-    /// Whether a press on it shows (an `El::press` overlay or an `El::press_color`).
+    /// Whether hover on this element paints a fill or border state of its own
+    /// (`El::hover`, `El::hover_fill`, or `El::hover_border`).
+    #[inline]
+    pub(crate) fn tracks_hover_paint(&self) -> bool {
+        self.hover().a > 0.0
+            || self.cold.get().is_some_and(|c| c.hover_fill.is_some() || c.hover_border.is_some())
+    }
+
+    /// Whether a press on it shows (`El::press`, `El::press_color`, `El::press_fill`, or `El::press_border`).
+    #[inline]
     pub(crate) fn tracks_press(&self) -> bool {
-        self.press().a > 0.0 || self.cold.get().is_some_and(|c| c.press_color.is_some())
+        self.press().a > 0.0
+            || self.cold.get().is_some_and(|c| c.press_color.is_some() || c.press_fill.is_some() || c.press_border.is_some())
     }
 }

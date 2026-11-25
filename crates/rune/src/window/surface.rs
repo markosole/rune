@@ -16,15 +16,21 @@ pub(in crate::window) mod redraw;
 pub(in crate::window) mod win;
 
 pub(crate) use backoff::{Backoff, BackoffEffect, BackoffEvent};
-pub(crate) use configure::configure;
+pub(crate) use configure::{ConfigureError, configure, configure_checked};
+#[cfg(test)]
+pub(crate) use configure::{ConfigureErrorKind, classify_scope_error};
+#[cfg(target_arch = "wasm32")]
+pub(crate) use configure::configure_then;
 #[cfg(target_os = "macos")]
 pub(in crate::window) use launch_drawables::LaunchDrawables;
 pub(in crate::window) use loop_frame::LoopFrame;
 pub(in crate::window) use native::Native;
 pub(crate) use pacing::{
-    HiddenPace, Missed, TimerFrame, TIMER_FRAME, acquire, acquire_checked, timer_deadline_core,
-    timer_wants_frame_core,
+    HiddenPace, Missed, TimerFrame, TIMER_FRAME, acquire, acquire_checked,
+    poll_timer_deadline_core, timer_deadline_core, timer_wants_frame_core,
 };
+#[cfg(target_os = "windows")]
+pub(crate) use pacing::{motion_wake_wall_core, poll_wake_wall_core};
 #[cfg(test)]
 pub(crate) use pacing::{
     HIDDEN_REFRESH, OCCLUDED_MAX, OCCLUDED_RETRY, TIMEOUT_RETRY, TIMER_FRAME_STALL, timer_deadline,
@@ -48,12 +54,58 @@ mod occluded_surface_tests;
 /// (`slot`) rather than in `acquire`. Elsewhere two.
 pub(crate) const FRAME_LATENCY: u32 = if cfg!(target_os = "windows") { 1 } else { 2 };
 
+/// The largest 2D surface side accepted while no GPU device is attached yet (Windows CPU boot, or
+/// between surfaces): matches D3D12 and Metal's 2D texture limit, large enough for multi-monitor
+/// desktops while rejecting wrapped negative Windows client sizes (such as `65527` for `-9`).
+pub(in crate::window) const CPU_MAX_SURFACE_DIM: u32 = 16_384;
+
+/// The largest 2D surface side the active GPU accepts, or `CPU_MAX_SURFACE_DIM` while no GPU is
+/// attached yet.
+pub(in crate::window) fn max_surface_dim(gpu: Option<&Gpu>) -> u32 {
+    gpu.map_or(CPU_MAX_SURFACE_DIM, |gpu| gpu.device.limits().max_texture_dimension_2d.max(1))
+}
+
+/// The physical drawable size for a platform-reported extent under `max_dim`.
+///
+/// Windows can report a transient negative client extent wrapped to `u16` (in `WM_SIZE`, e.g.
+/// `65527` for `-9`) or `u32` (from `GetClientRect`), exceeding `max_texture_dimension_2d`. When
+/// a window already has a drawable (`Some(prev)`), a zero or out-of-range size is ignored so the
+/// surface, viewport and CPU buffer keep the previous size until a valid resize arrives; when
+/// creating a surface (`None`), each edge is clamped to `1..=max_dim`.
+pub(in crate::window) fn drawable_size(current: Option<(u32, u32)>, reported: (u32, u32), max_dim: u32) -> (u32, u32) {
+    let max_dim = max_dim.max(1);
+    if reported.0 > 0 && reported.1 > 0 && reported.0 <= max_dim && reported.1 <= max_dim {
+        return reported;
+    }
+    match current {
+        Some(prev) => (prev.0.clamp(1, max_dim), prev.1.clamp(1, max_dim)),
+        None => (reported.0.clamp(1, max_dim), reported.1.clamp(1, max_dim)),
+    }
+}
+
 /// A vsynced sRGB (or non-sRGB when `srgb_blend` is set) configuration for the surface, and the
 /// first alpha mode it supports that composites translucent pixels.
 pub(crate) fn surface_config(surface: &wgpu::Surface, adapter: &wgpu::Adapter, (width, height): (u32, u32), srgb_blend: bool)
     -> Option<(wgpu::SurfaceConfiguration, Option<wgpu::CompositeAlphaMode>)> {
-    let mut config = surface.get_default_config(adapter, width.max(1), height.max(1))?;
+    let (width, height) = drawable_size(None, (width, height), adapter.limits().max_texture_dimension_2d);
+    // The surface is asked what it can do once. A Vulkan driver answers each part of that with a
+    // call of its own, and Mesa's Wayland surfaces answer each call by asking the compositor for
+    // its globals again and waiting for it twice (`wsi_wl_display_init`). Asked three times here
+    // (`get_default_config`, this, the alpha mode), a window's swap chain was made after 26
+    // such requests and 52 round trips; asked once, after 16 and 32. What follows is
+    // `get_default_config`'s answer.
     let caps = surface.get_capabilities(adapter);
+    let mut config = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format: *caps.formats.first()?,
+        color_space: wgpu::SurfaceColorSpace::Auto,
+        width,
+        height,
+        desired_maximum_frame_latency: 2,
+        present_mode: *caps.present_modes.first()?,
+        alpha_mode: wgpu::CompositeAlphaMode::Auto,
+        view_formats: vec![],
+    };
     let srgb = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(config.format);
     config.format = if srgb_blend {
         let non_srgb = srgb.remove_srgb_suffix();
@@ -75,7 +127,7 @@ pub(crate) fn surface_config(surface: &wgpu::Surface, adapter: &wgpu::Adapter, (
     config.usage |= caps.usages & wgpu::TextureUsages::COPY_DST;
     config.present_mode = wgpu::PresentMode::AutoVsync;
     config.desired_maximum_frame_latency = FRAME_LATENCY;
-    Some((config, crate::render::translucency::mode(surface, adapter)))
+    Some((config, crate::render::translucency::mode_of(&caps, adapter)))
 }
 
 /// Follows a blend switch (`Tx::set_srgb_blend`) on a configured surface: reconfigures it for
@@ -95,7 +147,12 @@ pub(crate) fn reblend_core(surface: &wgpu::Surface, gpu: &Gpu, config: &mut wgpu
         }
     }
     let target = if srgb { config.format.remove_srgb_suffix() } else { config.format };
-    rebuild_renderer_core(&gpu.device, renderer, target, rt);
+    if let Err(error) = renderer.try_set_format(&gpu.device, target) {
+        eprintln!("rune: could not rebuild the renderer pipeline for a blend switch: {error}");
+        return false;
+    }
+    renderer.set_srgb_blend(rt.srgb_blend());
+    renderer.attach_text(&mut rt.text.atlas);
     if alpha.is_some() {
         *alpha = Some(crate::render::surface_alpha::AlphaSurface::new(&gpu.device, target, (config.width, config.height)));
     }

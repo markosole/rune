@@ -24,9 +24,20 @@ use crate::tooling::{
 use super::app::{HeadlessApp, HeadlessRenderArgs};
 use super::report_traffic_light_overlaps;
 
+/// Bound on extra zero-dt layout-callback passes `--settle` runs at the capture frame.
+pub(in crate::tooling) const SETTLE_PASSES: usize = 3;
+
+/// A frame readback's destination and, when `--chrome` is active, the resolved macOS chrome on
+/// that frame so asynchronous readbacks paint the traffic lights that frame drew with.
+#[derive(Clone, Copy)]
+pub(super) struct FrameShot {
+    pub(super) shot: Shot,
+    pub(super) chrome: Option<Chrome>,
+}
+
 pub(super) struct PreparedHeadlessFrame {
     encoder: wgpu::CommandEncoder,
-    shot: Shot,
+    shot: FrameShot,
 }
 
 /// Persistent offscreen rendering resources and frame-to-frame state owned by `run_headless`.
@@ -36,7 +47,6 @@ pub(super) struct HeadlessLoop<'a> {
     pub(super) runtime_ms: f64,
     pub(super) init_ms: f64,
     pub(super) args: &'a Args,
-    pub(super) chrome: Chrome,
     pub(super) dark: bool,
     pub(super) scale: f32,
     pub(super) size: (f32, f32),
@@ -55,7 +65,8 @@ pub(super) struct HeadlessLoop<'a> {
     pub(super) target_format: wgpu::TextureFormat,
     pub(super) renderer: Renderer,
     pub(super) target: Offscreen,
-    pub(super) readback: crate::tooling::record::Readback<Shot>,
+    pub(super) readback: crate::tooling::record::Readback<FrameShot>,
+    pub(super) in_flight: crate::tooling::record::InFlight,
     pub(super) alpha: Option<crate::render::surface_alpha::AlphaSurface>,
     pub(super) overlay: Option<(crate::input::keycaps::Overlay, Renderer)>,
     pub(super) reports: crate::frame::encoded::FrameReports,
@@ -110,12 +121,12 @@ pub(super) struct HeadlessFrame<'a, 'b, F> {
     #[cfg(feature = "frame-profile")]
     pub(super) fp_commits0: u64,
     #[cfg(feature = "frame-profile")]
-    pub(super) fp_cpu0: Option<f64>,
+    pub(super) fp_cpu0: Option<crate::frame::profile::ThreadCpuMark>,
     #[cfg(feature = "frame-profile")]
     pub(super) fp_events: usize,
 }
 
-impl<F: FnMut(Shot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
+impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
     type Drawable = ();
     type Prepared = PreparedHeadlessFrame;
 
@@ -160,9 +171,14 @@ impl<F: FnMut(Shot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
         // step's own refusal shows for those too, counted apart.
         let asked = (self.app.rt().loop_check_on() && self.k > 0 && s.frame_anim.is_none())
             .then(|| self.app.rt_mut().loop_step(step));
-        let animating = self.app.frame(step);
+        let mut animating = self.app.frame(step);
         if let Some(asked) = asked {
             s.loop_check.add(self.real_t, self.script_had_events, asked, self.app.rt_mut().loop_checked());
+        }
+        if s.args.settle && self.k == s.snap_frame {
+            if let (_, Some(settled)) = self.app.settle_layout_passes(SETTLE_PASSES) {
+                animating = settled;
+            }
         }
         StepInfo {
             runtime_animating: animating,
@@ -234,9 +250,10 @@ impl<F: FnMut(Shot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
         };
         let first_pixels = s.args.first_pixels && self.k == 0;
         let want_pixels = shot.dump || shot.video || shot.snap || first_pixels;
+        let chrome = (want_pixels && s.args.chrome_overlay).then(|| self.app.rt().headless_chrome_current());
         self.want_pixels = want_pixels;
         self.first_pixels = first_pixels;
-        RenderPrep::Ready(PreparedHeadlessFrame { encoder, shot })
+        RenderPrep::Ready(PreparedHeadlessFrame { encoder, shot: FrameShot { shot, chrome } })
     }
 
     #[inline]
@@ -272,7 +289,7 @@ impl<F: FnMut(Shot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
         if let Some(alpha) = &s.alpha {
             alpha.draw(&mut prepared.encoder, &s.target.view);
         }
-        if prepared.shot.snap {
+        if prepared.shot.shot.snap {
             s.snap_crop.set(crop::snap_rect(self.app.rt(), s.args, s.scale, (s.wp, s.hp)));
         }
         if self.want_pixels {
@@ -285,7 +302,8 @@ impl<F: FnMut(Shot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
     #[inline]
     fn submit_and_present(&mut self, prepared: PreparedHeadlessFrame, _info: &StepInfo) -> Instant {
         let s = &mut *self.state;
-        s.renderer.submit(&s.gpu.queue, prepared.encoder);
+        let submission = s.renderer.submit(&s.gpu.queue, prepared.encoder);
+        s.in_flight.push(submission);
         self.encoded_stamp = s.reports.stamp();
         if self.want_pixels { s.readback.submitted(); }
         crate::time::now()
@@ -303,9 +321,13 @@ impl<F: FnMut(Shot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
         let ms = self.frame_start.elapsed().as_secs_f64() * 1000.0;
         #[cfg(feature = "frame-profile")]
         {
+            // Convert the frame's raw CPU mark before taking phase deltas so that once Windows'
+            // cycle rate is known here, `take()` sees the cached rate for every phase too.
+            let cpu_ms = frame_cpu_ms(self.fp_cpu0, crate::frame::profile::thread_cpu_since);
+            let phases = crate::frame::profile::take();
             let rt = self.app.rt_mut();
             s.profile.push(crate::frame::profile::Row {
-                phases: crate::frame::profile::take(),
+                phases,
                 update_ms: info.update_ms,
                 encode_ms: ms - info.update_ms,
                 events: self.fp_events,
@@ -314,7 +336,7 @@ impl<F: FnMut(Shot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
                 why: rt.commit.take_commit_why(),
                 shaped: rt.stats.shaped,
                 animating: info.animating,
-                cpu_ms: self.fp_cpu0.map(|start| crate::frame::profile::cpu_ms().unwrap() - start),
+                cpu_ms,
             });
         }
         s.cpu_ms.push(ms);
@@ -324,6 +346,7 @@ impl<F: FnMut(Shot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
         if s.has_comp {
             // Pace like a display link so a compositor's async readbacks (GPU timers) land between frames.
             rune_gpu::health::poll(&s.gpu.device, wgpu::PollType::wait_indefinitely()).ok();
+            s.in_flight.clear();
         }
         if let Some(tr) = s.trace.as_mut() {
             tr.frame_timed_core(self.app.rt_mut(), self.real_t * 1000.0, ms, FrameTiming::default());
@@ -332,6 +355,7 @@ impl<F: FnMut(Shot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
         if self.first_pixels {
             let wait = crate::time::now();
             let done = s.readback.finish(&s.gpu.device);
+            s.in_flight.clear();
             let marker = json!({
                 "headless_ms": s.launched.elapsed().as_secs_f64() * 1000.0,
                 "state_ms": s.state_ms, "runtime_ms": s.runtime_ms, "gpu_init_ms": s.init_ms,
@@ -344,9 +368,10 @@ impl<F: FnMut(Shot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
         } else if self.want_pixels {
             for (shot, px) in s.readback.ready(&s.gpu.device) { (self.deliver)(shot, px); }
         }
+        s.in_flight.pace(&s.gpu.device);
         if self.k == s.snap_frame
             && s.args.chrome_overlay
-            && let Some(lights) = s.chrome.traffic_light_rects()
+            && let Some(lights) = self.app.rt().headless_chrome_current().traffic_light_rects_in(s.size.0, crate::labels::rtl())
         {
             report_traffic_light_overlaps(self.app.rt(), &lights);
         }
@@ -378,6 +403,14 @@ pub(in crate::tooling) fn take_window_frame(
     *anim = Some(FrameAnim::retarget(anim.as_ref(), request.spring, start, from, [0.0, 0.0, w, h]));
 }
 
+#[cfg(feature = "frame-profile")]
+fn frame_cpu_ms(
+    start: Option<crate::frame::profile::ThreadCpuMark>,
+    since: impl FnOnce(crate::frame::profile::ThreadCpuMark) -> Option<f64>,
+) -> Option<f64> {
+    start.and_then(since).map(|ns| ns / 1e6)
+}
+
 /// Moves a headless window's viewport one frame along, before the frame lays out.
 pub(in crate::tooling) fn step_window_frame(
     rt: &mut RuntimeCore,
@@ -390,3 +423,10 @@ pub(in crate::tooling) fn step_window_frame(
     rt.step_viewport((w, h), scale);
     if moving.done(now) { *anim = None; }
 }
+
+#[cfg(all(test, feature = "frame-profile"))]
+#[path = "frame_tests.rs"]
+mod tests;
+#[cfg(test)]
+#[path = "settle_tests.rs"]
+mod settle_tests;

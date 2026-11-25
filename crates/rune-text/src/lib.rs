@@ -70,11 +70,19 @@ pub use fonts::face_weights::FaceWeights;
 pub use fonts::face_weights::set_face_weights;
 pub use fonts::fallback::is_pictographic;
 #[doc(hidden)]
+pub use fonts::families::choose_emoji_family;
+#[doc(hidden)]
 pub use fonts::families::choose_families;
-#[cfg(target_arch = "wasm32")]
+#[doc(hidden)]
+pub use fonts::families::normalize_emoji_family;
+#[doc(hidden)]
+pub use fonts::families::resolved_family_of;
 #[doc(hidden)]
 pub use fonts::full_faces;
+pub use fonts::full_faces::add_font;
 pub use fonts::language::set_language;
+pub use fonts::system_fonts::InstalledFamily;
+pub use fonts::system_fonts::installed_families;
 #[doc(hidden)]
 pub use icon::Facing;
 pub use icon::Icon;
@@ -86,6 +94,8 @@ pub use icon::icon_coverage;
 pub use icon::icon_coverage_placed;
 pub use icon::set_icon_swap;
 pub use icon::set_icon_swap_size;
+#[doc(hidden)]
+pub use layout::box_decos::span_box_decorations;
 #[doc(hidden)]
 pub use layout::cache::CachedElision;
 #[doc(hidden)]
@@ -103,6 +113,10 @@ pub use layout::cursor::line_edge;
 pub use layout::cursor::move_line;
 #[doc(hidden)]
 pub use layout::cursor::range_boxes;
+#[doc(hidden)]
+pub use layout::cursor::space_ahead;
+#[doc(hidden)]
+pub use layout::cursor::visual_step;
 pub use layout::decorations::Deco;
 #[doc(hidden)]
 pub use layout::decorations::PaintedDeco;
@@ -111,6 +125,8 @@ pub use layout::decorations::SPAN_RADIUS;
 pub use layout::hash::directed;
 #[doc(hidden)]
 pub use layout::hash::elide_key;
+#[doc(hidden)]
+pub use layout::hash::mix_span_boxes;
 #[doc(hidden)]
 pub use layout::hash::shape_key;
 pub use layout::hash::text_hash;
@@ -128,6 +144,8 @@ pub use layout::ltr_units::ltr_units;
 pub use layout::pill_chips::bare_icons;
 #[doc(hidden)]
 pub use layout::pill_chips::pill_chips;
+#[doc(hidden)]
+pub use layout::pill_chips::pill_chips_with_images;
 #[doc(hidden)]
 pub use layout::pretty::pretty_wrap;
 pub use layout::pretty::set_pretty_wrap;
@@ -148,12 +166,20 @@ pub use layout::span::PillMetrics;
 #[doc(hidden)]
 pub use layout::span::Replace;
 pub use layout::span::Span;
+pub use layout::span::SpanBox;
+#[doc(hidden)]
+pub use layout::span::SpanBoxRun;
 pub use layout::span::TextHighlight;
 #[doc(hidden)]
 pub use layout::span::flatten_spans;
 #[doc(hidden)]
+pub use layout::underline::line_end;
+#[doc(hidden)]
 pub use layout::underline::underline_edges;
+#[doc(hidden)]
+pub use layout::underline::underline_edges_with_end;
 pub use measure::FamiliesGuard;
+pub use measure::FontsGuard;
 pub use measure::TextInk;
 pub use measure::advance;
 #[doc(hidden)]
@@ -171,6 +197,7 @@ pub use measure::measure_with;
 #[doc(hidden)]
 pub use measure::primary_extents;
 pub use measure::with_families;
+pub use measure::with_fonts;
 pub use outline::Outline;
 #[doc(hidden)]
 pub use paragraphs::AsciiLine;
@@ -215,7 +242,7 @@ use fonts::platform_face;
 use fonts::fallback::Route;
 #[cfg(test)]
 use fonts::system_fonts::{CJK_FONT_FILES, system_font_files};
-use fonts::system_fonts::{LoadedFiles, family_list, load_installed, load_system_mono, named_list, names_system_mono, register_cjk_fallbacks};
+use fonts::system_fonts::{LoadedFiles, family_list, load_installed, load_system_mono, named_list, names_system_mono};
 use fonts::trak::{Trak, Traks, font_trak};
 use fonts::{fallback, families, system_fonts, system_weight};
 use icon::anim::AnimatedIcons;
@@ -227,7 +254,7 @@ use layout::cache::STALE_BYTES;
 use layout::decorations::Decoration;
 use layout::id::LayoutIds;
 use layout::rich::mono_tab_stops;
-use layout::span::{HIDDEN_SIZE, PILL_BOX, is_hidden_size};
+use layout::span::{HIDDEN_SIZE, PILL_BOX, SPAN_BOX, is_hidden_size};
 use layout::{cursor, hash, line_break, line_metrics, span};
 use raster::{macos, support, windfoil, windows};
 
@@ -276,6 +303,9 @@ pub struct TextSystem {
     ascii: HashMap<u64, Option<Rc<paragraphs::AsciiLine>>>,
     runs: Cache<Rc<RunLayout>>,
     generation: u32,
+    /// Incremented whenever [`Self::drop_shaped`] clears shaped caches so stale
+    /// [`ParagraphLayout`]s are not reused.
+    shaped_epoch: u64,
     /// The id of the layout at each address one was built or re-broken at (`layout::id`).
     layout_ids: LayoutIds,
     /// The slots' families as named; `sans` and `mono` are the lists text asks for.
@@ -292,6 +322,9 @@ pub struct TextSystem {
     symbol_families: Vec<&'static str>,
     /// The colour emoji family among `symbol_families`.
     emoji: Option<&'static str>,
+    /// Opt-in app-preferred emoji family (`Self::set_emoji_family`), tried ahead of selected
+    /// active-stack colour fonts and the lazily loaded system `emoji` family on `Route::Emoji`.
+    preferred_emoji: Option<String>,
     /// The installed math families, once a text has needed them.
     math: Option<Vec<&'static str>>,
     /// The installed monospace families with Arabic and Hebrew (`fallback::MONO_SCRIPT_FAMILIES`),
@@ -299,8 +332,8 @@ pub struct TextSystem {
     mono_scripts: Option<Vec<&'static str>>,
     /// The installed `Family::SystemMono` families, once a text has needed them.
     system_mono: Option<Vec<String>>,
-    /// The sans or mono slot names `ui-monospace` (see `family_list`).
-    slot_system_mono: bool,
+    /// Whether the sans (`[0]`) or mono (`[1]`) slot names `ui-monospace` (see `family_list`).
+    slot_system_mono: [bool; 2],
     /// Bit `i` is set once `fallback::SCRIPT_FONTS[i]` has been looked up.
     scripts: u64,
     font_files: LoadedFiles,
@@ -326,11 +359,11 @@ pub struct TextSystem {
     /// Reused across lines and frames when mapping glyphs back to cluster start bytes.
     cluster_scratch: Vec<u32>,
     /// Byte ranges `(start, end, ink)` of coloured spans set by [`Self::set_glyph_inks`].
-    ink_spans: Vec<(u32, u32, u16)>,
+    ink_spans: Vec<(u32, u32, u32)>,
     coords_scratch: Vec<i16>,
     traks: Traks,
-    /// The mode glyphs draw in: [`Self::requested`]'s, or its grayscale twin while subpixel
-    /// text can't draw ([`FontSmoothing::drawn`]).
+    /// The mode glyphs draw in: `Self::requested`'s, or its grayscale twin while subpixel
+    /// text can't draw (`FontSmoothing::drawn`).
     #[doc(hidden)]
     pub smoothing: FontSmoothing,
     /// The mode the app asked for ([`Self::set_font_smoothing`]).
@@ -359,7 +392,7 @@ pub struct TextSystem {
 
 impl Default for TextSystem {
     fn default() -> Self {
-        Self::new(&[], ("Inter", "Inter"))
+        Self::new(&[], ("Inter", "ui-monospace"))
     }
 }
 
@@ -368,10 +401,16 @@ impl TextSystem {
     /// bundled sans and mono fallbacks, since there are no system fonts to discover.
     /// `families` names the sans and mono slots; others are selectable with `Family::Named`.
     pub fn new(fonts: &[&'static [u8]], families: (&str, &str)) -> Self {
+        measure::note_fonts(fonts, families);
+        Self::new_local(fonts, families)
+    }
+
+    /// Builds a [`TextSystem`] without updating the process-wide measurement state, for
+    /// [`measure::with_text`]'s thread-local measurer.
+    pub(crate) fn new_local(fonts: &[&'static [u8]], families: (&str, &str)) -> Self {
         // Windows' own word dictionaries for the scripts that need one (loaded when first asked).
         #[cfg(all(target_os = "windows", not(feature = "segmenter-dictionaries")))]
         crate::segmenter::install();
-        measure::note_fonts(fonts, families);
         let mut collection = Collection::new(CollectionOptions { shared: false, system_fonts: false });
         let list: &[&'static [u8]] = if fonts.is_empty() { DEFAULT_FONTS } else { fonts };
         let mut registered = Vec::new();
@@ -397,7 +436,6 @@ impl TextSystem {
         #[cfg(target_arch = "wasm32")]
         platform_face::register(&mut collection);
         // No system font loads here: each comes the first time a text needs it (`load_fallbacks`).
-        let cjk = register_cjk_fallbacks(&mut collection, &registered, families);
         #[cfg(target_arch = "wasm32")]
         let families = if fonts.is_empty() { ("Inter", "IBM Plex Mono") } else { families };
         let (sans, mono) = families::slots(families.0, families.1);
@@ -406,15 +444,16 @@ impl TextSystem {
             families: (families.0.to_owned(), families.1.to_owned()),
             sans,
             mono,
-            slot_system_mono: names_system_mono(families.0) || names_system_mono(families.1),
-            fallbacks: system_fonts::Fallbacks::new(list, cjk),
+            slot_system_mono: [names_system_mono(families.0), names_system_mono(families.1)],
+            fallbacks: system_fonts::Fallbacks::new(&registered),
             atlas: Atlas::new(),
             ..Self::empty()
         };
+        text.follow_full_faces();
         text.load_installed(families.0);
         text.load_installed(families.1);
+        text.sync_cjk_fallbacks();
         text.load_slot_fallbacks();
-        text.follow_full_faces();
         text
     }
 
@@ -437,6 +476,7 @@ impl TextSystem {
             ascii: HashMap::default(),
             runs: Default::default(),
             generation: 0,
+            shaped_epoch: 0,
             layout_ids: LayoutIds::default(),
             families: (String::new(), String::new()),
             chosen: 0,
@@ -447,10 +487,11 @@ impl TextSystem {
             mono: String::new(),
             symbol_families: Vec::new(),
             emoji: None,
+            preferred_emoji: None,
             math: None,
             mono_scripts: None,
             system_mono: None,
-            slot_system_mono: false,
+            slot_system_mono: [false; 2],
             scripts: 0,
             font_files: LoadedFiles::new(),
             fallbacks: system_fonts::Fallbacks::default(),
@@ -522,7 +563,7 @@ impl TextSystem {
 
     /// The font text in `family` at `weight` shapes with first.
     fn primary_font(&mut self, family: Family, weight: f32, italic: bool) -> Option<parley::fontique::QueryFont> {
-        if family == Family::SystemMono || self.slot_system_mono {
+        if self.needs_system_mono(family, false) {
             self.system_mono();
         }
         if let Family::Named(list) = family {
@@ -553,6 +594,12 @@ impl TextSystem {
     #[doc(hidden)]
     pub fn load_installed(&mut self, list: &str) {
         load_installed(&mut self.font_cx.collection, &mut self.font_files, &mut self.installed, list);
+    }
+
+    /// Loads any installed system font families named by `list` (as configured by
+    /// [`Self::set_emoji_family`]) that are not yet registered in this collection.
+    pub(crate) fn load_installed_emoji(&mut self, list: &str) {
+        system_fonts::load_installed_emoji(&mut self.font_cx.collection, &mut self.font_files, &mut self.installed, list);
     }
 
     /// The installed `Family::SystemMono` families, loading them the first time.
@@ -812,7 +859,7 @@ impl TextSystem {
                 }
                 e
             }
-            None => match rasterize_icon(icon, (px, size), facing, &mut self.atlas) {
+            None => match self.cached_icon(icon, px, key).unwrap_or_else(|| rasterize_icon(icon, (px, size), facing, &mut self.atlas)) {
                 Rasterized::Placed(g) => {
                     self.atlas.icons.insert(key, Some(g));
                     Some(g)

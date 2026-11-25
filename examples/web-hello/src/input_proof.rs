@@ -10,6 +10,7 @@ use wasm_bindgen::prelude::*;
 #[wasm_bindgen(inline_js = "
 export function enabled() { return new URLSearchParams(location.search).has('input-proof'); }
 export function auditEnabled() { return new URLSearchParams(location.search).has('audit'); }
+export function mediaKeysEnabled() { return new URLSearchParams(location.search).has('media-keys'); }
 export function queryZoom() {
     const z = parseFloat(new URLSearchParams(location.search).get('zoom') ?? '1');
     return Number.isFinite(z) && z > 0 ? z : 1;
@@ -32,6 +33,8 @@ extern "C" {
     pub fn enabled() -> bool;
     #[wasm_bindgen(js_name = auditEnabled)]
     fn audit_enabled() -> bool;
+    #[wasm_bindgen(js_name = mediaKeysEnabled)]
+    fn media_keys_enabled() -> bool;
     #[wasm_bindgen(js_name = queryZoom)]
     fn query_zoom() -> f32;
     fn report(plain: &str, display: &str, single: &str, secret_length: usize, submits: u32, shortcuts: u32, visible: bool, window_visible: bool);
@@ -60,11 +63,11 @@ impl Default for State {
 fn view(s: &State, _: &mut Cx<State>) -> El {
     let field = |edit: &TextEdit| text_input(edit, tok::type_::BODY).w_full().h(48.0);
     col().w_full().h_full().padding(16.0).gap(8.0)
-        .child(field(&s.plain).key("plain").on_edit(|s: &mut State| &mut s.plain)
+        .child(field(&s.plain).key("plain").label("Plain").on_edit(|s: &mut State| &mut s.plain)
             .on_submit(|s: &mut State, _| s.submits += 1))
-        .child(field(&s.single).key("single").single_line().on_edit(|s: &mut State| &mut s.single)
+        .child(field(&s.single).key("single").label("Single line").single_line().on_edit(|s: &mut State| &mut s.single)
             .on_submit(|s: &mut State, _| s.submits += 1))
-        .child(field(&s.secret).key("secret").single_line().on_edit(|s: &mut State| &mut s.secret)
+        .child(field(&s.secret).key("secret").label("Secret").single_line().on_edit(|s: &mut State| &mut s.secret)
             .on_submit(|s: &mut State, _| s.submits += 1))
         .child(el().key("button").focusable(true).w_full().h(48.0).child(text("Button"))
             .on_press(|s: &mut State| s.submits += 1))
@@ -213,7 +216,7 @@ fn audit_view(s: &Audit, cx: &mut Cx<Audit>) -> El {
                 .child(el().size(1200.0, 1200.0)),
         )
         .child(
-            text_input(&s.edit, tok::type_::BODY).key("field").size(240.0, 48.0)
+            text_input(&s.edit, tok::type_::BODY).key("field").label("Field").size(240.0, 48.0)
                 .on_edit(|s: &mut Audit| &mut s.edit),
         )
 }
@@ -237,7 +240,7 @@ fn run_audit() {
         ));
         true
     });
-    let app = App::new(spec);
+    let app = if media_keys_enabled() { App::new(spec).media_keys() } else { App::new(spec) };
     let handle = app.handle();
     let state_handle = handle.clone();
     handle.update(move |s, _| s.handle = Some(state_handle));

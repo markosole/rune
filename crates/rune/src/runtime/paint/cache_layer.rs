@@ -201,11 +201,13 @@ impl RuntimeCore {
                     || self.scroll.scrolls.get(&n.id).is_some_and(|st| st.slack.height() > 0.0)
                     || self.motion.reveal_fading(n.id)
                     || self.subtree_exiting(i)
+                    || (!self.motion.flying.is_empty() && self.motion.flying.iter().any(|f| f.0 == n.id))
                     || (!self.motion.flights().is_empty() && self.motion.flights().iter().any(|f| f.departs(&n.path, n.key.as_deref()) || f.lands(&n.path, n.key.as_deref())))
                     || n.vis.effect.is_some()
-                    // A publication can replace texels without moving the atlas slot, so
-                    // identical image primitives do not imply identical raster contents.
+                    // A publication or animation frame can replace texels without moving the
+                    // atlas slot, so identical image primitives do not imply identical raster contents.
                     || n.vis.pixels.is_some()
+                    || n.text.as_ref().is_some_and(|t| t.cold.pills.iter().any(crate::text::PillChip::has_image))
                     || n.vis.surface.is_some()
                     || (n.material.is_some() && self.paint.native_materials)
                     // Never retain a raster of a secret, even when the field is unfocused.
@@ -219,10 +221,10 @@ impl RuntimeCore {
                 // Hover, press and link paint land without a commit (an instant track or a
                 // pointer move inside one text), so hash what this frame samples.
                 let links = n.text.as_ref().is_some_and(|t| !t.cold.links.is_empty());
-                if n.vis.hover().a > 0.0 || n.vis_flags.hover_group() || n.vis.tracks_press() || n.handlers.get().is_some_and(|h| h.press_scale.is_some()) || links {
+                if n.vis.tracks_hover_paint() || n.vis_flags.hover_group() || n.vis.tracks_press() || n.handlers.get().is_some_and(|h| h.press_scale.is_some() || h.press_offset.is_some()) || links {
                     let mut ph = rune_motion::Fx::default();
                     ph.write_u64(n.id.0);
-                    for prop in [P_HOVER, P_PRESS, P_PRESS_SCALE] {
+                    for prop in [P_HOVER, P_PRESS, P_PRESS_SCALE, P_PRESS_OX, P_PRESS_OY] {
                         ph.write_u32(self.scene.get(n.id, prop).unwrap_or(0.0).to_bits());
                     }
                     if links { self.link_states(i).hash(&mut ph); }

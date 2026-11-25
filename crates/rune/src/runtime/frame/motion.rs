@@ -15,7 +15,7 @@ impl RuntimeCore {
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub(crate) fn loops_shown(&self) -> bool {
         (!self.reduced_motion && self.paint.animated_icons_shown())
-            || self.tree.nodes.iter().enumerate().any(|(i, n)| n.looping.is_some() && self.paint.was_seen(i, false) && self.motion.has_loop(n.id))
+            || self.tree.nodes.iter().enumerate().any(|(i, n)| n.looping.is_some() && self.paint.was_seen(i, false) && self.motion.loop_active(n.id, self.scene.store().node_time(n.id)))
     }
 
     /// Wakes when a delayed start at animation time `at` comes due, on the loops' wake: the
@@ -112,9 +112,12 @@ impl RuntimeCore {
             animating |= self.build();
         }
         self.finish_keeps();
-        animating |= self.write_drawn_rects();
+        self.paint.drawn_rect_wrote = self.write_drawn_rects();
+        animating |= self.paint.drawn_rect_wrote;
         // A selection's edge scroll stepped: it follows the pointer over this layout, and shows.
-        if self.laid_edge_scroll(app) { animating |= self.build(); }
+        let edge = self.laid_edge_scroll(app);
+        if edge.repaint { animating |= self.build(); }
+        animating |= edge.queued;
         self.report_at_bottom();
         animating |= self.report_visible_rows();
         self.report_layout();
@@ -153,10 +156,16 @@ impl RuntimeCore {
     /// rows it's stuck over.
     #[inline]
     pub(in crate::runtime) fn update_layer_paint_order(&mut self) {
-        let Self { paint, tree, motion, scroll, .. } = self;
-        paint.update_layer_paint_order(tree, &motion.flying, |i| {
-            (scroll.requests.has_keeps() && scroll.requests.keeps().any(|k| k.hold.as_ref().is_some_and(|h| h.path == tree.nodes[i].path)))
-                || tree.nodes[i].sticky.as_ref().and_then(|s| s.edge).is_some()
-        });
+        let Self { paint, tree, motion, scroll, scene, .. } = self;
+        paint.update_layer_paint_order(
+            tree,
+            &motion.flying,
+            |id| motion.launches().launched(id),
+            |i| {
+                (scroll.requests.has_keeps() && scroll.requests.keeps().any(|k| k.hold.as_ref().is_some_and(|h| h.path == tree.nodes[i].path)))
+                    || tree.nodes[i].sticky.as_ref().and_then(|s| s.edge).is_some()
+            },
+            |i| std::iter::successors(Some(i), |&p| tree.nodes[p].parent).any(|p| matches!(scene.phase(tree.nodes[p].id), Some(PresencePhase::Exiting { .. }))),
+        );
     }
 }

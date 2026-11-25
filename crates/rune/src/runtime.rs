@@ -36,14 +36,11 @@ use event_log::log_event;
 
 #[inline(always)]
 pub(crate) fn handler_state<S: 'static>(state: &mut S) -> &mut dyn Any {
-    #[cfg(feature = "hot")]
-    if std::any::TypeId::of::<S>() == std::any::TypeId::of::<crate::hot::HostState>() {
-        return (state as &mut dyn Any).downcast_mut::<crate::hot::HostState>().unwrap().value.as_mut();
-    }
     state
 }
 
-/// Calls an app's `poll` or `on_key`. With `rune/hot` it goes through subsecond's jump table,
+/// Calls an app's runtime callback (`poll`, `on_key`, `on_focus`, `on_mods`,
+/// `on_visibility`, `on_ime`). With `rune/hot` it goes through subsecond's jump table,
 /// so a patched body runs instead of the pointer captured at startup, and a panicking patch
 /// falls back to that pointer.
 macro_rules! app_call {
@@ -58,17 +55,13 @@ macro_rules! app_call {
 
 #[inline(always)]
 pub(crate) fn handler_state_ref<S: 'static>(state: &S) -> &dyn Any {
-    #[cfg(feature = "hot")]
-    if std::any::TypeId::of::<S>() == std::any::TypeId::of::<crate::hot::HostState>() {
-        return (state as &dyn Any).downcast_ref::<crate::hot::HostState>().unwrap().value.as_ref();
-    }
     state
 }
 
 pub(crate) mod driver;
 pub(crate) use driver::{AppDriver, AppRef, AppRefMut, RuntimeHooks, ViewDriver};
 
-mod anchor;
+pub(crate) mod anchor;
 mod api;
 mod commit;
 mod cx;
@@ -84,11 +77,14 @@ mod input;
 mod interaction;
 mod key_index;
 pub(crate) mod layout_read;
+mod layout_seed;
+pub use layout_seed::LayoutSeed;
 mod motion;
 mod node_index;
 use node_index::NodeIndex;
 mod paint;
 mod paint_probe;
+mod pick;
 mod playground;
 mod scroll;
 mod selection;
@@ -103,6 +99,7 @@ mod window_requests;
 mod zoom;
 
 pub(crate) use commit::memo_reuse;
+pub(crate) use commit::path as element_path;
 pub(crate) use commit::text_layout::{caret_index, text_width};
 pub(crate) use commit::why::CommitWhy;
 #[cfg(all(test, debug_assertions))]
@@ -120,8 +117,12 @@ pub use input::help_look::HelpLook;
 #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(unused_imports))]
 pub(crate) use input::physical::Unhandled;
 pub(crate) use input::titlebar::WindowMenu;
+#[cfg(target_os = "windows")]
+pub(crate) use input::titlebar::{DragHit, drag_hit_at};
 pub use input::touch::TouchPhase;
-#[cfg(target_os = "linux")]
+#[cfg_attr(not(target_arch = "wasm32"), allow(unused_imports))]
+pub(crate) use input::touch::{TouchHoldCommand, TouchHoldPolicy};
+#[cfg(any(target_os = "linux", test))]
 use input::primary_selection;
 use input::{
     app_ime, autoscroll, capture, drop as drop_dispatch, focus, focus_machine,
@@ -155,6 +156,8 @@ use paint::soft_edges::{in_fade, inherit_fade};
 pub(crate) use scroll::offset::{ScrollAnchor, ScrollRequest};
 pub(crate) use scroll::reveal::ScrollReveal;
 #[doc(hidden)]
+pub use commit::path::{child_path, path_segment};
+#[doc(hidden)]
 pub use scroll::watch::scroll_watch_state;
 #[cfg(not(target_os = "windows"))]
 pub(crate) use scroll::x::LINE_POINTS;
@@ -167,6 +170,8 @@ use scroll::{
 use scroll::drawn::PixelHold;
 use scroll::mode::ScrollMode;
 
+#[cfg(test)]
+pub(crate) use selection::links::count_span_box_queries;
 pub(crate) use selection::links::origin as text_origin;
 pub(crate) use selection::selectable;
 pub use selection::selectable::{SelectedText, SelectionChange, TextSelection};
@@ -180,13 +185,14 @@ pub(crate) use web::{a11y as web_a11y, export as web_export, page as web_page};
 pub(crate) use web::runtime as web_runtime;
 
 pub(crate) use anchor::anchor_position;
-use anchor::{anchor_index, anchor_index_live, step_up};
+use anchor::{anchor_ancestors, anchor_index, anchor_index_live, step_up};
 pub use cx::{Cx, Env, Waker, commit_generation};
 pub(crate) use cx::caret_of;
 use cx::COMMITS;
-pub use elements::{ElementInfo, Pick, Picked, Pose};
+pub use elements::{ElementInfo, MatchedHandover, Pose, ResolvedTextStyle};
+pub use pick::{Pick, Picked};
 #[cfg(debug_assertions)]
-pub(crate) use layout_read::window_read_key;
+pub(crate) use layout_read::{anchor_read_key, window_read_key};
 pub(crate) use turn::intersect;
 use turn::{Turn, compose_turn, open_turned_layer, screen_clip_of};
 pub(crate) use types::{AnimSource, Node};
@@ -207,9 +213,15 @@ mod line_clamp_tests;
 #[cfg(test)]
 mod aspect_fit_tests;
 #[cfg(test)]
+mod aspect_ratio_tests;
+#[cfg(test)]
 mod anchor_fit_tests;
 #[cfg(test)]
 mod drop_tests;
+#[cfg(test)]
+mod elements_tests;
+#[cfg(test)]
+mod any_handlers_tests;
 #[cfg(test)]
 mod on_key_tests;
 #[cfg(test)]
@@ -224,6 +236,10 @@ mod select_all_tests;
 mod selection_api_tests;
 #[cfg(test)]
 mod anchored_grow_tests;
+#[cfg(test)]
+mod languages_tests;
+#[cfg(test)]
+mod layout_seed_tests;
 #[cfg(test)]
 mod pixel_snap_tests;
 #[cfg(test)]
@@ -351,8 +367,10 @@ runtime_core_fields! {
 
     /// Per-frame hit-test lists built in paint order.
     hit: hit::HitState,
-    /// Two presses closer than this (seconds) are a double press: the system setting on macOS
-    /// and Windows, 0.5 elsewhere and headless.
+    /// Two presses closer than this (seconds) are a double press: the system setting on macOS,
+    /// Windows and Linux (XDG Settings portal `org.gnome.desktop.peripherals.mouse`
+    /// `double-click`, falling back to GSettings or `kdeglobals` `DoubleClickInterval`), 0.5
+    /// elsewhere and headless.
     pub double_click_interval: f64,
 
     /// Paint scratch buffers, reuse record, layer caches, text quads and paint outputs.

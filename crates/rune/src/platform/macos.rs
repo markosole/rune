@@ -6,15 +6,17 @@ use objc2::rc::Retained;
 use objc2_app_kit::{NSEvent, NSPanel, NSWindow, NSResponder, NSScreen, NSView};
 use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize};
 use crate::{KeyPolicy, OverlayInput, OverlayLevel, OverlayOptions, OverlaySupport};
-use std::{cell::{Cell, RefCell}, rc::Rc, time::Instant};
+use std::{cell::{Cell, RefCell}, rc::Rc};
 
 #[doc(hidden)]
 pub mod appearance;
 pub(crate) mod cursor;
+pub(crate) mod document;
 pub(crate) mod drop;
 mod geometry;
 mod hold;
 pub(crate) mod help;
+pub(crate) mod launch;
 #[doc(hidden)]
 pub mod panel_bridge;
 mod pointer;
@@ -29,11 +31,11 @@ pub(crate) use pointer::PointerState;
 pub(crate) use presentation::Prewarm;
 #[cfg(test)]
 pub(crate) use surface::layer_occluded;
-pub(crate) use surface::{PresumeShown, pin_contents_top_left, present_with_transaction, surface_occluded, window_occluded};
+pub(crate) use surface::{PresumeShown, flush_while_launching, launching, pin_contents_top_left, present_with_transaction, surface_occluded, sync_contents_scale, window_occluded};
 use geometry::{overlay_rect_on, screen_id};
 use pointer::MouseMonitors;
 use presence::Presence;
-use surface::occlusion_hidden;
+use surface::{apply_window_color_space, occlusion_hidden};
 
 #[allow(unsafe_code)]
 mod overlay_panel {
@@ -118,6 +120,37 @@ pub(crate) fn ns_window(window: &winit::window::Window) -> Option<Retained<NSWin
     content_view(window)?.window()
 }
 
+/// Whether `window` is an `NSPanel` instance (an overlay or an ordinary window adopted by
+/// `Panel::adopt_window`).
+#[allow(unsafe_code)]
+pub(crate) fn is_panel_object(window: &objc2::runtime::AnyObject) -> bool {
+    // SAFETY: `window` is a live ObjC instance; `isKindOfClass:` takes a `Class` and returns `BOOL`.
+    let panel: objc2::runtime::Bool = unsafe { msg_send![window, isKindOfClass: NSPanel::class()] };
+    panel.as_bool()
+}
+
+/// Whether `window`'s content view currently lives in an `NSPanel`.
+pub(crate) fn is_panel(window: &winit::window::Window) -> bool {
+    ns_window(window).is_some_and(|w| is_panel_object(&w))
+}
+
+/// Whether key-value observing (or another runtime subclass that hides itself from `-class`)
+/// sits on `object`. Placing a Rune per-instance subclass above KVO's crashes Foundation when
+/// an observer is removed.
+#[allow(unsafe_code)]
+pub(crate) unsafe fn kvo_observed(object: &objc2::runtime::AnyObject) -> bool {
+    // SAFETY: caller guarantees `object` is a live ObjC instance; `-class` takes no arguments.
+    let reported: &objc2::runtime::AnyClass = unsafe { msg_send![object, class] };
+    let actual = object.class();
+    !std::ptr::eq(reported, actual) || actual.name().to_bytes().starts_with(b"NSKVONotifying_")
+}
+
+/// Whether any class in `object`'s runtime superclass chain starts with `prefix`.
+pub(crate) fn has_subclass(object: &objc2::runtime::AnyObject, prefix: &[u8]) -> bool {
+    std::iter::successors(Some(object.class()), |c| c.superclass())
+        .any(|c| c.name().to_bytes().starts_with(prefix))
+}
+
 pub(crate) fn configure_window(window: &winit::window::Window, options: &crate::MacWindowOptions) {
     crate::platform::macos::appearance::install();
     if let Some(window) = ns_window(window) { configure_native(&window, options); }
@@ -127,13 +160,22 @@ pub(crate) fn configure_window(window: &winit::window::Window, options: &crate::
 fn configure_native(window: &NSWindow, options: &crate::MacWindowOptions) {
     if let Some(shadow) = options.shadow { window.setHasShadow(shadow); }
     if let Some(level) = options.level { window.setLevel(level); }
+    apply_window_color_space(window, options.color_space);
     // SAFETY: every caller runs on the AppKit main thread.
     unsafe {
+        // AppKit saves nothing of a window it could not restore (`launch::ignore_saved_windows`).
+        if launch::ignores_saved_windows() { let _: () = msg_send![window, setRestorable: false]; }
         if let Some(bits) = options.collection_behavior {
             let _: () = msg_send![window, setCollectionBehavior: bits];
         }
     }
     if let Some(exclude) = options.exclude_from_capture { set_sharing(window, exclude); }
+    if let Some(path) = options.represented_file.as_deref() {
+        document::apply_represented_file(window, Some(path), options.title_from_file, None);
+    }
+    if options.document_edited {
+        document::apply_document_edited(window, true);
+    }
 }
 
 /// `sharingType` none keeps the window out of captures; read-only lets recorders see it.
@@ -144,6 +186,11 @@ fn configure_native(window: &NSWindow, options: &crate::MacWindowOptions) {
 fn set_sharing(window: &NSWindow, exclude: bool) {
     // SAFETY: every caller runs on the AppKit main thread.
     unsafe { let _: () = msg_send![window, setSharingType: if exclude { 0usize } else { 1usize }]; }
+}
+
+/// Sets or clears capture exclusion on an ordinary macOS window.
+pub(crate) fn set_exclude_from_capture(window: &winit::window::Window, exclude: bool) {
+    if let Some(window) = ns_window(window) { set_sharing(&window, exclude); }
 }
 
 /// Orders a window front without making it key or activating the app.
@@ -161,12 +208,12 @@ pub(crate) struct Panel {
     pointer: Rc<PointerState>,
     options: OverlayOptions,
     follow_pointer: Cell<bool>,
-    pointer_poll: Cell<Option<Instant>>,
     /// Prewarmed, shown or fading, under one fence, and the requested capture exclusion,
     /// applied only while shown. While a fade runs the panel reads as visible, so a fading-out
     /// overlay can still draw its exit.
     presence: Rc<Cell<Presence>>,
     wake: Option<crate::Waker>,
+    ordinary: bool,
     panel: objc2::rc::Retained<objc2_app_kit::NSPanel>,
     window: objc2::rc::Retained<objc2_app_kit::NSWindow>,
     view: objc2::rc::Retained<objc2_app_kit::NSView>,
@@ -188,7 +235,7 @@ impl Panel {
 
     #[allow(unsafe_code)]
     fn adopt_kind(window: &winit::window::Window, at: crate::overlay::Placement, interactive: bool, options: &OverlayOptions, wake: Option<crate::Waker>, ordinary: bool) -> Option<Panel> {
-        use objc2_app_kit::{NSBackingStoreType, NSColor, NSWindowCollectionBehavior, NSWindowStyleMask};
+        use objc2_app_kit::{NSBackingStoreType, NSColor, NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask};
         let mtm = MainThreadMarker::new()?;
         crate::platform::macos::appearance::install();
         let view = content_view(window)?;
@@ -227,6 +274,8 @@ impl Panel {
         configure_native(&panel, &native);
         if ordinary {
             panel.setTitle(&ns_window.title());
+            panel.setTitleVisibility(ns_window.titleVisibility());
+            panel.setTitlebarAppearsTransparent(ns_window.titlebarAppearsTransparent());
             panel.setLevel(3);
             panel.setHasShadow(ns_window.hasShadow());
             panel.setContentMinSize(ns_window.contentMinSize());
@@ -239,6 +288,9 @@ impl Panel {
         if options.prewarm {
             panel.setAlphaValue(0.0);
             panel.setIgnoresMouseEvents(true);
+            // AppKit's default animation scales and fades an NSPanel in over ~280 ms on
+            // order-in; a prewarmed panel reveals cached pixels at once (or runs its own fade).
+            panel.setAnimationBehavior(NSWindowAnimationBehavior::None);
         }
         // defer:NO creates the WindowServer identity while hidden. Never publish a sentinel
         // (-1/0) cast to CGWindowID as a successful native creation.
@@ -254,7 +306,7 @@ impl Panel {
             return None;
         }
         panel.setDelegate(ns_window.delegate().as_deref());
-        Some(Panel { bridge, monitors: RefCell::new(None), pointer, options: options.clone(), follow_pointer: Cell::new(options.follow_pointer), pointer_poll: Cell::new(None), presence, wake, panel, window: ns_window, view })
+        Some(Panel { bridge, monitors: RefCell::new(None), pointer, options: options.clone(), follow_pointer: Cell::new(options.follow_pointer), presence, wake, ordinary, panel, window: ns_window, view })
     }
 
     /// On the primary screen (the one with the menu bar), in AppKit's bottom-left coordinates.
@@ -264,6 +316,37 @@ impl Panel {
             self.window.setFrame_display(rect, false);
             self.panel.setFrame_display(rect, true);
             if self.presence.get().visible() { self.pointer.observe(&self.panel, self.wake.as_ref()); }
+        }
+    }
+
+    /// Resizes the panel in place, keeping its top-left corner fixed (for a user-dragged overlay).
+    pub fn resize(&self, size: (f32, f32)) {
+        let mut rect = self.panel.frame();
+        let next = NSSize::new(f64::from(size.0), f64::from(size.1));
+        if rect.size == next { return; }
+        rect.origin.y += rect.size.height - next.height;
+        rect.size = next;
+        self.window.setFrame_display(rect, false);
+        self.panel.setFrame_display(rect, true);
+        if self.presence.get().visible() { self.pointer.observe(&self.panel, self.wake.as_ref()); }
+    }
+
+    /// Starts an interactive AppKit window drag on this panel from the current mouse-down event.
+    /// Shared by overlay panels (whose hidden source `NSWindow` does not bridge geometry, so the
+    /// source frame is synced here) and ordinary adopted panels (`Panel::adopt_window`, whose
+    /// `panel_bridge` already forwards `frame` and `performWindowDragWithEvent:` to this panel).
+    /// Returns whether the panel's frame moved during the drag.
+    pub fn drag_window(&self) -> bool {
+        let Some(mtm) = MainThreadMarker::new() else { return false };
+        let Some(event) = NSApplication::sharedApplication(mtm).currentEvent() else { return false };
+        let before = self.panel.frame();
+        self.panel.performWindowDragWithEvent(&event);
+        let after = self.panel.frame();
+        if after != before {
+            if !self.ordinary { self.window.setFrame_display(after, false); }
+            true
+        } else {
+            false
         }
     }
 
@@ -293,6 +376,11 @@ impl Panel {
 
     /// The panel's AppKit window level (`NSWindow.Level`), changeable while shown.
     pub fn set_level(&self, level: isize) { self.panel.setLevel(level); }
+
+    /// Applies `scheme` to this panel's `NSWindow.appearance`.
+    pub fn set_color_scheme(&self, scheme: crate::ColorScheme) {
+        crate::platform::macos::appearance::set_window_appearance(&self.panel, scheme);
+    }
 
     /// The moved view, for a new wgpu surface (winit's window handle would look for the view
     /// in winit's window, where it no longer is).
@@ -348,5 +436,69 @@ pub(crate) fn dock_badge(window: &winit::window::Window, count: u32) {
         let label = (total > 0).then(|| objc2_foundation::NSString::from_str(&total.to_string()));
         let label: *const objc2::runtime::AnyObject = label.as_deref().map_or(std::ptr::null(), |l| (l as *const objc2_foundation::NSString).cast());
         let _: () = msg_send![tile, setBadgeLabel: label];
+    }
+}
+
+#[cfg(test)]
+#[allow(unsafe_code)]
+pub(crate) mod test_pasteboard {
+    use objc2::rc::Retained;
+    use objc2::{class, msg_send};
+    use objc2_app_kit::{NSPasteboard, NSPasteboardItem};
+    use objc2_foundation::{NSArray, NSString};
+
+    /// A private named pasteboard, released globally when dropped.
+    pub(crate) struct Board(Retained<NSPasteboard>);
+
+    impl Drop for Board {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is a private named pasteboard created via `pasteboardWithName:` and released once on drop.
+            unsafe { msg_send![&*self.0, releaseGlobally] }
+        }
+    }
+
+    impl std::ops::Deref for Board {
+        type Target = NSPasteboard;
+        fn deref(&self) -> &NSPasteboard { &self.0 }
+    }
+
+    /// Creates a private named pasteboard unique to this call. `+[NSPasteboard pasteboardWithUniqueName]`
+    /// stamps names from `mach_absolute_time`, so parallel tests that start within one tick receive
+    /// the same `NSPasteboard` instance and overwrite each other's items.
+    fn create() -> Option<Board> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = NSString::from_str(&format!("dev.rune.test.{}.{n}", std::process::id()));
+        // SAFETY: `+[NSPasteboard pasteboardWithName:]` takes an `NSString` and returns a retained or
+        // nil `NSPasteboard`; the private pasteboard is released once in `Board::drop`.
+        let pb: Option<Retained<NSPasteboard>> = unsafe { msg_send![class!(NSPasteboard), pasteboardWithName: &*name] };
+        pb.map(Board)
+    }
+
+    /// Whether this session has a pasteboard server. A headless or SSH-only session (no window
+    /// server) has none, and `pasteboardWithName:` returns nil or refuses writes there, so tests
+    /// skip with a note instead of panicking.
+    pub(crate) fn available() -> bool {
+        static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *AVAILABLE.get_or_init(|| {
+            let probe = std::panic::catch_unwind(|| {
+                let Some(pb) = create() else { return false };
+                pb.clearContents();
+                let item = NSPasteboardItem::new();
+                let kind = NSString::from_str("public.utf8-plain-text");
+                item.setString_forType(&NSString::from_str("probe"), &kind)
+                    && pb.writeObjects(&NSArray::from_retained_slice(&[objc2::runtime::ProtocolObject::from_retained(item)]))
+                    && pb.stringForType(&kind).is_some_and(|s| s.to_string() == "probe")
+            });
+            let ok = probe.unwrap_or(false);
+            if !ok { eprintln!("macos: no pasteboard in this session (headless?); skipping pasteboard round-trip tests"); }
+            ok
+        })
+    }
+
+    /// A private named pasteboard unique to this call, or `None` without a pasteboard server.
+    pub(crate) fn unique() -> Option<Board> {
+        if !available() { return None; }
+        create()
     }
 }

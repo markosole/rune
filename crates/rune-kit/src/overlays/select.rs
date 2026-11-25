@@ -8,7 +8,7 @@
 
 use rune::{El, Icon, TextStyle, Tx, col, el, icon, row, text};
 
-use super::overlay::{Modal, Placement, content_key, dismissal, push_anchored_modal, scrim_key, trigger_key};
+use super::overlay::{Modal, Placement, content_key, dismissal, dismissal_tx, push_anchored_modal, scrim_key, trigger_key};
 use super::popover::fit_scroll_bar;
 use crate::{Kit, State, over};
 
@@ -26,6 +26,22 @@ pub enum SelectAppearance {
 }
 
 type Choose = Box<dyn Fn(&str) -> Box<dyn FnOnce(El) -> El>>;
+type StepClosed = Box<dyn FnOnce(El, Vec<String>, Option<String>) -> El>;
+
+/// Previous or next option in `options` while a select is closed, clamping at both ends.
+/// When `current` is absent (or no longer in `options`), Down picks the first and Up the last.
+fn step_option<'a>(options: &'a [String], current: Option<&str>, down: bool) -> Option<&'a str> {
+    if options.is_empty() {
+        return None;
+    }
+    let next = match current.and_then(|c| options.iter().position(|o| o == c)) {
+        Some(i) if down => (i + 1).min(options.len() - 1),
+        Some(i) => i.saturating_sub(1),
+        None if down => 0,
+        None => options.len() - 1,
+    };
+    Some(options[next].as_str())
+}
 
 /// `Select::new("fruit", &FRUITS).current(s.fruit.as_deref()).open(..).on_choose(|s, v| ..)`.
 pub struct Select {
@@ -37,12 +53,14 @@ pub struct Select {
     placeholder: String,
     name: Option<String>,
     open: bool,
+    step_closed: bool,
     invalid: bool,
     state: State,
     appearance: SelectAppearance,
     highlighted: Option<String>,
     placement: Placement,
     choose: Option<Choose>,
+    step_key: Option<StepClosed>,
     toggle: Option<Box<dyn FnOnce(El) -> El>>,
     dismiss: Option<(El, Modal)>,
 }
@@ -58,12 +76,14 @@ impl Select {
             placeholder: String::new(),
             name: None,
             open: false,
+            step_closed: false,
             invalid: false,
             state: State::Rest,
             appearance: SelectAppearance::Inline,
             highlighted: None,
             placement: Placement::BottomEnd,
             choose: None,
+            step_key: None,
             toggle: None,
             dismiss: None,
         }
@@ -102,6 +122,28 @@ impl Select {
         self.open = o;
         self
     }
+    /// Step through options with Up and Down while the select is closed, calling
+    /// [`Self::on_choose`] without opening the popup (matching Chromium and Windows native
+    /// `<select>` behaviour).
+    ///
+    /// Defaults to `false`, where Up and Down open the popup (AppKit `NSPopUpButton`). When
+    /// enabled, Up and Down clamp at the first and last option, start from the first option on
+    /// Down or last option on Up when [`Self::current`] is `None`, and leave `Alt+Down`, Space,
+    /// and pointer press opening the popup as usual.
+    ///
+    /// ```
+    /// use rune_kit::Select;
+    ///
+    /// struct App { theme: String, open: bool }
+    /// let _select = Select::new("theme", &["System", "Light", "Dark"])
+    ///     .current(Some("Light"))
+    ///     .step_closed(true)
+    ///     .on_choose(|s: &mut App, v: &str, _| s.theme = v.to_owned());
+    /// ```
+    pub fn step_closed(mut self, enabled: bool) -> Self {
+        self.step_closed = enabled;
+        self
+    }
     pub fn invalid(mut self, i: bool) -> Self {
         self.invalid = i;
         self
@@ -134,16 +176,65 @@ impl Select {
         self.toggle = Some(Box::new(move |e: El| e.on_press(f)));
         self
     }
+    /// [`Self::on_toggle`] whose callback receives the change's [`Tx`], so opening or closing
+    /// can focus, scroll, or announce in the same commit.
+    ///
+    /// ```
+    /// use rune::Tx;
+    /// use rune_kit::Select;
+    ///
+    /// struct App { open: bool }
+    /// let _select = Select::new("fruit", &["Apple", "Pear"]).on_toggle_tx(|s: &mut App, tx: &mut Tx| {
+    ///     s.open = !s.open;
+    ///     tx.instant();
+    /// });
+    /// ```
+    pub fn on_toggle_tx<S: 'static>(mut self, f: impl Fn(&mut S, &mut Tx) + 'static) -> Self {
+        self.toggle = Some(Box::new(move |e: El| e.on_press_tx(f)));
+        self
+    }
     /// Presses outside and Escape close the listbox. While open it holds keyboard focus.
     pub fn on_close<S: 'static>(mut self, f: impl Fn(&mut S) + 'static) -> Self {
         self.dismiss = Some(dismissal(scrim_key(&self.key), f));
         self
     }
-    /// Choosing an option: `f(state, option)`.
+    /// [`Self::on_close`] whose callback receives the change's [`Tx`], so closing on an outside
+    /// press or Escape can focus, scroll, or announce in the same commit.
+    ///
+    /// ```
+    /// use rune::Tx;
+    /// use rune_kit::Select;
+    ///
+    /// struct App { open: bool }
+    /// let _select = Select::new("fruit", &["Apple", "Pear"]).on_close_tx(|s: &mut App, tx: &mut Tx| {
+    ///     s.open = false;
+    ///     tx.focus("after", true);
+    /// });
+    /// ```
+    pub fn on_close_tx<S: 'static>(mut self, f: impl Fn(&mut S, &mut Tx) + 'static) -> Self {
+        self.dismiss = Some(dismissal_tx(scrim_key(&self.key), f));
+        self
+    }
+    /// Choosing an option: `f(state, option, tx)`.
     pub fn on_choose<S: 'static>(mut self, f: impl Fn(&mut S, &str, &mut Tx) + Clone + 'static) -> Self {
+        let step = f.clone();
         self.choose = Some(Box::new(move |v: &str| {
             let (f, v) = (f.clone(), v.to_owned());
             Box::new(move |e: El| e.on_press_tx(move |s: &mut S, tx: &mut Tx| f(s, &v, tx)))
+        }));
+        self.step_key = Some(Box::new(move |e: El, options: Vec<String>, current: Option<String>| {
+            e.on_key(move |s: &mut S, ev: &rune::KeyEvent, tx: &mut Tx| {
+                if ev.mods != rune::Mods::default() || !matches!(ev.key, rune::Key::Up | rune::Key::Down) {
+                    return false;
+                }
+                let Some(next) = step_option(&options, current.as_deref(), ev.key == rune::Key::Down) else {
+                    return true;
+                };
+                if current.as_deref() != Some(next) {
+                    step(s, next, tx);
+                }
+                true
+            })
         }));
         self
     }
@@ -155,7 +246,9 @@ impl Select {
     }
 
     pub fn build(mut self, k: &Kit, layer: &mut Vec<El>) -> El {
-        let trigger = self.field(k);
+        let trigger = self.field(k)
+            .has_popup(rune::HasPopup::Listbox)
+            .controls(content_key(&self.key));
         if self.state == State::Disabled || !self.open {
             return trigger;
         }
@@ -217,18 +310,22 @@ impl Select {
             list = list.child(item);
             after_item = true;
         }
+        let name = self.name.clone().unwrap_or_else(|| self.placeholder.clone());
         let content = k.elevate(
             col()
                 .key(content_key(&self.key))
-                // Modal, so a reader hears a dialog: it's named as the select is.
-                .label(self.name.clone().unwrap_or_else(|| self.placeholder.clone()))
+                .role("listbox")
+                .label(name)
+                .focus_group()
                 .focus_return(&anchor_key)
                 .min_w(160.0)
                 .max_w(368.0)
+                .max_h(LISTBOX_MAX_HEIGHT)
+                .min_h(0.0)
+                .shrink()
                 .radius(6.0)
                 .fill(c.layer_01)
-                .child(col().key("listbox").role("listbox").label(self.name.clone().unwrap_or_else(|| self.placeholder.clone()))
-                    .focus_group().max_h(LISTBOX_MAX_HEIGHT).min_h(0.0).shrink().child(fit_scroll_bar(k, &self.key, list))),
+                .child(fit_scroll_bar(k, &self.key, list)),
             &k.elevation.floating,
         );
         push_anchored_modal(k, layer, self.dismiss, content, &anchor_key, self.placement, 2.0);
@@ -315,6 +412,10 @@ impl Select {
         }
         if let Some(f) = self.toggle.take() {
             trigger = f(trigger);
+        }
+        if self.step_closed && !self.open && let Some(step) = self.step_key.take() {
+            let options: Vec<String> = self.options.iter().map(|(_, o)| o.clone()).collect();
+            trigger = step(trigger, options, self.current.clone());
         }
         trigger
     }

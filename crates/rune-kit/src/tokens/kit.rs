@@ -186,6 +186,7 @@ pub struct Type {
     /// The older text-12 (descriptions).
     pub text_xsmall: TextStyle,
     pub text_xsmall_medium: TextStyle,
+    /// Monospace copy (code, ids, hashes): 12 / 18 in the mono slot (`ui-monospace` by default on native, `IBM Plex Mono` on web).
     pub mono: TextStyle,
 }
 
@@ -222,7 +223,7 @@ pub struct Motion {
     pub control: Spring,
     /// Overlays opening and closing (popover, menu, tooltip): ~120–150 ms.
     pub overlay: Spring,
-    /// Disclosure height changes (accordion, collapsible).
+    /// Disclosure transitions (shell `SplitView` panes via `PaneMotion`, and `SidebarSection` collapse/expand).
     pub disclosure: Spring,
 }
 

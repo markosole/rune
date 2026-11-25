@@ -1,6 +1,21 @@
-//! Element inspection (`Runtime::elements`, `presented`, `presented_pose`) and point picking
-//! (`Runtime::element_at`, `contains`, `find`).
+//! Element inspection (`Runtime::elements`, `presented`, `presented_pose`, `find`,
+//! `text_offset_at`). Point picking lives in `runtime/pick.rs`.
 use super::*;
+
+/// Resolved typography of a text element ([`ElementInfo::text_style`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedTextStyle {
+    /// The font family actually used after CSS family-list fallback (from the first visible
+    /// shaped run, or the first available family in the stack for empty or secure text).
+    pub family: Option<String>,
+    pub size: f32,
+    pub weight: f32,
+    /// Resolved line height in points ([`TextStyle::line_px`](crate::tok::TextStyle::line_px),
+    /// `1.25 * size` when auto).
+    pub line_height: f32,
+    pub tracking: f32,
+    pub italic: bool,
+}
 
 /// What tools see of one element.
 #[derive(Clone, Debug)]
@@ -32,7 +47,30 @@ pub struct ElementInfo {
     pub blur: f32,
     pub radius: f32,
     pub fill: Color,
+    /// Presented border colour, when this element has a non-zero border width.
+    pub border_color: Option<Color>,
     pub text_color: Option<Color>,
+    /// Resolved typography for text, rich text and text input elements.
+    pub text_style: Option<ResolvedTextStyle>,
+    /// Padding plus border `[left, top, right, bottom]` in window points: text draws inside it.
+    pub inset: [f32; 4],
+    /// Laid-out text `[width, height]` in window points (`None` for non-text elements and secure text).
+    pub text_size: Option<[f32; 2]>,
+    /// Whether this text element wraps lines ([`El::wrap`]).
+    pub wrap: bool,
+    /// Whether this text element truncates or line-clamps on purpose
+    /// ([`El::truncate`], [`El::truncate_fade`], or [`El::max_lines`]).
+    pub truncate: bool,
+    /// Whether truncation or line clamping cut or faded the text on the last frame
+    /// (`false` for secure text).
+    pub text_cut: bool,
+    /// Whether this element clips its descendants (a scroll viewport,
+    /// [`El::clip_soft`]/[`El::clip_rounded`]/[`El::clip_corners`]/[`El::clip_fade`], or an active scene mask).
+    pub clips: bool,
+    /// Axes this element scrolls along (`[x, y]`).
+    pub scroll_axes: [bool; 2],
+    /// Whether this element paints above siblings ([`El::raise`]).
+    pub raised: bool,
     pub hover: f32,
     pub press: f32,
     pub moving: bool,
@@ -64,6 +102,9 @@ pub struct ElementInfo {
     pub drag_out: bool,
     /// Its tooltip and accessibility help ([`El::help`]).
     pub help: Option<String>,
+    /// Its explicit accessibility description ([`El::description`], [`El::description_static`]),
+    /// omitting empty strings. Separate from [`Self::help`].
+    pub description: Option<String>,
     /// The part of this [`El::selectable`] text that is selected, as copying would take it.
     pub selected: Option<String>,
     /// Its outline depth ([`El::level`]).
@@ -76,39 +117,25 @@ pub struct ElementInfo {
     /// where scrolling put it this frame, in points: down for a stuck header, up for a stuck
     /// footer, right for a stuck left element, 0 when it isn't stuck. `rect` already includes it.
     pub stuck: f32,
+    /// True when this visible [`El::system_material`](crate::El::system_material) element
+    /// exceeded the window's native material cap ([`App::max_native_materials`](crate::App::max_native_materials),
+    /// default [`MAX_NATIVE_MATERIALS`](crate::MAX_NATIVE_MATERIALS)) on the last frame and drew
+    /// its fallback fill instead.
+    pub material_fallback: bool,
 }
 
-/// An element [`Runtime::element_at`] found.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Picked {
-    path: String,
-    key: Option<String>,
-}
-
-/// Options for [`Runtime::element_at_with`] and its siblings. Fields are private, so options can
-/// be added without breaking callers; `Pick::default()` is [`Runtime::element_at`]'s behaviour.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Pick {
-    transparent: bool,
-}
-
-impl Pick {
-    pub fn new() -> Self { Self::default() }
-
-    /// Also find elements whose own or inherited opacity is 0, as a design canvas does to
-    /// select an invisible layer. Exiting elements are skipped either way, and so are hidden
-    /// or unmounted ones.
-    pub fn transparent(mut self, on: bool) -> Self {
-        self.transparent = on;
-        self
-    }
-}
-
-impl Picked {
-    /// Its path in the element tree (as [`ElementInfo::path`]).
-    pub fn path(&self) -> &str { &self.path }
-    /// Its key ([`El::key`]), if it has one.
-    pub fn key(&self) -> Option<&str> { self.key.as_deref() }
+/// One `El::matched` handover completed on the last frame: `from` left the tree at `from_rect`
+/// as `to` took over on the same frame at `to_rect`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MatchedHandover {
+    /// Element tree path of the leaving source (`ElementInfo::path`).
+    pub from: String,
+    /// Element tree path of the arriving target (`ElementInfo::path`).
+    pub to: String,
+    /// Drawn rect `[x, y, w, h]` of `from` on its last frame, in window points.
+    pub from_rect: [f32; 4],
+    /// Drawn rect `[x, y, w, h]` of `to` on the handover frame, in window points.
+    pub to_rect: [f32; 4],
 }
 
 /// What an element presents beyond its rect and opacity, as of the last frame
@@ -151,7 +178,7 @@ impl types::TreeState {
         self.nodes.iter().enumerate().filter(|&(i, n)| {
             let v = &n.vis;
             !parents[i] && n.text.is_none() && n.input.is_none() && !n.focus.enabled && n.material.is_none()
-                && v.fill.a == 0.0 && (v.border_width() == 0.0 || v.border().a == 0.0 && v.border_bottom.is_none_or(|c| c.a == 0.0))
+                && v.fill.a == 0.0 && (v.border_width() == 0.0 || v.border().a == 0.0 && v.border_bottom.is_none_or(|c| c.a == 0.0) && n.focus.border.is_none_or(|c| c.a == 0.0))
                 && v.shadows.is_empty() && v.surface.is_none() && v.icon.is_none() && v.gradient.is_none() && v.radial.is_none()
                 && v.outline.is_none() && v.shape.is_none() && v.grid.is_none() && v.pixels.is_none() && v.effect.is_none()
                 && v.hover().a == 0.0 && v.press().a == 0.0
@@ -203,18 +230,35 @@ impl RuntimeCore {
         }
     }
 
+    /// `El::matched` handovers completed on the last frame, with both drawn rects in window points.
+    pub fn matched_handovers(&self) -> Vec<MatchedHandover> {
+        self.motion.handovers().iter().map(|h| {
+            let to_rect = self.tree.node_index.get(&h.to_id)
+                .and_then(|&i| self.paint.drawn.get(i).copied())
+                .unwrap_or(h.start_rect);
+            MatchedHandover {
+                from: h.from_path.clone(),
+                to: h.to_path.clone(),
+                from_rect: h.from_rect,
+                to_rect,
+            }
+        }).collect()
+    }
+
     pub fn elements(&self) -> Vec<ElementInfo> {
+        #[cfg(test)]
+        ELEMENTS_BUILDS.with(|c| c.set(c.get() + 1));
         fn intent(n: &Node) -> u32 {
             n.live.iter().filter(|b| b.enter.is_none()).fold(0, |bits, b| bits | match b.property {
                 crate::live::Property::Offset => 1,
-                crate::live::Property::Scale | crate::live::Property::Rect => 1 | 2,
+                crate::live::Property::Scale | crate::live::Property::Rotation | crate::live::Property::Rect => 1 | 2,
                 crate::live::Property::Opacity => 4,
                 _ => 0,
             })
         }
         let store = self.scene.store();
         let animating = |id: NodeId| store.is_animating(id, prop::FRAME) || store.is_animating(id, prop::TRAVEL)
-            || store.is_animating(id, prop::PRESENCE) || store.is_animating(id, prop::OFFSET) || store.is_animating(id, prop::SCALE) || store.is_animating(id, P_PRESS_SCALE)
+            || store.is_animating(id, prop::PRESENCE) || store.is_animating(id, prop::OFFSET) || store.is_animating(id, prop::SCALE) || store.is_animating(id, P_PRESS_SCALE) || store.is_animating(id, P_PRESS_OX) || store.is_animating(id, P_PRESS_OY)
             || store.is_animating(id, P_SCALE) || store.is_animating(id, prop::ROTATION) || paint_pose_springing(store, id)
             || (!self.reduced_motion && self.motion.loop_active(id, store.node_time(id)));
         let sel_ranges = self.selection_ranges();
@@ -257,7 +301,7 @@ impl RuntimeCore {
                 if let Some(gi) = up(Some(i)).find(|&j| self.tree.nodes[j].vis.group_opacity.is_some()) {
                     let group = up(self.tree.nodes[gi].parent)
                         .map(|pi| &self.tree.nodes[pi])
-                        .find(|g| g.vis.hover().a > 0.0 || g.vis_flags.hover_group());
+                        .find(|g| g.vis.tracks_hover_paint() || g.vis_flags.hover_group());
                     if group.and_then(|g| g.hover_motion()).is_some_and(|(e, x)| [e, x].iter().any(|a| matches!(a.curve, rune_motion::Curve::Instant))) {
                         live_intent |= 4 | 16;
                     }
@@ -265,11 +309,18 @@ impl RuntimeCore {
                 // Offsets are in points inside the scroll viewport; `rect` is in the window, after
                 // every scale and turn above. Below a lift (a flight or launch drawn over the
                 // window), the scales holding still above it carry them, unturned.
-                let mut lifted = None;
+                let mut lifted: Option<(f32, u32)> = None;
                 let mut j = i;
+                let mut steps = 0usize;
                 loop {
                     let to_window = |at: Option<usize>, v: [f32; 2]| match lifted {
-                        Some(k) => v.map(|c| c * k),
+                        Some((k, turn)) => {
+                            let [x, y] = v.map(|c| c * k);
+                            match turn.checked_sub(1).and_then(|t| self.paint.turn_scratch.get(t as usize)) {
+                                Some(t) => [t.mat[0] * x + t.mat[1] * y, t.mat[2] * x + t.mat[3] * y],
+                                None => [x, y],
+                            }
+                        }
                         None => at.map_or(v, |at| self.content_to_window(at, v)),
                     };
                     if j != i && let Some(st) = self.scroll.scrolls.get(&self.tree.nodes[j].id) {
@@ -286,8 +337,14 @@ impl RuntimeCore {
                         scrolled = [scrolled[0] - fix[0] * k, scrolled[1] - fix[1] * k];
                     }
                     if lifted.is_none() && self.motion.flying.iter().any(|f| f.0 == id) {
-                        lifted = Some(parent.and_then(|p| self.paint.inh_scratch.get(p)).map_or(1.0, |h| h.still.0));
+                        let is_launch = self.motion.launches().launched(id);
+                        let in_place = self.tree.nodes[j].vis.flight_in_place && !is_launch;
+                        lifted = Some(parent.and_then(|p| self.paint.inh_scratch.get(p)).map_or((1.0, 0), |h| {
+                            (if is_launch { h.still.0 } else { h.held.0 }, if in_place { h.turn } else { 0 })
+                        }));
                     }
+                    steps += 1;
+                    if steps >= self.tree.nodes.len() { break; }
                     let Some(pi) = step_up(&self.tree.nodes, j) else { break };
                     let p = &self.tree.nodes[pi];
                     moving |= animating(p.id)
@@ -299,11 +356,24 @@ impl RuntimeCore {
                     j = pi;
                 }
                 let secure = n.is_secure();
+                let text_size = (!secure).then(|| {
+                    let spec = n.text.as_deref()?;
+                    if let (Some(r), Some((_, at))) = (&n.run_layout, &spec.cold.advance_in)
+                        && let Some(w) = r.advance(*at, s)
+                    {
+                        return Some([w, crate::text::spec_height(&r.layout, spec.style, s, spec.exact_lines) / s]);
+                    }
+                    let laid = n.text_layout.as_ref()?;
+                    let l = laid.view();
+                    let w = text_width(if spec.wrap { l.width() } else { l.full_width() }) / s;
+                    let h = l.spec_height(spec.style, s, spec.exact_lines) / s;
+                    Some([w, h])
+                }).flatten();
                 Some(ElementInfo {
                     trace_name: n.trace_name,
                     trace_namespace: n.trace_namespace,
                     loop_phase: self.motion.loop_track(n.id).map(|l| {
-                        if self.reduced_motion && !matches!(n.looping.as_ref().map(|s| s.kind), Some(rune_motion::LoopKind::Sequence(_))) { 0.0 }
+                        if self.reduced_motion && !l.is_finite() { 0.0 }
                         else { l.phase(self.scene.store().node_time(n.id)) }
                     }),
                     focusable: self.can_focus(i),
@@ -327,8 +397,35 @@ impl RuntimeCore {
                     blur: if flight.is_some() { 0.0 } else { self.paint.inh_scratch.get(i).map_or(p.blur, |h| h.blur) },
                     radius: p.radius.0[0],
                     fill: self.color(n.id, P_FILL, n.vis.fill),
+                    border_color: (n.vis.border_width() > 0.0).then(|| self.color(n.id, P_BORDER, n.vis.border())),
                     text_color: paint_tracks::text_color(n)
                         .map(|c| paint_tracks::group_tint(n, self.color(n.id, P_TEXT, c), self.paint.inh_scratch.get(i).map_or(0.0, |h| h.group))),
+                    text_style: n.text.as_deref().map(|spec| {
+                        let family = if secure {
+                            self.text.resolved_family(spec.style.family)
+                        } else {
+                            n.text_layout
+                                .as_ref()
+                                .and_then(crate::text::resolved_family_of)
+                                .or_else(|| self.text.resolved_family(spec.style.family))
+                        };
+                        ResolvedTextStyle {
+                            family,
+                            size: spec.style.size,
+                            weight: spec.style.weight,
+                            line_height: spec.style.line_px(),
+                            tracking: spec.style.tracking,
+                            italic: spec.style.italic,
+                        }
+                    }),
+                    inset: n.inset,
+                    text_size,
+                    wrap: n.text.as_ref().is_some_and(|t| t.wrap),
+                    truncate: n.text.as_ref().is_some_and(|t| t.truncate || t.truncate_fade || t.max_lines > 0),
+                    text_cut: !secure && n.text_cut(s),
+                    clips: n.scroll.is_some() || n.vis.clip.is_some() || n.vis.clip_radius.is_some() || !p.mask.is_none(),
+                    scroll_axes: [n.scroll.is_some() && n.scroll_axes.x(), n.scroll.is_some() && n.scroll_axes.y()],
+                    raised: n.vis_flags.raise(),
                     hover: if (n.focus.highlight.is_some() && self.highlight_visible(i)) || (n.focus.fill.is_some() && self.focus_ring_visible(i)) { 1.0 }
                         else { self.scene.get(n.id, P_HOVER).unwrap_or(0.0) },
                     press: self.scene.get(n.id, P_PRESS).unwrap_or(0.0),
@@ -344,6 +441,7 @@ impl RuntimeCore {
                     edit_range: n.input.as_ref().filter(|inp| inp.edit.focused && !inp.edit.is_secure()).map(|inp| [inp.edit.anchor, inp.edit.focus]),
                     drag_out: n.handlers.drag_out.is_some(),
                     help: n.help.as_deref().filter(|_| !n.help_cut || n.text_cut(s)).map(|h| crate::el::help_words(h).into_owned()),
+                    description: n.a11y.more.as_deref().and_then(|m| m.description.as_deref()).filter(|d| !d.is_empty()).map(str::to_owned),
                     selected: n.text.as_ref().filter(|t| t.selectable && !secure).and_then(|t| {
                         let (a, b) = selectable::range_in(&sel_ranges, i)?;
                         t.copy_slice(a as u32, b as u32)
@@ -352,6 +450,7 @@ impl RuntimeCore {
                     expanded: n.a11y.expanded,
                     item_selected: n.focus.selected,
                     stuck: self.scroll.stuck.get(i).copied().unwrap_or(0.0),
+                    material_fallback: self.paint.material_fallback(n.id),
                     virtual_extent: self.commit.virtuals.contains_key(&n.path) && n.vis.fill.a == 0.0
                         && n.vis.border_width() == 0.0 && n.vis.shadows.is_empty() && n.text.is_none() && n.vis.icon.is_none(),
                 })
@@ -369,12 +468,13 @@ impl RuntimeCore {
                 focusable: false, focused: false, focus_visible: false, inert: true, exiting: false,
                 key: Some(path.clone()), path, role: "text", label: None, text: None,
                 rect: [r.x, r.y, r.w, r.h], target: [t.x, t.y, t.w, t.h],
-                opacity: f.source_alpha, scale: 1.0, blur: 0.0, radius: 0.0, fill: Color::TRANSPARENT, text_color: None,
+                opacity: f.source_alpha, scale: 1.0, blur: 0.0, radius: 0.0, fill: Color::TRANSPARENT, border_color: None, text_color: None, text_style: None,
+                inset: [0.0; 4], text_size: None, wrap: false, truncate: false, text_cut: false, clips: false, scroll_axes: [false, false], raised: false,
                 hover: 0.0, press: 0.0, moving: true, parent: None,
                 visible: [r.x.max(c[0]), r.y.max(c[1]), (r.edges()[2].min(c[2]) - r.x.max(c[0])).max(0.0),
                     (r.edges()[3].min(c[3]) - r.y.max(c[1])).max(0.0)],
                 revealing: true, in_growing_row: false, scrolling: false, scrolled: [0.0; 2], virtual_extent: false, live_intent: 0, caret: None, edit_range: None, drag_out: false,
-                help: None, selected: None, level: None, expanded: None, item_selected: false, stuck: 0.0,
+                help: None, description: None, selected: None, level: None, expanded: None, item_selected: false, stuck: 0.0, material_fallback: false,
             });
         }
         self.link_elements(&mut elements);
@@ -408,95 +508,112 @@ impl RuntimeCore {
         let r = self.paint.drawn.get(i).copied()?;
         Some((r[0] + r[2] * 0.5, r[1] + r[3] * 0.5))
     }
+    /// Where a script event aimed at `key` lands, in points: the centre of the part of the element
+    /// that is shown, its drawn box inside its ancestors' clips and the window. An element taller
+    /// than its scroll viewport, or partly scrolled out, is hit where it can be seen and not at a
+    /// centre that lies outside the window. `Err` names the key, its box and what is shown of the
+    /// window when no part of the element is shown: an event sent there reaches nothing, and the
+    /// script would end as if it had acted. A link or highlight keyed `key`, and an element in a
+    /// rotated subtree, keep [`Runtime::find`]'s point.
+    pub(crate) fn find_shown(&self, key: &str) -> Result<(f32, f32), String> {
+        let Some(i) = self.live_named(None, key) else {
+            return self.find_link(key).or_else(|| self.find_highlight(key)).ok_or_else(|| format!("no element with key {key:?}"));
+        };
+        let Some(r) = self.paint.drawn.get(i).copied() else { return Err(format!("no element with key {key:?}")) };
+        if self.paint.inh_scratch.get(i).is_some_and(|h| h.turn != 0) {
+            return Ok((r[0] + r[2] * 0.5, r[1] + r[3] * 0.5));
+        }
+        let edges = [r[0], r[1], r[0] + r[2], r[1] + r[3]];
+        let clip = self.tree.nodes[i].parent.and_then(|p| self.paint.inh_scratch.get(p)).map_or(NO_CLIP, |h| h.clip).map(|v| v / self.env.scale);
+        let window = [0.0, 0.0, self.viewport.0, self.viewport.1];
+        let shown = intersect(intersect(edges, clip), window);
+        // An element with no width or height of its own (an anchor) is shown when its line is.
+        let across = shown[2] > shown[0] || (r[2] == 0.0 && shown[2] >= shown[0]);
+        let down = shown[3] > shown[1] || (r[3] == 0.0 && shown[3] >= shown[1]);
+        if across && down {
+            return Ok(((shown[0] + shown[2]) * 0.5, (shown[1] + shown[3]) * 0.5));
+        }
+        let within = intersect(clip, window);
+        Err(format!(
+            "the element with key {key:?} is not shown: its box [{}, {}, {}, {}] (x, y, width, height) lies outside what is drawn of the window [{}, {}, {}, {}]; scroll it into view first, or aim at a point with \"x\" and \"y\"",
+            r[0], r[1], r[2], r[3], within[0], within[1], (within[2] - within[0]).max(0.0), (within[3] - within[1]).max(0.0),
+        ))
+    }
 
     /// Drawn rect `[x, y, w, h]` in points and effective opacity (ancestors included) of the
-    /// element keyed `key`, exiting or not, as of the last frame.
+    /// element keyed `key` (or key path such as `card-2/title`), exiting or not, as of the last
+    /// frame.
     pub fn presented(&self, key: &str) -> Option<([f32; 4], f32)> {
-        let i = self.tree.index_of_key(key)?;
+        let i = self.tree.selects_index(key)?;
         Some((*self.paint.drawn.get(i)?, self.paint.inh_scratch.get(i)?.opacity))
     }
 
-    /// The topmost element drawn at window point (`x`, `y`) in points, as of the last frame: the
-    /// point is tested against each element's drawn box the way a press is, through `El::rotate`,
-    /// `El::scale`, `El::origin`, offsets and scrolling, and inside its ancestors' clips
-    /// (including a turned ancestor's clip), in paint order (so `El::raise`, sticky and flying
-    /// elements count). Unlike a press, it also finds elements with no handlers, and it ignores
-    /// `El::inert` and modals, so a press can land on a different element than this returns.
-    /// Elements that are exiting or fully transparent are skipped (see [`Runtime::element_at_with`] to include transparent ones). `El::hit`, which marks native
-    /// overlay input, makes no difference, and overlay panels outside the window are not
-    /// considered. An element is not cut by its own clip, only by its ancestors'. This is box
-    /// geometry, not pixel/alpha picking: a box with no fill remains pickable (as an invisible
-    /// input area does), and rounded corners and soft clip fades do not trim its hit box.
-    /// Running handlers can use [`Tx::element_at`] without holding a `Runtime`.
-    pub fn element_at(&self, x: f32, y: f32) -> Option<Picked> {
-        self.element_at_with(x, y, Pick::default())
+    /// Authored key of the non-exiting presented focused element, or the focused inline link's
+    /// id, matching `self.elements().into_iter().find(|e| e.focused && !e.exiting).and_then(|e| e.key)`
+    /// without building the inspection list.
+    pub fn presented_focus_key(&self) -> Option<&str> {
+        let path = self.kbd.focus.path()?;
+        let (i, n) = self.tree.nodes.iter().enumerate().find(|&(i, n)| {
+            n.path == path && !self.subtree_exiting(i) && self.scene.presented(n.id).is_some()
+        })?;
+        if let Some(spec) = n.text.as_ref().filter(|t| !t.cold.links.is_empty()) {
+            let k = self.edit.link_focus()?;
+            let link = spec.cold.links.get(k)?;
+            return (!self.link_boxes_for(i, k, self.drawn_box(i)).is_empty())
+                .then_some(link.id.as_str());
+        }
+        n.key.as_deref()
     }
 
-    /// [`Runtime::element_at`] with options: [`Pick::transparent`] also finds fully
-    /// transparent elements (exiting ones stay skipped).
-    pub fn element_at_with(&self, x: f32, y: f32, pick: Pick) -> Option<Picked> {
-        self.element_at_within(None, x, y, pick)
+    /// UTF-8 byte offset in the text or text field named `key` (a key or key path, as
+    /// [`Runtime::find`] resolves it) under window point (`x`, `y`) in points, as of the last
+    /// presented frame, following `El::scale`, `El::rotate`, scrolling and single-line field
+    /// horizontal scroll. Returns `None` when `key` is missing, exiting, not a text or text
+    /// field, or secure, or when `x` or `y` is not finite. Running handlers can use
+    /// [`Tx::text_offset_at`](crate::Tx::text_offset_at) without holding a `Runtime`.
+    pub fn text_offset_at(&self, key: &str, x: f32, y: f32) -> Option<usize> {
+        if !x.is_finite() || !y.is_finite() { return None; }
+        let i = self.live_named(None, key)?;
+        let n = &self.tree.nodes[i];
+        if n.is_secure() { return None; }
+        if let Some(inp) = n.input.as_deref() {
+            let laid = n.text_layout.as_ref()?;
+            let [tx, ty] = self.input_text_point(i, x, y)?;
+            return Some(input_click::hit(&inp.edit, laid.view(), tx, ty, self.env.scale, inp.single_line).caret);
+        }
+        self.text_index_at(i, x, y)
     }
 
     pub(super) fn run_pick_reads(&mut self, app: &mut dyn AppDriver, tx: &mut Tx) {
+        let mut elements: Option<Vec<ElementInfo>> = None;
         for read in std::mem::take(&mut tx.pick_reads) {
-            let picked = self.element_at_within(read.within.as_deref(), read.x, read.y, read.pick);
-            if let Some(f) = read.take() {
-                f(app.states(), picked, tx);
-                self.commit.dirty = true;
+            match read {
+                crate::el::PickRead::Element { within, x, y, pick, f } => {
+                    let picked = self.element_at_within(within.as_deref(), x, y, pick);
+                    if let Some(f) = f.take() {
+                        f(app.states(), picked, tx);
+                        self.commit.dirty = true;
+                    }
+                }
+                crate::el::PickRead::TextOffset { key, x, y, f } => {
+                    if !self.paint.text_rows.is_empty() { self.fill_text_near(); }
+                    let offset = self.text_offset_at(&key, x, y);
+                    if let Some(f) = f.take() {
+                        f(app.states(), offset, tx);
+                        self.commit.dirty = true;
+                    }
+                }
+                crate::el::PickRead::Elements { f } => {
+                    if let Some(f) = f.take() {
+                        let list = elements.get_or_insert_with(|| self.elements());
+                        f(app.states(), list, tx);
+                        self.commit.dirty = true;
+                    }
+                }
             }
         }
         // A callback may ask again, but cannot keep this dispatch running indefinitely.
         self.frame.pending.pick_reads.append(&mut tx.pick_reads);
-    }
-
-    /// [`Runtime::element_at`] restricted to an element and its descendants, ignoring other
-    /// subtrees. `within` accepts a key or key path as [`Cx::layout`] does.
-    pub fn element_at_in(&self, within: &str, x: f32, y: f32) -> Option<Picked> {
-        self.element_at_in_with(within, x, y, Pick::default())
-    }
-
-    /// [`Runtime::element_at_in`] with options, as [`Runtime::element_at_with`].
-    pub fn element_at_in_with(&self, within: &str, x: f32, y: f32, pick: Pick) -> Option<Picked> {
-        self.element_at_within(Some(within), x, y, pick)
-    }
-
-    fn element_at_within(&self, within: Option<&str>, x: f32, y: f32, pick: Pick) -> Option<Picked> {
-        let scope = match within {
-            Some(key) => Some(self.tree.selects_index(key)?),
-            None => None,
-        };
-        let n = self.tree.nodes.len();
-        let order = self.paint.layer_paint_order();
-        let at = |k: usize| if order.is_empty() { k } else { order[k] };
-        let count = if order.is_empty() { n } else { order.len() };
-        (0..count).rev().map(at).find(|&i| {
-            scope.is_none_or(|scope| self.tree.is_descendant(i, scope))
-                && self.pickable(i, x, y, pick)
-        }).map(|i| Picked {
-            path: self.tree.nodes[i].path.clone(),
-            key: self.tree.nodes[i].key.clone(),
-        })
-    }
-
-    /// Whether window point (`x`, `y`), in points, is inside the drawn, clipped and turned box
-    /// of the element keyed `key`, whatever is drawn above it and whether or not it has handlers.
-    /// False when there is no such element, it is exiting or fully transparent. Same geometry
-    /// as [`Runtime::element_at`].
-    pub fn contains(&self, key: &str, x: f32, y: f32) -> bool {
-        self.contains_with(key, x, y, Pick::default())
-    }
-
-    /// [`Runtime::contains`] with options, as [`Runtime::element_at_with`].
-    pub fn contains_with(&self, key: &str, x: f32, y: f32, pick: Pick) -> bool {
-        self.tree.selects_index(key).is_some_and(|i| self.pickable(i, x, y, pick))
-    }
-
-    fn pickable(&self, i: usize, x: f32, y: f32, pick: Pick) -> bool {
-        self.paint.drawn.get(i).is_some()
-            && self.paint.inh_scratch.get(i).is_some_and(|h| pick.transparent || h.opacity > 0.0)
-            && !self.subtree_exiting(i)
-            && self.node_contains(i, x, y)
     }
 
     /// The presented rotation, scale and shadows of the element keyed `key`, exiting or not, as
@@ -515,7 +632,7 @@ impl RuntimeCore {
             }
         }).collect();
         let moving = self.rect_springing(i)
-            || std::iter::successors(Some(i), |&p| step_up(&self.tree.nodes, p)).any(|p| {
+            || anchor_ancestors(&self.tree.nodes, i).any(|p| {
                 let id = self.tree.nodes[p].id;
                 paint_pose_springing(store, id)
                     || (!self.reduced_motion && self.motion.loop_active(id, store.node_time(id)))
@@ -541,7 +658,18 @@ impl RuntimeCore {
 /// Whether `path`'s keyed segments end with `key`'s: `slider/knob` matches
 /// `form/#2/slider/#0/knob`, since the `#n` segments stand for elements without keys.
 fn keyed_suffix(path: &str, key: &str) -> bool {
-    let unkeyed = |s: &&str| s.len() > 1 && s.starts_with('#') && s[1..].bytes().all(|b| b.is_ascii_digit());
-    let mut keyed = path.rsplit('/').filter(|s| !unkeyed(s));
-    key.rsplit('/').all(|want| keyed.next() == Some(want))
+    element_path::keyed_suffix_matches(path, key)
+}
+
+#[cfg(test)]
+thread_local! {
+    static ELEMENTS_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn count_elements_builds<R>(f: impl FnOnce() -> R) -> (R, usize) {
+    ELEMENTS_BUILDS.with(|c| c.set(0));
+    let out = f();
+    let count = ELEMENTS_BUILDS.with(|c| c.get());
+    (out, count)
 }

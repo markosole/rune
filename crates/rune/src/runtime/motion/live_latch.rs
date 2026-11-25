@@ -39,6 +39,8 @@ pub(crate) enum LiveEvent {
     LatchBegin,
     /// The latch read the sources; `active` says one is still moving.
     LatchEnd { active: bool },
+    /// A visible frame had no bound sources to read, so any pending wake is cleared.
+    Clear,
 }
 
 impl LiveWake {
@@ -82,6 +84,9 @@ impl LiveWake {
             // A value still moving after the read keeps the next frame due.
             (Hidden { dirty }, LiveEvent::LatchEnd { active }) => (Hidden { dirty: dirty || active }, active),
             (_, LiveEvent::LatchEnd { active }) => (if active { Pending } else { Idle }, active),
+            // A visible frame with no bound sources has nothing to read, so any pending wake is spent.
+            (Hidden { .. }, LiveEvent::Clear) => (self, false),
+            (_, LiveEvent::Clear) => (Idle, false),
         }
     }
 }
@@ -127,6 +132,7 @@ impl LiveLane {
     }
 
     /// A source published on another thread.
+    #[cfg(test)]
     pub(crate) fn publish(&self) { self.wake.notify(); }
 
     pub(crate) fn subscribed(&mut self, sampled: bool) { self.apply(LiveEvent::Subscribe { sampled }); }
@@ -144,17 +150,16 @@ impl LiveLane {
         self.wake.take_visible()
     }
 
-    /// Whether the frame should read its sources now. Hidden lanes retain their wake, and
-    /// source-less lanes consume a local request without sampling anything.
+    /// Whether the frame should read its sources now. A hidden or clean frame returns before
+    /// any transition. A visible frame with no bound sources has nothing to read, so any
+    /// pending wake is cleared rather than keeping the window redrawing until the next commit.
     pub(crate) fn latch_begin(&mut self, can: bool, has_subs: bool) -> bool {
         if !self.visible() { return false; }
         if !has_subs {
-            // A live-only handler can skip a rebuild without bindings. This frame consumes its
-            // local wake. A publication after `take` still lives in the shared atomic.
-            if self.dirty() { self.pruned(false); }
+            if self.state.dirty() { self.apply(LiveEvent::Clear); }
             return false;
         }
-        if !can && !self.dirty() { return false; }
+        if !can && !self.state.dirty() { return false; }
         self.apply1(LiveEvent::LatchBegin)
     }
 
@@ -172,6 +177,42 @@ impl LiveLane {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static SOURCE_KEY_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Key for `FrameState::live_subscriptions`. Compiles to a plain `u64` outside tests; in tests,
+/// equality comparisons count lookups so regression tests prove `subscribe_live` is linear.
+#[derive(Clone, Copy, Debug, Eq)]
+#[repr(transparent)]
+pub(super) struct SourceKey(pub(super) u64);
+
+impl std::hash::Hash for SourceKey {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) { self.0.hash(state); }
+}
+
+#[cfg(not(test))]
+impl PartialEq for SourceKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool { self.0 == other.0 }
+}
+
+#[cfg(test)]
+impl PartialEq for SourceKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        SOURCE_KEY_COMPARISONS.with(|c| c.set(c.get() + 1));
+        self.0 == other.0
+    }
+}
+
+#[cfg(test)]
+fn take_source_key_comparisons() -> usize {
+    SOURCE_KEY_COMPARISONS.with(|c| c.replace(0))
+}
+
 impl timer_wake::FrameState {
     pub(in crate::runtime) fn subscribe_live(&mut self, nodes: &mut [Node], scene: &Scene, clock: f64) {
         for node in nodes.iter_mut() {
@@ -179,7 +220,7 @@ impl timer_wake::FrameState {
                 for bound in &mut cold.live { bound.attach(&self.live_clock, clock); }
             }
         }
-        for sub in &self.live_subscriptions { sub.active.store(false, Ordering::Release); }
+        for sub in self.live_subscriptions.values() { sub.active.store(false, Ordering::Release); }
         // Pixels only wake: each frame's build uploads their current image, so unlike bound
         // values they leave nothing to sample on a later visible frame.
         let mut sampled = false;
@@ -187,7 +228,8 @@ impl timer_wake::FrameState {
             let text = node.text.as_ref().and_then(|t| t.cold.live.as_ref()).map(|t| &t.source);
             let pixels = node.vis.cold.get().and_then(|v| v.pixels.as_ref()).map(|p| &p.source);
             let has_live = node.cold.get().is_some_and(|c| !c.live.is_empty());
-            if !has_live && text.is_none() && pixels.is_none() {
+            let has_pill_pixels = node.text.as_ref().is_some_and(|t| t.cold.pills.iter().any(crate::text::PillChip::has_image));
+            if !has_live && text.is_none() && pixels.is_none() && !has_pill_pixels {
                 continue;
             }
             // An element removed outright leaves the scene now but `nodes` only at the next
@@ -195,15 +237,20 @@ impl timer_wake::FrameState {
             // pixels keep waking until the exit ends (commit already dropped their bindings).
             if !scene.contains(node.id) { continue; }
             sampled |= text.is_some() || has_live;
-            for source in node.live.iter().map(|b| &b.source).chain(text).chain(pixels) {
-                if let Some(sub) = self.live_subscriptions.iter().find(|s| s.source_id == source.id()) {
-                    sub.active.store(true, Ordering::Release);
-                } else {
-                    self.live_subscriptions.push(source.subscribe(self.live.waker()));
-                }
+            let pill_pixels = node
+                .text
+                .as_ref()
+                .into_iter()
+                .flat_map(|t| t.cold.pills.iter())
+                .filter_map(|p| p.image.as_ref().or_else(|| p.bare.as_deref().and_then(|b| b.image.as_ref())).map(|px| &px.source));
+            for source in node.live.iter().map(|b| &b.source).chain(text).chain(pixels).chain(pill_pixels) {
+                self.live_subscriptions
+                    .entry(SourceKey(source.id()))
+                    .and_modify(|sub| sub.active.store(true, Ordering::Release))
+                    .or_insert_with(|| source.subscribe(self.live.waker()));
             }
         }
-        self.live_subscriptions.retain(|s| s.active.load(Ordering::Acquire));
+        self.live_subscriptions.retain(|_, s| s.active.load(Ordering::Acquire));
         self.live.subscribed(sampled);
     }
 
@@ -218,7 +265,10 @@ impl timer_wake::FrameState {
     ) -> bool {
         if !self.live.latch_begin(pending, !self.live_subscriptions.is_empty()) { return false; }
         let mut active = false;
+        let mut text_changed = false;
         for node in nodes {
+            let mut layout_text_in_place = false;
+            let mut node_text_changed = false;
             if let Some(spec) = &mut node.text
                 && let Some(live) = &spec.cold.live
             {
@@ -226,8 +276,22 @@ impl timer_wake::FrameState {
                 if let Some(live_text) = live.read(seen) && spec.source_text() != &*live_text {
                     spec.replace_content(live_text.to_string());
                     spec.apply_case();
-                    node.text_layout = Some(TextLayout::Single(text.layout_live(&spec.content, spec.style, scale)));
+                    node_text_changed = true;
+                    if !spec.wrap && !spec.truncate && spec.max_lines == 0 {
+                        node.text_layout = Some(TextLayout::Single(text.layout_live(&spec.content, spec.style, scale)));
+                    } else {
+                        layout_text_in_place = true;
+                    }
                 }
+            }
+            if node_text_changed {
+                node.epoch = crate::runtime::paint_keep::next_epoch();
+                if !node.is_secure() && scene.contains(node.id) {
+                    text_changed = true;
+                }
+            }
+            if layout_text_in_place {
+                super::super::commit::relayout::lay_out_live_text_in_place(text, node, scale);
             }
             let Some(cold) = node.cold.get_mut_if_some() else { continue };
             for bound in &mut cold.live {
@@ -285,6 +349,11 @@ impl timer_wake::FrameState {
                         |b| f32::decode(b).max(0.0), op,
                         |cur, to| cur.is_some_and(|c| to < c),
                     ),
+                    Property::Rotation => apply(
+                        scene, node.id, prop::ROTATION, enter, leave,
+                        f32::decode, op,
+                        |_, _| false,
+                    ),
                     Property::Offset => apply(
                         scene, node.id, prop::OFFSET, enter, leave,
                         |b| { let [x, y] = <[f32; 2]>::decode(b); rune_motion::Vec2::new(x, y) }, op,
@@ -339,6 +408,9 @@ impl timer_wake::FrameState {
                 }
             }
         }
+        if text_changed {
+            self.live_text_gen = self.live_text_gen.wrapping_add(1);
+        }
         self.live.latch_end(active)
     }
 }
@@ -350,7 +422,7 @@ impl RuntimeCore {
 
     /// Install before the first frame. Live updates use this separate coalesced wake lane.
     pub(crate) fn set_live_waker(&mut self, waker: Waker) {
-        for sub in &self.frame.live_subscriptions { sub.active.store(false, Ordering::Release); }
+        for sub in self.frame.live_subscriptions.values() { sub.active.store(false, Ordering::Release); }
         self.frame.live_subscriptions.clear();
         self.frame.live.replace_waker(waker);
         self.subscribe_live();

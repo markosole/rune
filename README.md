@@ -1,6 +1,6 @@
 # Rune
 
-A native GPU-rendered Rust UI framework for macOS, Windows, Linux and the web, with its own renderer, text, layout and springs.
+A native GPU-rendered Rust UI framework for macOS, Windows, Linux, iOS and the web, with its own renderer, text, layout and springs.
 
 Every app can run headless, so an agent can render to PNG, dump the element tree and drive it with scripted input.
 
@@ -42,17 +42,28 @@ fn view(s: &State, _: &mut Cx<State>) -> El {
 
 ## Use it with your agent
 
-Give your coding agent this repo. Have it start from [`examples/hello`](examples/hello) and [`crates/rune/README.md`](crates/rune/README.md), then check its own work headlessly by rendering PNGs and inspecting the element tree.
+Give your coding agent this repo. Have it start from [`examples/hello`](examples/hello), the [examples index](examples/README.md), and [`crates/rune/README.md`](crates/rune/README.md), then check its own work headlessly by rendering PNGs and inspecting the element tree.
 
 > Build me a <thing> with Rune (github.com/anomalyco/rune). Start from examples/hello and check your work headlessly.
 
 ## Add it
 
 ```toml
+[dependencies]
 rune = { git = "https://github.com/anomalyco/rune", rev = "<dev rev>" }
+
+[patch.crates-io]
+winit = { git = "https://github.com/anomalyco/rune", rev = "<dev rev>" }
+sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "<dev rev>" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "<dev rev>" }
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "<dev rev>" }
+naga = { git = "https://github.com/anomalyco/rune", rev = "<dev rev>" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "<dev rev>" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "<dev rev>" }
+accesskit_atspi_common = { git = "https://github.com/anomalyco/rune", rev = "<dev rev>" }
 ```
 
-Rune is pre-release. Pin a rev of `dev`; `dev` is never rewritten.
+Rune is pre-release. Pin a rev of `dev`; `dev` is never rewritten. Cargo does not inherit `[patch.crates-io]` from a dependency, so put those patches in your workspace root `Cargo.toml` at the same `rev`. When pinning or bumping `rev`, check Rune's [`Cargo.toml`](Cargo.toml) for the current `[patch.crates-io]` list and see [Depending on Rune](crates/rune/README.md#depending-on-rune) for details.
 
 On Windows, the MSVC toolchain (`x86_64-pc-windows-msvc`, rustup's default) needs only the Visual Studio C++ build tools rustup asks for. The GNU toolchain (`x86_64-pc-windows-gnu`) also needs MinGW-w64's binutils on `PATH`: `windows-link` (under `parking_lot`, `libloading`, `windows-core` and `windows-sys`, so under every Windows UI crate) imports with `raw-dylib`, rustc makes those import libraries with `dlltool` on GNU targets, and the `dlltool` in rustup's `rust-mingw` can't run without an `as` it doesn't ship ([rust-lang/rust#140704](https://github.com/rust-lang/rust/issues/140704)). Without binutils the build stops at `windows-result` with `error calling dlltool 'dlltool.exe': program not found`. Install [MSYS2](https://www.msys2.org), run `pacman -S mingw-w64-ucrt-x86_64-binutils`, and put `C:\msys64\ucrt64\bin` on `PATH` (or build with `RUSTFLAGS=-Cdlltool=C:\msys64\ucrt64\bin\dlltool.exe`).
 

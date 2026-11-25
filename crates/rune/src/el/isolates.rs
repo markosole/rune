@@ -8,7 +8,7 @@ use super::*;
 const MARK: u32 = 3;
 
 impl El {
-    /// Lays bytes `range` of a [`text`](crate::text) or [`rich`](crate::rich) element out as an
+    /// Lays bytes `range` of a [`text`](crate::text()) or [`rich`] element out as an
     /// isolate (UAX #9 LRI, RLI or FSI .. PDI): it reads in `dir` (`Auto` from its own first
     /// strong character) and the text around it reads as if it were one neutral character, so
     /// `src/app.ts`, `-v` or `npm install` in an Arabic sentence keeps its own order, and an
@@ -93,8 +93,17 @@ impl TextSpec {
         for r in &mut cold.strikes {
             (r.0, r.1) = marked.range(r.0, r.1);
         }
+        for r in &mut cold.overlines {
+            (r.0, r.1) = marked.range(r.0, r.1);
+        }
+        for b in &mut cold.span_boxes {
+            (b.start, b.end) = marked.range(b.start, b.end);
+        }
         for h in &mut cold.highlights {
             (h.start, h.end) = marked.range(h.start, h.end);
+        }
+        for f in &mut cold.line_fills {
+            (f.start, f.end) = marked.range(f.start, f.end);
         }
         for p in &mut cold.pills {
             (p.start, p.end) = marked.range(p.start, p.end);

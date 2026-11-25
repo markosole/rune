@@ -40,6 +40,9 @@ pub(in crate::runtime) struct WheelLock {
     /// while deltas of it still wait in the queue for `on_wheel` handlers.
     run: WheelRun,
     phase: WheelPhase,
+    /// Modifiers of the unphased gesture in progress: changing modifiers ends the timer-based
+    /// wheel sequence, as Chromium's `MouseWheelPhaseHandler::HasDifferentModifiers` does.
+    mods: Option<crate::Mods>,
     /// The vertical viewport the current run of deltas scrolls, once one has.
     vertical: Option<VerticalRun>,
     /// Whether the current run of deltas is a notched wheel's.
@@ -86,8 +89,12 @@ struct VerticalRun {
     at: f64,
     x: f32,
     y: f32,
+    mods: crate::Mods,
     down: bool,
     moved: bool,
+    /// Started under a platform-phased gesture (trackpad): stays latched through pointer
+    /// movement and momentum without applying mouse-wheel slop.
+    phased: bool,
 }
 
 /// Who has the deltas still to run, keyed by the gesture each belongs to: the gesture arriving
@@ -278,6 +285,7 @@ impl WheelLock {
         let mut run = std::mem::take(&mut self.run);
         self.gesture = self.seq.next();
         self.phase = WheelPhase::Unphased { at: None };
+        self.mods = None;
         self.run = match pending {
             None => WheelRun::Arriving(WheelOwner::Unpicked),
             Some(next) if next == arriving => {
@@ -307,31 +315,49 @@ impl WheelLock {
         across.is_some()
     }
 
-    /// A delta arrived at `now`, on (dx, dy) points: a gesture idle too long, ended, or wholly
-    /// on the other axis (Shift let go, a tilt, a second wheel), is over, and this delta starts
-    /// the next.
-    fn delta(&mut self, now: f64, dx: f32, dy: f32, pending: Option<Attempt>) {
+    /// A delta arrived at `now`, on (dx, dy) points: a gesture idle too long, ended, with
+    /// different modifiers, or wholly on the other axis (Shift let go, a tilt, a second wheel),
+    /// is over, and this delta starts the next.
+    fn delta(&mut self, now: f64, dx: f32, dy: f32, mods: crate::Mods, pending: Option<Attempt>) {
         let phased = self.phase.phased();
         let idle = if phased { PHASED_IDLE } else { WHEEL_IDLE };
         let flipped = !phased && self.run.arriving().horizontal().is_some_and(|h| if h { dx == 0.0 } else { dy == 0.0 });
-        let stale = self.phase.ended().is_some() || self.phase.at().is_none_or(|a| now - a > idle) || flipped;
-        if stale { self.restart(pending); }
+        let mods_changed = !phased && self.mods.is_some_and(|m| m != mods);
+        let ended = self.phase.ended().is_some();
+        let stale = ended || self.phase.at().is_none_or(|a| now - a > idle) || flipped || mods_changed;
+        if stale {
+            if phased || ended || mods_changed { self.vertical = None; }
+            self.restart(pending);
+        }
+        self.mods = Some(mods);
         self.phase = self.phase.moving(now);
     }
 
     /// The viewport a vertical delta `dy` at (x, y) at `now` keeps to, when it continues the run.
-    pub(in crate::runtime) fn vertical_run(&self, now: f64, x: f32, y: f32, dy: f32) -> Option<NodeId> {
+    /// A platform-phased gesture (trackpad) stays latched across pointer movement until it ends
+    /// (Chromium's `MouseWheelPhaseHandler` only applies `kWheelLatchingSlopRegion` and
+    /// `HasDifferentModifiers` to timer-based unphased mouse-wheel runs).
+    pub(in crate::runtime) fn vertical_run(&self, now: f64, x: f32, y: f32, dy: f32, mods: crate::Mods, phased: bool) -> Option<NodeId> {
         let run = self.vertical?;
-        let continues = now - run.at <= RUN_IDLE && (x - run.x).hypot(y - run.y) < RUN_SLOP && (run.moved || (dy < 0.0) == run.down);
+        let continues = if run.phased && phased {
+            now - run.at <= PHASED_IDLE && (run.moved || (dy < 0.0) == run.down)
+        } else if !run.phased && !phased {
+            now - run.at <= RUN_IDLE
+                && (x - run.x).hypot(y - run.y) < RUN_SLOP
+                && run.mods == mods
+                && (run.moved || (dy < 0.0) == run.down)
+        } else {
+            false
+        };
         continues.then_some(run.id)
     }
 
     /// A vertical delta `dy` at (x, y) at `now` scrolled viewport `id` (`moved`: it moved it);
     /// `continued`, as part of the run, or else starting one.
-    pub(in crate::runtime) fn ran_vertical(&mut self, id: NodeId, now: f64, x: f32, y: f32, dy: f32, moved: bool, continued: bool) {
+    pub(in crate::runtime) fn ran_vertical(&mut self, id: NodeId, now: f64, x: f32, y: f32, dy: f32, mods: crate::Mods, phased: bool, moved: bool, continued: bool) {
         match &mut self.vertical {
             Some(run) if continued => run.at = now,
-            _ => self.vertical = Some(VerticalRun { id, at: now, x, y, down: dy < 0.0, moved }),
+            _ => self.vertical = Some(VerticalRun { id, at: now, x, y, mods, down: dy < 0.0, moved, phased }),
         }
     }
 
@@ -410,6 +436,19 @@ impl RuntimeCore {
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) const SHIFT_TURNS_WHEEL: bool = !cfg!(target_os = "macos");
 
+/// Scroll delta after Chromium's Shift + vertical wheel horizontal turn
+/// (`MouseWheelEventQueue::ProcessMouseWheelAck` / `GetPlatformSpecificDefaultEventAction`):
+/// turns a purely-vertical Shift wheel (without Ctrl) horizontal when a host has not already
+/// swapped `dx`. On macOS, a real Shift + trackpad (`precise == true`) stays vertical while a
+/// Shift + mouse wheel (`!precise`) turns horizontal so headless/scripted calls match.
+pub(in crate::runtime) fn shift_scroll_delta(ev: crate::WheelEvent) -> (f32, f32) {
+    if ev.mods.shift && !ev.mods.ctrl && ev.dx == 0.0 && ev.dy != 0.0 && (SHIFT_TURNS_WHEEL || !ev.precise) {
+        (ev.dy, 0.0)
+    } else {
+        (ev.dx, ev.dy)
+    }
+}
+
 impl ScrollState {
     /// The offset, velocity and limit on one axis.
     pub(in crate::runtime) fn axis(&mut self, horizontal: bool) -> (&mut f64, f64) {
@@ -419,12 +458,12 @@ impl ScrollState {
 
 impl requests::ScrollTables {
     /// A delta arrived: a gesture idle too long, or ended and not followed by its momentum,
-    /// is over, and this delta starts the next. Without phases, a delta wholly on the other
-    /// axis (Shift let go, a tilt, a second wheel) also starts a new gesture.
+    /// is over, and this delta starts the next. Without phases, a modifier change or a delta
+    /// wholly on the other axis (Shift let go, a tilt, a second wheel) also starts a new gesture.
     #[inline]
-    pub(in crate::runtime) fn wheel_delta(&mut self, now: f64, dx: f32, dy: f32, pending: Option<Attempt>) {
+    pub(in crate::runtime) fn wheel_delta(&mut self, now: f64, dx: f32, dy: f32, mods: crate::Mods, pending: Option<Attempt>) {
         self.drop_holds();
-        self.wheel_lock.delta(now, dx, dy, pending);
+        self.wheel_lock.delta(now, dx, dy, mods, pending);
     }
 
     #[inline]
@@ -450,30 +489,40 @@ impl requests::ScrollTables {
         let mut moving = false;
         match st.x.motion {
             XMotion::Glide { v, aim } => {
+                let before = st.x.offset;
                 let mut glide = Some(v);
                 moving = scroll_offset::glide_axis(st.glide_spring(), &mut st.x.offset, &mut glide, aim.min(st.x.max), dt);
                 st.x.motion = glide.map_or(XMotion::Rest, |v| XMotion::Glide { v, aim });
+                if (st.x.offset - before).abs() > 1e-6 { st.note_source(crate::ScrollSource::Programmatic); }
             }
             XMotion::Momentum(v) if v.abs() > 1.0 => {
+                let before = st.x.offset;
                 let decay = (-SCROLL_DECAY * dt).exp();
                 st.x.offset += f64::from(v * (1.0 - decay) / SCROLL_DECAY);
                 let edge = st.x.offset <= 0.0 || st.x.offset >= st.x.max;
                 st.x.motion = if edge { XMotion::Rest } else { XMotion::Momentum(v * decay) };
+                if (st.x.offset - before).abs() > 1e-6 { st.note_source(crate::ScrollSource::Momentum); }
                 moving = true;
             }
             XMotion::Momentum(_) => st.x.motion = XMotion::Rest,
             XMotion::Wheel(mut curve) => {
+                let before = st.x.offset;
                 curve.follow(st.x.offset);
                 if curve.target() > st.x.max { curve.retarget(st.x.max, scale); }
                 if land_wheel { curve.advance(f64::INFINITY, false) } else { curve.advance(f64::from(dt), catch_up) }
                 st.x.offset = scroll_wheel::on_grid_or_end(curve.value(), st.x.max, scale);
                 curve.applied(st.x.offset);
                 st.moved();
+                if (st.x.offset - before).abs() > 1e-6 { st.note_source(crate::ScrollSource::Direct); }
                 if curve.done() { st.x.motion = XMotion::Rest; } else { st.x.motion = XMotion::Wheel(curve); moving = true; }
             }
             XMotion::Rest => {}
         }
-        st.x.offset = st.x.offset.clamp(0.0, st.x.max);
+        let clamped = st.x.offset.clamp(0.0, st.x.max);
+        if (clamped - st.x.offset).abs() > 1e-6 {
+            st.x.offset = clamped;
+            st.note_source(crate::ScrollSource::Programmatic);
+        }
         moving
     }
 }
@@ -496,6 +545,7 @@ impl RuntimeCore {
     pub(in crate::runtime) fn wheel_pending(&self) -> Option<Attempt> {
         self.frame.queue.iter().find_map(|a| match a {
             Action::Wheel { gesture, .. } => Some(*gesture),
+            Action::WheelRepost(r) => Some(r.gesture),
             _ => None,
         })
     }
@@ -503,14 +553,19 @@ impl RuntimeCore {
     /// Whether a wheel delta waits in the queue for `on_wheel` handlers: one of gesture `of`,
     /// or of any gesture.
     pub(in crate::runtime) fn wheel_queued(&self, of: Option<Attempt>) -> bool {
-        self.frame.queue.iter().any(|a| matches!(a, Action::Wheel { gesture: g, .. } if of.is_none_or(|of| *g == of)))
+        self.frame.queue.iter().any(|a| match a {
+            Action::Wheel { gesture, .. } => of.is_none_or(|of| *gesture == of),
+            Action::WheelRepost(r) => of.is_none_or(|of| r.gesture == of),
+            _ => false,
+        })
     }
 
     /// Scrolls by a delta no `on_wheel` handler took, on the axis the gesture locked to.
     /// `phased` is that delta's own gesture's policy, which a delta queued before a newer
     /// gesture began keeps.
     pub(in crate::runtime) fn wheel_scroll_for(&mut self, gesture: Attempt, ev: crate::WheelEvent, phased: bool, start: crate::runtime::gesture_dispatch::WheelStart) {
-        let (x, y, dx, dy) = (ev.x, ev.y, ev.dx, ev.dy);
+        let (x, y) = (ev.x, ev.y);
+        let (dx, dy) = shift_scroll_delta(ev);
         if dx == 0.0 && dy == 0.0 { return; }
         self.scroll.wheel_lock.sync_gesture(gesture);
         // Without phases, a delta wholly on the other axis is another wheel turning (Shift let
@@ -523,9 +578,13 @@ impl RuntimeCore {
             }
         };
         if horizontal {
-            if dx != 0.0 { self.wheel_x(gesture, x, y, dx, ev.notch, start); }
+            if dx != 0.0 { self.wheel_x(gesture, x, y, dx, ev.notch, ev.momentum, start); }
         } else if dy != 0.0 {
-            if ev.notch { self.wheel_notch(x, y, dy, start) } else { self.wheel_from(x, y, dy, start) }
+            if ev.notch {
+                self.wheel_notch(x, y, dy, ev.mods, phased, start)
+            } else {
+                self.wheel_from(x, y, dy, ev.mods, phased, ev.momentum, start)
+            }
         }
     }
 
@@ -555,7 +614,7 @@ impl RuntimeCore {
     /// Scrolls the horizontal viewport latched for `gesture` (or the innermost one at (x, y)) by
     /// `dx` points: 1:1, or for whole notches of a wheel eased there as the vertical axis does
     /// (`Self::wheel_notch`).
-    fn wheel_x(&mut self, gesture: Attempt, x: f32, y: f32, dx: f32, notch: bool, start: crate::runtime::gesture_dispatch::WheelStart) {
+    fn wheel_x(&mut self, gesture: Attempt, x: f32, y: f32, dx: f32, notch: bool, momentum: bool, start: crate::runtime::gesture_dispatch::WheelStart) {
         self.release_hover_hold();
         self.dismiss_help();
         let latched = match self.scroll.wheel_lock.owner_of(gesture) { Some(WheelOwner::Horizontal(id)) => Some(*id), _ => None }.filter(|id| {
@@ -586,7 +645,10 @@ impl RuntimeCore {
         st.x.motion = XMotion::Rest;
         st.moved();
         log_event!(self, "wheel-x {dx:.1}");
-        if st.x.offset != before { self.pointer.scroll_cancels_press(&self.tree.nodes, id); }
+        if st.x.offset != before {
+            st.note_source(if momentum { crate::ScrollSource::Momentum } else { crate::ScrollSource::Direct });
+            self.pointer.scroll_cancels_press(&self.tree.nodes, id);
+        }
     }
 
     /// Releases a scroll with velocity (vx, vy) in points per second (positive moves content
@@ -630,7 +692,7 @@ impl RuntimeCore {
     }
 
     /// `Tx::scroll_into_view` on x: scrolls the nearest horizontal viewport around row `key`
-    /// just far enough to show it, leaving its `El::scroll_margin`.
+    /// (within `scope`, when given) just far enough to show it, leaving its `El::scroll_margin`.
     pub(in crate::runtime) fn reveal_row_x(&mut self, scope: Option<&str>, key: &str) {
         let target = self.live_named(scope, key)
             .map(|i| (i, self.tree.nodes[i].target[0], self.tree.nodes[i].local.w))
@@ -640,6 +702,7 @@ impl RuntimeCore {
             });
         let Some((i, target_x, target_w)) = target else { return };
         let Some(v) = std::iter::successors(self.tree.nodes[i].parent, |&p| self.tree.nodes[p].parent)
+            .take_while(|&p| in_scope(&self.tree.nodes[p].path, scope))
             .find(|&p| self.tree.nodes[p].scroll.is_some() && self.tree.nodes[p].scroll_axes.x()) else { return };
         let view = &self.tree.nodes[v];
         // From the viewport's start edge: its right, right to left.
@@ -658,6 +721,7 @@ impl RuntimeCore {
         st.x.offset = offset;
         st.x.motion = XMotion::Rest;
         st.moved();
+        st.note_source(crate::ScrollSource::Programmatic);
     }
 }
 

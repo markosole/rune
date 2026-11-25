@@ -3,9 +3,85 @@
 
 use super::*;
 
+/// Whether a live Wayland layer-shell surface must be destroyed and recreated for `requests`.
+/// `zwlr_layer_surface_v1` fixes its `wl_output` at creation, so only changing the target
+/// display requires a new surface; placement changes (size, anchors, margins) update in place.
+#[cfg_attr(not(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))), allow(dead_code))]
+pub(super) fn should_recreate_layer(current_display: &DisplayTarget, requests: &Requests, is_layer: bool) -> bool {
+    is_layer && requests.display.as_ref().is_some_and(|display| display != current_display)
+}
+
+/// Who owns a window-backed overlay's screen position.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum PositionOwner {
+    /// Positioned by `OverlaySpec`, `OverlayOptions`, or `OverlayHandle` placement requests.
+    #[default]
+    Managed,
+    /// An asynchronous native window drag (Windows, X11) was started; if the OS moves the
+    /// window before release, the user owns its position.
+    Dragging,
+    /// The user moved the overlay by dragging a `.window_drag()` region; preserve its position
+    /// across shows, resizes, and pointer following until the app sends a new placement request.
+    User,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PositionEvent {
+    /// An asynchronous native window drag started (Windows, X11).
+    DragStarted,
+    /// A synchronous native window drag moved the window (macOS).
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+    DragMoved,
+    /// The OS reported `WindowEvent::Moved`.
+    WindowMoved,
+    /// A press ended without moving the window, or a non-drag press arrived.
+    LeftReleased,
+    /// The app explicitly asked to place or refollow the overlay.
+    PlacementRequested,
+    /// The native window was destroyed, so a recreated window must be placed fresh.
+    WindowReleased,
+}
+
+impl PositionOwner {
+    pub(super) fn is_managed(self) -> bool { self == Self::Managed }
+
+    pub(super) fn step(&mut self, event: PositionEvent) {
+        *self = match (*self, event) {
+            (Self::Managed, PositionEvent::DragStarted) => Self::Dragging,
+            (state, PositionEvent::DragStarted) => state,
+            (_, PositionEvent::DragMoved) => Self::User,
+            (Self::Dragging, PositionEvent::WindowMoved) => Self::User,
+            (state, PositionEvent::WindowMoved) => state,
+            (Self::Dragging, PositionEvent::LeftReleased) => Self::Managed,
+            (state, PositionEvent::LeftReleased) => state,
+            (_, PositionEvent::PlacementRequested | PositionEvent::WindowReleased) => Self::Managed,
+        };
+    }
+
+    /// Updates ownership for incoming handle `requests`; returns whether an explicit placement
+    /// request reclaimed a user-dragged or in-flight drag position so `sync` must re-place even
+    /// when target coordinates match `self.at`.
+    pub(super) fn apply_requests(&mut self, requests: &Requests) -> bool {
+        if requests.follow_pointer == Some(true) {
+            self.step(PositionEvent::PlacementRequested);
+        }
+        let explicit = requests.placement.is_some()
+            || requests.display.is_some()
+            || requests.edge.is_some()
+            || requests.margin.is_some()
+            || requests.align.is_some();
+        let reset = explicit && !self.is_managed();
+        if explicit || requests.refollow {
+            self.step(PositionEvent::PlacementRequested);
+        }
+        reset
+    }
+}
+
 /// An overlay has no window to ask: whatever a step requested of one is dropped.
 pub(super) fn drop_window_requests(rt: &mut RuntimeCore) {
     rt.shell_request = None;
+    rt.host.user_close_request = false;
     rt.ignore_minimize("an overlay");
     // Overlays size through `OverlayHandle::resize`, not `Tx::resize_window`.
     rt.host.window_frame = None;
@@ -77,6 +153,74 @@ impl OverlayCore {
         self.apply_cursor(rt);
     }
 
+    /// Consumes a window-drag or titlebar double-click request from the press or touch just
+    /// delivered. Window-backed overlays start the native move loop on `Drag`; Wayland
+    /// layer-shell and XWayland overlays cannot be interactively dragged and ignore it.
+    /// `DoubleClick` is ignored because overlays do not maximize or minimize.
+    pub(super) fn take_titlebar_action(&mut self, app: &mut dyn OverlayApp) -> bool {
+        let _ = app.rt_mut().take_resize_action();
+        match app.rt_mut().take_titlebar_action() {
+            Some(crate::TitlebarAction::Drag) => self.begin_window_drag(app),
+            Some(crate::TitlebarAction::DoubleClick) | None => false,
+        }
+    }
+
+    /// Starts the native window move loop for a window-backed overlay, clearing drag-out and
+    /// native pointer capture because the OS move loop consumes mouse-up.
+    fn begin_window_drag(&mut self, app: &mut dyn OverlayApp) -> bool {
+        app.rt_mut().disarm_drag_out();
+        #[cfg(test)]
+        if self.test_window_backing && self.surface.live().is_none() {
+            self.test_window_drags += 1;
+            self.position_owner.step(PositionEvent::DragStarted);
+            let rt = app.rt();
+            self.apply_input(rt);
+            self.apply_cursor(rt);
+            self.dirty = true;
+            return true;
+        }
+        #[allow(irrefutable_let_patterns)]
+        let Some(Backing::Window(window)) = self.surface.live().map(|l| &l.backing) else {
+            return false;
+        };
+        let window = window.clone();
+        self.start_native_window_drag(app, &window);
+        // The OS move loop consumes mouse-up, so release native pointer capture now rather than
+        // waiting for a missed-release grace or leaving input regions stuck captured.
+        #[cfg(target_os = "macos")]
+        if let Some(panel) = &self.panel { panel.pointer_released(); }
+        #[cfg(target_os = "windows")]
+        if let Some(native) = &self.native { native.pointer_released(); }
+        let rt = app.rt();
+        self.apply_input(rt);
+        self.apply_cursor(rt);
+        self.dirty = true;
+        true
+    }
+
+    fn start_native_window_drag(&mut self, app: &mut dyn OverlayApp, window: &Arc<Window>) {
+        #[cfg(target_os = "macos")]
+        if let Some(panel) = &self.panel {
+            if panel.drag_window() {
+                self.position_owner.step(PositionEvent::DragMoved);
+                self.sync_live_origin(app.rt_mut());
+                let scale = crate::window::backing_scale(window);
+                if let Some(live) = self.surface.live()
+                    && (scale - live.scale).abs() > f32::EPSILON
+                    && let Some(gpu) = self.gpu.clone()
+                {
+                    self.rescale(app, &gpu, scale);
+                }
+            }
+            return;
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = app;
+        if window.drag_window().is_ok() {
+            self.position_owner.step(PositionEvent::DragStarted);
+        }
+    }
+
     /// A left press or release, at the panel's click point when it has one.
     pub(super) fn left_button(&mut self, app: &mut dyn OverlayApp, pressed: bool, point: Option<(f32, f32)>) {
         if pressed {
@@ -84,11 +228,17 @@ impl OverlayCore {
             if let Some((x, y)) = app.rt().pointer() {
                 app.pointer_down(x, y);
                 app.rt_mut().physical_input(crate::PhysicalInput::Modifiers(crate::window::map_mods(self.mods)));
+                if !self.take_titlebar_action(app) {
+                    self.position_owner.step(PositionEvent::LeftReleased);
+                }
             }
-        } else if let Some((x, y)) = point.or(app.rt().pointer()) {
-            // `pointer_up` moves to the release point itself, after disarming a drag-out: a
-            // release never starts an OS drag.
-            app.pointer_up(x, y);
+        } else {
+            if let Some((x, y)) = point.or(app.rt().pointer()) {
+                // `pointer_up` moves to the release point itself, after disarming a drag-out: a
+                // release never starts an OS drag.
+                app.pointer_up(x, y);
+            }
+            self.position_owner.step(PositionEvent::LeftReleased);
         }
         self.dirty = true;
     }
@@ -238,6 +388,16 @@ impl OverlayCore {
         }
     }
 
+    /// Hardware media keys the monitor saw since the loop last turned.
+    #[cfg(target_os = "macos")]
+    pub(super) fn media_keys(&mut self, app: &mut dyn OverlayApp) {
+        let Some(events) = self.surface.live().and_then(|l| l.media_keys.as_ref()).map(|m| m.take()) else { return };
+        if !self.presence.shown() || self.options.keys != KeyPolicy::OnDemand { return; }
+        for (decoded, mods) in events {
+            self.dirty |= app.media_key(decoded, mods);
+        }
+    }
+
     /// Handle updates, and the `setup` waker (new data arrived) re-runs the view. A shown
     /// overlay draws a frame, which polls; a hidden one polls now, as for a due timer, and
     /// re-runs the view when it shows (`advance_at`).
@@ -269,19 +429,41 @@ impl OverlayCore {
         }
     }
 
-    /// Hidden, or shown but not on screen: no frame will come to run what's due.
+    /// Wayland layer-shell: true while a presented frame's `wl_surface.frame` callback is
+    /// outstanding and the GPU device is still live, so the overlay must not acquire or present
+    /// again until the compositor answers.
+    pub(super) fn awaiting_layer_frame(&self) -> bool {
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        let surface_ready = match self.surface.live().map(|l| &l.backing) {
+            Some(Backing::Layer(layer)) => layer.frame_ready(),
+            _ => true,
+        };
+        #[cfg(not(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
+        let surface_ready = true;
+        #[cfg(test)]
+        let surface_ready = surface_ready && !self.layer_frame_pending;
+        let lost = self.gpu.as_ref().is_some_and(|gpu| gpu.is_lost());
+        frame::is_awaiting_frame(surface_ready, lost)
+    }
+
+    /// Hidden, shown but not on screen, or awaiting a Wayland layer frame callback: no frame will
+    /// come on its own to run what's due.
     pub(super) fn frameless(&self) -> bool {
-        !self.presence.drawing() || self.presence.occluded()
+        frame::is_frameless(self.presence.drawing(), self.presence.occluded(), self.awaiting_layer_frame())
     }
 
     pub(super) fn advance_at(&mut self, app: &mut dyn OverlayApp, now: Instant) {
-        // Covered or asleep, a shown overlay only polls. What it would commit waits for the
-        // first uncovered frame, which resumes running motion and starts new motion fresh
-        // (`step`). Hidden, an overlay only polls too, and its view waits for the frame that
-        // shows it; a retained one commits at most every `HIDDEN_REFRESH` to keep its cached
-        // frame near. Input and drag ends still run their handlers now.
+        // Covered, asleep or awaiting a Wayland layer frame callback, a shown overlay only polls.
+        // What it would commit waits for the next drawn frame, which resumes running motion and
+        // starts new motion fresh (`step`). Hidden, an overlay only polls too, and its view waits
+        // for the frame that shows it; a retained one commits at most every `HIDDEN_REFRESH` to
+        // keep its cached frame near. Input and drag ends still run their handlers now.
         let handlers = app.rt().has_pending_input() || app.rt().drag_ends_pending();
-        let polls_only = !handlers && if self.presence.drawing() { self.presence.shown() && self.presence.occluded() } else { !self.retained() || !self.hidden_pace.ready(now) };
+        let polls_only = !handlers && if self.presence.drawing() {
+            frame::polls_only_when_drawing(self.presence.shown(), self.presence.occluded(), self.awaiting_layer_frame())
+        } else {
+            !self.retained() || !self.hidden_pace.ready(now)
+        };
         if !polls_only { return self.commit_at(app, now); }
         app.poll_hidden();
         if app.rt().has_pending_input() { return self.commit_at(app, now); }
@@ -320,9 +502,11 @@ impl OverlayCore {
 
     pub(super) fn wake_due(&mut self, app: &mut dyn OverlayApp, now: Instant) {
         self.presence_due(app, now);
+        self.rest_step(app, crate::window::RestEvent::Woke { now }, now);
+        self.retire.poll_due(now);
         // Paced to a frame interval: a hidden or covered overlay's poll that keeps asking for
         // the next frame runs once a frame, however often other events turn the loop.
-        let deadline = crate::window::timer_deadline_core(app.rt());
+        let deadline = self.poll_deadline(app.rt());
         if deadline.is_some_and(|deadline| deadline <= now) {
             // Backing off, the frame waits for the retry and would leave the timer due.
             if !self.frameless() && !self.backing_off(now) {
@@ -334,7 +518,7 @@ impl OverlayCore {
             } else {
                 // No frame will come to run it in time: a hidden, occluded or backing-off
                 // overlay steps without drawing, so its timers fire (and may hide it) on time.
-                self.advance(app);
+                self.advance_at(app, now);
                 self.turn_frame.step(frame::TurnEvent::WakeStepped);
             }
         }
@@ -350,7 +534,10 @@ impl OverlayCore {
     /// without drawing, as a hidden overlay does, unless it already `stepped`. The next try
     /// waits, with the display link stopped so no tick tries sooner.
     pub(super) fn missed(&mut self, app: &mut dyn OverlayApp, missed: crate::window::Missed, paced: bool, stepped: bool) {
-        let now = crate::time::now();
+        self.missed_at(app, missed, paced, stepped, crate::time::now());
+    }
+
+    pub(super) fn missed_at(&mut self, app: &mut dyn OverlayApp, missed: crate::window::Missed, paced: bool, stepped: bool, now: Instant) {
         self.quiet.step(frame::QuietEvent::Forget);
         self.turn_frame.step(frame::TurnEvent::FrameMissed);
         if stepped {
@@ -411,14 +598,25 @@ impl OverlayCore {
             #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
             if let Some(x11) = &self.x11 { x11.set_follow_pointer(follow); }
         }
+        let reset_position = self.position_owner.apply_requests(&requests);
         let options_changed = requests.placement.is_some() || requests.display.is_some();
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
-        let recreate_layer = options_changed && matches!(self.surface.live().map(|l| &l.backing), Some(Backing::Layer(_)));
+        let recreate_layer = should_recreate_layer(
+            &self.options.display,
+            &requests,
+            matches!(self.surface.live().map(|l| &l.backing), Some(Backing::Layer(_))),
+        );
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
         let layer_was_visible = self.presence.shown();
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
         if recreate_layer { self.hide(app); }
-        if let Some(placement) = requests.placement { self.options.placement = placement; }
+        if let Some(placement) = requests.placement {
+            self.options.placement = placement;
+            #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+            if let Some(Live { backing: Backing::Layer(layer), .. }) = self.surface.live_mut() {
+                layer.set_placement(placement);
+            }
+        }
         if let Some(display) = requests.display { self.options.display = display; }
         self.apply_wake(app, requests.woken);
         let mut at = self.at;
@@ -430,7 +628,7 @@ impl OverlayCore {
         let old_size = self.at.size;
         if let Some(size) = requests.size { self.canvas_size = size; }
         at.size = requests.size.unwrap_or(at.size);
-        if at != self.at || options_changed {
+        if at != self.at || options_changed || reset_position {
             self.at = at;
             self.resolve_size(event_loop);
             if self.at.size != old_size {
@@ -444,11 +642,11 @@ impl OverlayCore {
                     }
                     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
                     Some(Backing::Layer(layer)) => {
-                        layer.place(at);
+                        layer.place(self.at);
                         layer.commit();
                     }
                     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
-                    Some(Backing::Xwayland(surface)) => surface.place(at, &self.options),
+                    Some(Backing::Xwayland(surface)) => surface.place(self.at, &self.options),
                     None => {}
                 }
             }
@@ -495,3 +693,7 @@ impl OverlayCore {
             && let Some(native) = &self.native { native.request_keys(); }
     }
 }
+
+#[cfg(test)]
+#[path = "input_tests.rs"]
+mod tests;

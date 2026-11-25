@@ -7,12 +7,15 @@ use crate::machine::Attempt;
 use crate::runtime::scroll_x::WheelOwner;
 use crate::{GesturePhase, MagnifyEvent, PointerButton, RotateEvent, WheelEvent};
 
-/// A trackpad gesture at a window point, queued for the handlers under it.
+/// A trackpad gesture or extra mouse button press at a window point, queued for the handlers under it.
 #[derive(Clone, Copy, Debug)]
 pub(in crate::runtime) enum Gesture {
     Magnify(MagnifyEvent),
     Rotate(RotateEvent),
     SmartMagnify(f32, f32),
+    /// An extra mouse button (`Middle`, `Back`, `Forward`, `Other`) for [`El::on_button`]
+    /// handlers; `released` records a same-frame middle release for deferred autoscroll fallback.
+    Button { button: PointerButton, x: f32, y: f32, released: Option<(f32, f32)> },
 }
 
 /// Where a wheel delta's chain starts (`Runtime::chain_start`), when it was already found on the
@@ -23,13 +26,16 @@ pub(crate) enum WheelStart {
     At(Option<usize>),
 }
 
-/// Points of Ctrl + wheel per unit of magnification, where a pinch arrives that way.
+/// Points of pixel-precise Ctrl + wheel per unit of magnification, where a pinch arrives that way.
 const PINCH_WHEEL: f32 = 200.0;
+/// Zoom factor per vertical line-delta wheel notch with Ctrl held, matching Chromium's
+/// `kTextSizeMultiplierRatio = 1.2` (`third_party/blink/common/page/page_zoom.cc`).
+const PINCH_WHEEL_STEP: f32 = 1.2;
 
 impl RuntimeCore {
     /// A wheel or trackpad scroll at window point (`ev.x`, `ev.y`), with its modifiers and
-    /// phase. The innermost [`El::on_wheel`] handler there hears it first, up to the nearest
-    /// scroll view; what none takes scrolls as [`Self::wheel_xy`] does.
+    /// phase. The innermost [`El::on_wheel`] handler there hears it first, bubbling through
+    /// every ancestor past scroll views; what none takes scrolls as [`Self::wheel_xy`] does.
     pub fn wheel_event(&mut self, ev: WheelEvent) {
         if ev.phase == GesturePhase::Began { self.wheel_began(); }
         let moved = ev.dx != 0.0 || ev.dy != 0.0;
@@ -37,17 +43,61 @@ impl RuntimeCore {
             self.dismiss_help();
             let now = self.now_clock();
             let pending = self.wheel_pending();
-            self.scroll.wheel_delta(now, ev.dx, ev.dy, pending);
+            let (dx, dy) = crate::runtime::scroll_x::shift_scroll_delta(ev);
+            self.scroll.wheel_delta(now, dx, dy, ev.mods, pending);
         }
         // A notch or not is the run's to decide, not each delta's.
         let ev = if moved { WheelEvent { notch: self.scroll.wheel_notched(self.now_clock(), ev.notch), ..ev } } else { ev };
         if moved || ev.phase != GesturePhase::Moved {
-            let ev = WheelEvent { momentum: self.scroll.wheel_momentum(), ..ev };
+            let ev = WheelEvent { momentum: ev.momentum || self.scroll.wheel_momentum(), ..ev };
             let gesture = self.scroll.wheel_gesture();
             let phased = self.scroll.wheel_phased();
-            if let Some(start) = self.offer_wheel(gesture, ev) { self.wheel_scroll_for(gesture, ev, phased, start); }
+            if !(moved && self.dismiss_modal_on_wheel(gesture, ev, phased))
+                && let Some(start) = self.offer_wheel(gesture, ev)
+            {
+                self.wheel_scroll_for(gesture, ev, phased, start);
+            }
         }
         if ev.phase == GesturePhase::Ended { self.wheel_ended(); }
+    }
+
+    /// Dismisses an active modal opted into [`crate::El::modal_wheel_outside`] on an outside,
+    /// non-momentum wheel and queues [`Action::WheelRepost`] so the delta routes to what lies
+    /// beneath once the dismissal commits and rebuilds hit-testing.
+    pub(super) fn dismiss_modal_on_wheel(&mut self, gesture: Attempt, ev: WheelEvent, phased: bool) -> bool {
+        if ev.momentum { return false; }
+        let owner_allows = matches!(self.scroll.wheel_owner(), WheelOwner::Unpicked)
+            || (!phased && matches!(self.scroll.wheel_owner(), WheelOwner::Vertical | WheelOwner::Horizontal(_)));
+        if !owner_allows { return false; }
+        let Some(i) = self.active_modal() else { return false };
+        if self.point_in_modal(i, ev.x, ev.y) { return false; }
+        if !self.tree.nodes[i].handlers.modal.as_ref().is_some_and(|m| m.wheel_outside && m.dismiss.is_some()) {
+            return false;
+        }
+        if self.scroll.wheel_owner() != &WheelOwner::Unpicked {
+            self.scroll.set_wheel_owner(gesture, WheelOwner::Unpicked);
+            self.scroll.end_wheel_vertical();
+        }
+        let modal = self.tree.nodes[i].path.clone();
+        let outer = self.outer_modal_path(i);
+        if !self.frame.queue.iter().any(|a| matches!(a, Action::Dismiss(p) if *p == modal)) {
+            self.frame.queue.push(Action::Dismiss(modal.clone()));
+        }
+        self.frame.queue.push(Action::WheelRepost(action::WheelRepost { modal, outer, gesture, ev, phased }));
+        true
+    }
+
+    /// Same-frame outside-wheel repost: runs after `Action::Dismiss` commits so `ModalScope` and
+    /// hit-testing are freshly rebuilt for the post-dismiss tree.
+    pub(super) fn run_wheel_repost(&mut self, app: &mut dyn AppDriver, repost: action::WheelRepost, one: &mut Tx) -> bool {
+        if !self.repost_allowed(&repost.modal, repost.outer.as_deref()) { return false; }
+        if !self.tree.built {
+            self.scene.present();
+            self.begin_exit_mask();
+            self.build();
+            self.end_exit_mask();
+        }
+        self.run_wheel(app, repost.gesture, None, repost.ev, repost.phased, one)
     }
 
     /// Queues `ev` for the `on_wheel` handlers it may go to (None), or leaves it to scrolling now,
@@ -62,41 +112,60 @@ impl RuntimeCore {
         };
         if scrolls && !pending { return Some(WheelStart::Unknown); }
         let start = if handled { WheelStart::Unknown } else { WheelStart::At(self.chain_start(ev.x, ev.y)) };
-        let chain = match start { WheelStart::At(s) => self.gesture_chain_from(s, |g| g.wheel.is_some(), true), WheelStart::Unknown => Vec::new() };
-        if chain.is_empty() && !handled && !pending { return Some(start); }
+        let chain = match start { WheelStart::At(s) => Some(self.gesture_chain_from(s, |g| g.wheel.is_some())), WheelStart::Unknown => None };
+        if chain.as_ref().is_some_and(Vec::is_empty) && !handled && !pending { return Some(start); }
         let phased = self.scroll.wheel_phased();
         self.frame.queue.push(Action::Wheel { gesture, chain, ev, phased });
         None
     }
 
     /// A queued wheel delta: the handler holding its gesture hears it, else each handler
-    /// under the pointer until one takes it, else it scrolls. Each queued delta keeps its own
-    /// gesture's turn and axis policy, so one queued before a newer gesture began still reaches
-    /// the owner its own gesture picked.
-    pub(in crate::runtime) fn run_wheel(&mut self, app: &mut dyn AppDriver, gesture: Attempt, chain: Vec<String>, ev: WheelEvent, phased: bool, tx: &mut Tx) -> bool {
+    /// under the pointer until one takes it, else it scrolls. If the owning handler declines
+    /// (returns false) or goes away, the delta bubbles to outer handlers and then scrolls as
+    /// usual. Each queued delta keeps its own gesture's turn and axis policy, so one queued
+    /// before a newer gesture began still reaches the owner its own gesture picked.
+    pub(in crate::runtime) fn run_wheel(&mut self, app: &mut dyn AppDriver, gesture: Attempt, chain: Option<Vec<String>>, ev: WheelEvent, phased: bool, tx: &mut Tx) -> bool {
         self.scroll.sync_wheel_gesture(gesture);
-        let mut taken = None;
+        let mut taken = false;
         match self.scroll.wheel_owner_of(gesture).cloned() {
             Some(WheelOwner::Handler(path)) => {
-                taken = self.call_wheel(app, &path, ev, tx);
-                if taken.is_none() { self.scroll.set_wheel_owner(gesture, WheelOwner::Unpicked); }
+                match self.call_wheel(app, &path, ev, tx) {
+                    Some(true) => taken = true,
+                    result => {
+                        self.scroll.set_wheel_owner(gesture, WheelOwner::Unpicked);
+                        let rest = if result.is_some() {
+                            let parent = self.live_index(&path).and_then(|i| self.tree.nodes[i].parent);
+                            self.gesture_chain_from(parent, |g| g.wheel.is_some())
+                        } else {
+                            self.gesture_chain(ev.x, ev.y, |g| g.wheel.is_some())
+                        };
+                        for next in rest {
+                            if self.call_wheel(app, &next, ev, tx) == Some(true) {
+                                self.scroll.set_wheel_owner(gesture, WheelOwner::Handler(next));
+                                taken = true;
+                                break;
+                            }
+                        }
+                    }
+                }
             }
             Some(WheelOwner::Unpicked) => {
+                let chain = chain.unwrap_or_else(|| self.gesture_chain(ev.x, ev.y, |g| g.wheel.is_some()));
                 for path in chain {
                     if self.call_wheel(app, &path, ev, tx) == Some(true) {
                         self.scroll.set_wheel_owner(gesture, WheelOwner::Handler(path));
-                        taken = Some(true);
+                        taken = true;
                         break;
                     }
                 }
             }
             _ => {}
         }
-        if taken.is_none() {
+        if !taken {
             // Queued from an earlier frame: what lies under the pointer may have moved since.
             self.wheel_scroll_for(gesture, ev, phased, WheelStart::Unknown);
         }
-        taken.unwrap_or(false)
+        taken
     }
 
     /// Element `path`'s `on_wheel` on `ev`, in its own points; None when it's gone.
@@ -124,20 +193,50 @@ impl RuntimeCore {
         self.offer_gesture(x, y, |g| g.smart_magnify.is_some(), Gesture::SmartMagnify(x, y));
     }
 
-    /// A Ctrl + wheel `dy` at (x, y), which is how a trackpad pinch reaches Windows, Linux and
-    /// web apps: a pinch when an `on_magnify` handler is there (true), else nothing.
-    pub(crate) fn pinch_wheel(&mut self, x: f32, y: f32, dy: f32) -> bool {
-        if dy == 0.0 || self.gesture_chain(x, y, |g| g.magnify.is_some(), false).is_empty() { return false; }
-        self.magnify_event(MagnifyEvent::new(-dy / PINCH_WHEEL).at(x, y));
+    /// A Ctrl + wheel at (x, y), which is how a trackpad pinch reaches Windows, Linux and web
+    /// apps, and how Chromium hands any page Ctrl + wheel: a pinch (`MagnifyEvent::wheel`) when
+    /// an `on_magnify` handler is there (true), else nothing. For line-delta wheels (`ticks`),
+    /// scales by `1.2^ticks - 1.0` (+20% per forward notch, independent of OS scroll-lines
+    /// settings, matching Chromium's tick-based `WebContentsImpl::HandleWheelEvent` and
+    /// `kTextSizeMultiplierRatio`); for pixel-precise deltas (`None`), scales by `dy / PINCH_WHEEL`.
+    /// Positive `ticks` or `dy` moves content down, so the wheel turned away from the user (or the
+    /// fingers spread) zooms in, as in a browser.
+    pub(crate) fn pinch_wheel(&mut self, x: f32, y: f32, dy: f32, ticks: Option<f32>) -> bool {
+        let delta = match ticks {
+            Some(t) if t != 0.0 => PINCH_WHEEL_STEP.powf(t) - 1.0,
+            Some(_) => return false,
+            None if dy != 0.0 => dy / PINCH_WHEEL,
+            None => return false,
+        };
+        if self.gesture_chain(x, y, |g| g.magnify.is_some()).is_empty() { return false; }
+        self.magnify_event(MagnifyEvent { wheel: true, ..MagnifyEvent::new(delta).at(x, y) });
         true
     }
 
     fn offer_gesture(&mut self, x: f32, y: f32, has: impl Fn(&CanvasInput) -> bool, gesture: Gesture) {
-        let chain = self.gesture_chain(x, y, has, false);
+        let chain = self.gesture_chain(x, y, has);
         if !chain.is_empty() { self.frame.queue.push(Action::Gesture(chain, gesture)); }
     }
 
     pub(in crate::runtime) fn run_gesture(&mut self, app: &mut dyn AppDriver, chain: Vec<String>, gesture: Gesture, tx: &mut Tx) -> bool {
+        if let Gesture::Button { button, x, y, released } = gesture {
+            tx.button = button;
+            for path in chain {
+                let taken = self.gesture_handler(&path, |g| g.button.clone()).map(|(_, f)| {
+                    Tx::took(f(app.states(), button, tx), tx)
+                });
+                if taken == Some(true) { return true; }
+            }
+            if button == PointerButton::Middle && self.pointer.pos.is_some() && self.autoscroll_down(x, y) {
+                if let Some((ux, uy)) = released {
+                    self.autoscroll_moved(ux, uy);
+                    self.pointer.autoscroll_release(PointerButton::Middle);
+                } else if let Some((px, py)) = self.pointer.pos && (px, py) != (x, y) {
+                    self.autoscroll_moved(px, py);
+                }
+            }
+            return false;
+        }
         for path in chain {
             let taken = match gesture {
                 Gesture::Magnify(ev) => self.gesture_handler(&path, |g| g.magnify.clone()).map(|(i, f)| {
@@ -152,28 +251,27 @@ impl RuntimeCore {
                     let [x, y] = self.to_local(i, x, y);
                     Tx::took(f(app.states(), x, y, tx), tx)
                 }),
+                Gesture::Button { .. } => unreachable!(),
             };
             if taken == Some(true) { return true; }
         }
         false
     }
 
-    /// The elements under window point (x, y) with a handler `has` picks, innermost first: up
-    /// from the topmost hit, and from a scroll view there inside it. With `stop_at_scroll`, the
-    /// walk ends at the first scroll view, which scrolls what its handlers leave.
-    fn gesture_chain(&self, x: f32, y: f32, has: impl Fn(&CanvasInput) -> bool, stop_at_scroll: bool) -> Vec<String> {
-        self.gesture_chain_from(self.chain_start(x, y), has, stop_at_scroll)
+    /// The elements under window point (x, y) with a handler `has` picks, innermost first,
+    /// walking every ancestor up to the root (or open modal) past scroll views.
+    fn gesture_chain(&self, x: f32, y: f32, has: impl Fn(&CanvasInput) -> bool) -> Vec<String> {
+        self.gesture_chain_from(self.chain_start(x, y), has)
     }
 
     /// [`Self::gesture_chain`] from a start already found.
-    fn gesture_chain_from(&self, start: Option<usize>, has: impl Fn(&CanvasInput) -> bool, stop_at_scroll: bool) -> Vec<String> {
+    fn gesture_chain_from(&self, start: Option<usize>, has: impl Fn(&CanvasInput) -> bool) -> Vec<String> {
         let mut chain = Vec::new();
         let mut at = start;
         while let Some(i) = at {
             if self.subtree_exiting(i) || !self.allowed(i) { break; }
             let n = &self.tree.nodes[i];
             if n.handlers.gestures.as_deref().is_some_and(&has) { chain.push(n.path.clone()); }
-            if stop_at_scroll && n.scroll.is_some() { break; }
             at = n.parent;
         }
         chain
@@ -205,18 +303,46 @@ impl RuntimeCore {
     /// text with `on_link`, or an element with [`El::on_middle_press`], each clicked when the
     /// button comes up over it.
     pub(crate) fn button_down(&mut self, app: &mut dyn AppDriver, x: f32, y: f32, button: PointerButton) {
+        self.button_down_with_primary(app, x, y, button, cfg!(target_os = "linux"));
+    }
+
+    /// Queues passive [`El::on_any_press`] observers for a button-down that starts a new
+    /// gesture, in reverse tree order (topmost live, allowed, non-exiting observer first), ahead
+    /// of that press's normal target actions. Windows without an observer pay one cached boolean
+    /// check.
+    pub(in crate::runtime) fn queue_any_press(&mut self, button: PointerButton, x: f32, y: f32) {
+        if !self.tree.has_any_press { return; }
+        for i in (0..self.tree.nodes.len()).rev() {
+            if self.tree.nodes[i].handlers.get().is_some_and(|h| h.on_any_press.is_some())
+                && self.allowed(i)
+                && !self.subtree_exiting(i)
+                && !self.subtree_unmounted(i)
+            {
+                let point = self.pointer_event(i, x, y);
+                let path = self.tree.nodes[i].path.clone();
+                self.frame.queue.push(Action::AnyPress(path, button, point));
+            }
+        }
+    }
+
+    pub(super) fn button_down_with_primary(&mut self, app: &mut dyn AppDriver, x: f32, y: f32, button: PointerButton, primary_paste: bool) {
         match button {
             PointerButton::Primary => return self.pointer_down(app, x, y),
             PointerButton::Secondary => return self.secondary_down(x, y),
             _ => {}
         }
+        let starts_gesture = !self.pointer.any_button_down() && !self.pointer.captured();
+        self.pointer.note_button_down(button);
         if self.pointer.autoscroll_press(button) { self.pointer.pos = Some((x, y)); return; }
         if self.pointer.press.is_held() { return; }
         self.pointer.pos = Some((x, y));
+        if starts_gesture { self.queue_any_press(button, x, y); }
         if button == PointerButton::Middle { self.tint_down(x, y, button); }
         // On Linux a middle click in a text field pastes the primary selection there.
-        #[cfg(target_os = "linux")]
-        if button == PointerButton::Middle && self.primary_paste_down(x, y) { return; }
+        #[cfg(any(target_os = "linux", test))]
+        if primary_paste && button == PointerButton::Middle && self.primary_paste_down(x, y) { return; }
+        #[cfg(not(any(target_os = "linux", test)))]
+        let _ = primary_paste;
         self.dismiss_help();
         let hit = self.hit.top_hit(|id, r| self.hit_contains(id, r, x, y)).and_then(|id| self.tree.node_index.get(&id).copied());
         let middle = button == PointerButton::Middle;
@@ -230,18 +356,24 @@ impl RuntimeCore {
                 h.on_middle_press.is_some().then_some((i, None))
             });
         let Some((i, link)) = target else {
-            if middle { self.autoscroll_down(x, y); }
+            let chain = self.gesture_chain(x, y, |g| g.button.is_some());
+            if !chain.is_empty() {
+                self.frame.queue.push(Action::Gesture(chain, Gesture::Button { button, x, y, released: None }));
+            } else if middle {
+                self.autoscroll_down(x, y);
+            }
             return;
         };
         let n = &self.tree.nodes[i];
         let r = n.target;
         let [lx, ly] = self.to_local(i, x, y);
-        let d = Drag { phase: Phase::Down, x: lx, y: ly, w: r[2] - r[0], h: r[3] - r[1], start_x: lx, start_y: ly, dx: 0.0, dy: 0.0, data: 0.0, clicks: 1, cancelled: false, window: [x, y], screen: self.screen_at(x, y) };
+        let d = Drag { phase: Phase::Down, x: lx, y: ly, w: r[2] - r[0], h: r[3] - r[1], start_x: lx, start_y: ly, dx: 0.0, dy: 0.0, data: 0.0, clicks: 1, cancelled: false, rtl: n.flow == crate::el::Flow::Rtl, window: [x, y], screen: self.screen_at(x, y) };
         let path = n.path.clone();
-        if self.drags_with(i, button) { self.frame.queue.push(Action::Drag(path.clone(), d, button)); }
+        let drag_handler = self.drags_with(i, button).then(|| n.handlers.on_drag.clone()).flatten();
+        if drag_handler.is_some() { self.frame.queue.push(Action::Drag(path.clone(), d, button)); }
         self.pointer.clear_press_clicks();
         let now = self.now_clock();
-        self.pointer.press.hold(capture::Held::new(path, d, button, (x, y), now, false, None).on_link(link));
+        self.pointer.press.hold(capture::Held::new(path, d, button, (x, y), now, false, None).on_link(link).drag_handler(drag_handler));
     }
 
     /// Element `i` opted in to `button` ([`El::pointer_buttons`]); every element takes the
@@ -264,7 +396,9 @@ impl RuntimeCore {
 
     /// A mouse button came up at (x, y): the release of [`Self::button_down`].
     pub(crate) fn button_up(&mut self, app: &dyn ViewDriver, x: f32, y: f32, button: PointerButton) {
+        self.pointer.note_button_up(button);
         self.pointer.release_tint(button);
+        if button == PointerButton::Middle { self.frame.queue.note_middle_button_up(x, y); }
         if !matches!(button, PointerButton::Primary | PointerButton::Secondary) && self.pointer.autoscroll_release(button) { self.pointer.pos = Some((x, y)); return; }
         match button {
             PointerButton::Primary => self.pointer_up(app, x, y),
@@ -278,6 +412,7 @@ impl RuntimeCore {
     /// and a frame is needed. A host with physical keys passes the release's logical key to
     /// `physical_then` instead, so the focused `on_physical_input` hears it first.
     pub(crate) fn key_up(&mut self, app: &mut dyn AppDriver, ev: KeyEvent) -> bool {
+        if matches!(ev.key, crate::Key::Media(_)) && !self.kbd.media_keys { return false; }
         if !self.wants_key_up() { return false; }
         if self.frame.queue.is_empty() && !self.commit.dirty && self.eat_ime_key_up(app) { return false; }
         self.frame.queue.push(Action::KeyUp(ev));
@@ -312,6 +447,7 @@ impl RuntimeCore {
     /// element with a handler (deepest first), inside the open modal if there is one. If focus moved since the key went down, the element that had
     /// focus on the press (and its ancestors) hears the release first.
     pub(in crate::runtime) fn route_key_up(&mut self, app: &mut dyn AppDriver, ev: &KeyEvent, tx: &mut Tx) -> bool {
+        if matches!(ev.key, crate::Key::Media(_)) && !self.kbd.media_keys { return false; }
         if self.eat_ime_key_up(app) { return false; }
         tx.focused = self.focused_key();
         let pressed = self.kbd.route_key_release().and_then(|p| self.live_index(&p));
@@ -361,3 +497,7 @@ mod tests;
 #[cfg(test)]
 #[path = "gesture_tests.rs"]
 mod gesture_tests;
+
+#[cfg(test)]
+#[path = "modal_wheel_tests.rs"]
+mod modal_wheel_tests;

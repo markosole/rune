@@ -26,12 +26,16 @@ pub(super) struct Renderer {
     pub(super) selectable: bool,
     /// `Markdown::scroll_wide`.
     pub(super) scroll_wide: bool,
+    /// `Markdown::wrap_anywhere`.
+    pub(super) wrap_anywhere: bool,
     /// `Markdown::dir_tentative`.
     pub(super) tentative: Option<rune::Direction>,
     pub(super) highlighter: Highlighter,
     pub(super) sources: Rc<[Source]>,
     /// The next of `sources`, advanced at each [`Block::Code`] in document order.
     pub(super) next_source: Cell<usize>,
+    /// The next diff fence index, advanced at each [`Block::Diff`] in document order.
+    pub(super) next_diff: Cell<usize>,
     pub(super) tasks: Rc<[Option<(bool, usize)>]>,
     /// The next of `tasks`, advanced at each list item in document order.
     pub(super) next_task: Cell<usize>,
@@ -41,6 +45,8 @@ pub(super) struct Renderer {
     pub(super) diagram_frame: Option<FrameWire>,
     /// `Markdown::code_frame`.
     pub(super) code_frame: Option<CodeWire>,
+    /// `Markdown::diff_frame`.
+    pub(super) diff_frame: Option<DiffFrameFn>,
     /// `Markdown::quote_frame`.
     pub(super) quote_frame: Option<QuoteWire>,
     /// `Markdown::link_favicon`.
@@ -145,16 +151,17 @@ fn block_key(i: usize, keys: &[String], used: &mut Vec<String>) -> String {
 /// (margin-top, margin-bottom) per block, collapsed like CSS margins.
 pub(super) fn margins(b: &Block, s: &MarkdownStyle) -> (f32, f32) {
     match b {
-        Block::Para(_) => (0.0, 12.0),
-        Block::Heading(1, _) => (28.0, 12.0),
-        Block::Heading(2, _) => (24.0, 10.0),
-        Block::Heading(..) => (20.0, 8.0),
+        Block::Para(_) => (s.paragraph_margin[0], s.paragraph_margin[1]),
+        Block::Heading(level, _) => {
+            let [top, bottom] = s.heading_margin[usize::from((*level).clamp(1, 4) - 1)];
+            (top, bottom)
+        }
         Block::Code { .. } | Block::Diff(_) | Block::Mermaid(_) => (s.code_margin[0], s.code_margin[1]),
         Block::List { .. } => (8.0, 12.0),
         Block::Quote(_) => (16.0, 16.0),
         Block::Rule => (32.0, 32.0),
         Block::Table(_) => (s.table_margin[0], s.table_margin[1]),
-        Block::Image { .. } => (24.0, 24.0),
+        Block::Image { .. } => (s.image_margin[0], s.image_margin[1]),
     }
 }
 

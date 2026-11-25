@@ -35,7 +35,7 @@ pub(super) struct StartedWebApp {
     pub(super) fonts: &'static [&'static [u8]],
 }
 
-type StartFn = Box<dyn FnOnce(Vec<Vec<u8>>, (f32, f32), Env, Waker) -> StartedWebApp>;
+type StartFn = Box<dyn FnOnce(Vec<Vec<u8>>, (f32, f32), Env, Waker, Waker) -> StartedWebApp>;
 
 /// Everything `Browser` holds of an `App<S>` before `start_app` constructs its `Runtime<S>`.
 pub(super) struct PendingApp {
@@ -45,6 +45,8 @@ pub(super) struct PendingApp {
     pub(super) embedded: bool,
     pub(super) document: bool,
     pub(super) fit_height: bool,
+    pub(super) srgb_blend: bool,
+    pub(super) cpu_first: crate::CpuFirst,
     pub(super) font_urls: Vec<String>,
     pub(super) late_font_urls: Vec<String>,
     pub(super) on_ready: Option<OnWindow>,
@@ -65,8 +67,8 @@ impl PendingApp {
         Ok(())
     }
 
-    pub(super) fn start(self, fonts: Vec<Vec<u8>>, viewport: (f32, f32), env: Env, wake: Waker) -> StartedWebApp {
-        (self.start)(fonts, viewport, env, wake)
+    pub(super) fn start(self, fonts: Vec<Vec<u8>>, viewport: (f32, f32), env: Env, wake: Waker, live_wake: Waker) -> StartedWebApp {
+        (self.start)(fonts, viewport, env, wake, live_wake)
     }
 }
 
@@ -89,6 +91,8 @@ pub(super) trait WebApp {
     fn compositor_animating(&self) -> bool;
     fn compositor_draws_own(&self) -> bool;
     fn render_compositor(&mut self, args: CompositorFrame<'_>) -> bool;
+    fn release_compositor_gpu(&mut self);
+    fn inspect_frame(&mut self);
     fn paste_event(&mut self, clipboard: &crate::clipboard::Client, content: crate::ClipboardContent, image: Option<&JsValue>);
 }
 
@@ -138,6 +142,10 @@ impl dyn WebApp + '_ {
         self.driver(|rt, app| rt.pointer_move(app, x, y));
     }
 
+    pub(super) fn observe_pointer(&mut self, x: f32, y: f32) -> bool {
+        self.driver(|rt, app| rt.observe_pointer(app, x, y))
+    }
+
     pub(super) fn mouse_button(
         &mut self,
         input: crate::input::host_events::MouseButtonInput,
@@ -152,15 +160,22 @@ impl dyn WebApp + '_ {
 
     pub(super) fn keyboard(
         &mut self,
-        clipboard: &crate::clipboard::Client,
         event: &winit::event::KeyEvent,
         mods: winit::keyboard::ModifiersState,
     ) -> bool {
-        self.driver(|rt, app| crate::input::host_events::keyboard(rt, app, clipboard, event, mods, None))
+        self.driver(|rt, app| crate::input::host_events::keyboard(rt, app, event, mods, None))
     }
 
-    pub(super) fn touch(&mut self, touch: &winit::event::Touch) {
-        self.driver(|rt, app| crate::window::touch_core(rt, app, touch));
+    pub(super) fn touch_at(&mut self, touch: &winit::event::Touch, time: f64) {
+        self.driver(|rt, app| crate::window::touch_core_at(rt, app, touch, time));
+    }
+
+    pub(super) fn confirm_touch_hold(&mut self, attempt: crate::machine::Attempt) -> bool {
+        self.driver(|rt, app| rt.confirm_touch_hold(app, attempt))
+    }
+
+    pub(super) fn host_touch_hold(&mut self, id: u64) -> bool {
+        self.driver(|rt, app| rt.host_touch_hold(app, id))
     }
 
     pub(super) fn web_focus_field(&mut self) -> bool {
@@ -175,8 +190,12 @@ impl dyn WebApp + '_ {
         self.driver(|rt, app| rt.web_key(app, event))
     }
 
-    pub(super) fn web_edit(&mut self, event: &serde_json::Value) {
-        self.driver(|rt, app| rt.web_edit(app, event));
+    pub(super) fn web_edit(&mut self, event: &serde_json::Value, mirror: &mut crate::runtime::web_runtime::Mirror) {
+        self.driver(|rt, app| rt.web_edit(app, event, mirror));
+    }
+
+    pub(super) fn web_secure_replace(&mut self, key: &str, text: String) {
+        self.driver(|rt, app| rt.web_secure_replace(app, key, text));
     }
 }
 
@@ -189,6 +208,7 @@ pub(super) struct TypedWebApp<S: 'static> {
     rt: Runtime<S>,
     shared: Arc<Shared<S>>,
     compositor: Option<Box<dyn Compositor<S>>>,
+    on_frame_drawn: Option<crate::frame::encoded::OnFrameDrawn<S>>,
 }
 
 impl<S: 'static> TypedWebApp<S> {
@@ -200,25 +220,22 @@ impl<S: 'static> TypedWebApp<S> {
         let size = app.spec.size;
         let canvas_id = app.canvas_id.take();
         let fit_height = app.fit_content_height;
+        let srgb_blend = app.runtime.srgb_blend;
+        let cpu_first = app.cpu_first;
         let font_urls = std::mem::take(&mut app.font_urls);
         let late_font_urls = std::mem::take(&mut app.late_font_urls);
         let on_ready = app.on_ready.take();
         let same_tab_router = app.same_tab_router.take();
         let compositor_features = app.compositor.as_ref().map_or(wgpu::Features::empty(), |c| c.features());
         let shared = app.shared.core.clone();
-        let start: StartFn = Box::new(move |fonts, viewport, env, wake| {
+        let start: StartFn = Box::new(move |fonts, viewport, env, wake, live_wake| {
             app.spec.fonts = with_fonts(app.spec.fonts, fonts);
-            let compositor = app.compositor.take();
-            let (playground, attach_playground) = (app.playground.take(), app.attach_playground);
-            let spec_fonts = app.spec.fonts;
-            let (spec, state, shared, runtime) = app.into_parts(None);
-            let mut rt = crate::tooling::runtime_for(&spec, state, viewport, env, wake.clone());
-            if let Some(attach) = attach_playground { attach(&mut rt, playground, &spec, None, None, true); }
-            rt.configure(runtime);
+            let (rt, shared, compositor, on_frame_drawn, spec_fonts) =
+                super::super::web_math::start_web_runtime(app, viewport, env, wake.clone(), live_wake);
             let menus = crate::native_menu::MenuGuard::attach(&shared, false);
             let shortcuts = crate::shortcuts::Guard::attach(&shared, wake, false, false);
             StartedWebApp {
-                app: Box::new(TypedWebApp { rt, shared, compositor }),
+                app: Box::new(TypedWebApp { rt, shared, compositor, on_frame_drawn }),
                 menus,
                 shortcuts,
                 fonts: spec_fonts,
@@ -231,6 +248,8 @@ impl<S: 'static> TypedWebApp<S> {
             embedded,
             document,
             fit_height,
+            srgb_blend,
+            cpu_first,
             font_urls,
             late_font_urls,
             on_ready,
@@ -291,6 +310,18 @@ impl<S: 'static> WebApp for TypedWebApp<S> {
         };
         c.render(&mut f);
         c.animating()
+    }
+
+    fn release_compositor_gpu(&mut self) {
+        if let Some(c) = self.compositor.as_mut() {
+            c.release_gpu();
+        }
+    }
+
+    fn inspect_frame(&mut self) {
+        if let Some(hook) = self.on_frame_drawn.as_mut() {
+            hook(&self.rt);
+        }
     }
 
     fn paste_event(&mut self, clipboard: &crate::clipboard::Client, content: crate::ClipboardContent, image: Option<&JsValue>) {

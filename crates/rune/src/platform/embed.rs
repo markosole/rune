@@ -9,7 +9,7 @@ use std::sync::{Arc, OnceLock};
 use crate::compose::{Compositor, Frame};
 use crate::frame::clock::FrameClock;
 use crate::frame::host_step::{self, Acquire};
-use crate::platform::embed_frame::{self, EmbedSurface, FrameSummary};
+use crate::platform::embed_frame::{self, EmbedSurface, EmbedSurfaceEvent, EmbedSurfaceHealth, FrameSummary};
 use crate::render::{Gpu, Renderer};
 use crate::runtime::{AppDriver, Env, Runtime, RuntimeCore, Waker};
 use crate::time::Instant;
@@ -20,7 +20,7 @@ static SHARED_GPU: OnceLock<Result<Arc<Gpu>, String>> = OnceLock::new();
 
 fn shared_gpu() -> Result<Arc<Gpu>, String> {
     SHARED_GPU
-        .get_or_init(|| Gpu::try_new(Gpu::instance(), None).map(Arc::new))
+        .get_or_init(|| Gpu::try_for_display(Gpu::instance(), wgpu::Features::empty()).map(Arc::new))
         .clone()
 }
 
@@ -31,7 +31,7 @@ pub fn prewarm() {
     STARTED.get_or_init(|| {
         std::thread::Builder::new().name("rune-embed-prewarm".into()).spawn(|| {
             if let Ok(gpu) = shared_gpu() {
-                let _ = Renderer::new(&gpu.device, wgpu::TextureFormat::Bgra8Unorm);
+                Renderer::try_new(&gpu.device, wgpu::TextureFormat::Bgra8Unorm).ok();
             }
         }).ok();
     });
@@ -76,6 +76,7 @@ struct LayerHostCore {
     renderer: Renderer,
     clock: FrameClock,
     suspended: bool,
+    surface_health: EmbedSurfaceHealth,
 }
 
 impl LayerHostCore {
@@ -99,7 +100,7 @@ impl LayerHostCore {
             .ok_or_else(|| "CAMetalLayer has no supported wgpu surface configuration".to_owned())?;
         crate::window::configure(&surface, &gpu, &config)?;
         let target_format = config.format.remove_srgb_suffix();
-        let mut renderer = Renderer::new(&gpu.device, target_format);
+        let mut renderer = Renderer::try_new(&gpu.device, target_format)?;
         renderer.set_srgb_blend(true);
         let size = (px_w as f32 / scale, px_h as f32 / scale);
         let now = crate::time::now();
@@ -110,6 +111,7 @@ impl LayerHostCore {
             renderer,
             clock: FrameClock::new(now),
             suspended: viewport.0 <= 0.0 || viewport.1 <= 0.0,
+            surface_health: EmbedSurfaceHealth::default(),
         };
         Ok((core, size, scale, now))
     }
@@ -129,6 +131,7 @@ impl LayerHostCore {
             return;
         }
         self.suspended = false;
+        self.surface_health.step(EmbedSurfaceEvent::Resized);
         let scale = scale.max(1.0);
         let max_dim = self.gpu.device.limits().max_texture_dimension_2d.max(1);
         let px_w = ((viewport.0 * scale).round() as u32).clamp(1, max_dim);
@@ -188,6 +191,9 @@ impl LayerHostCore {
         self.renderer.submit(&self.gpu.queue, prepared.encoder);
         self.gpu.queue.present(prepared.frame);
         crate::render::gpu_events::presented();
+        if !self.gpu.is_lost() {
+            self.renderer.warm_effects(&self.gpu.device);
+        }
         crate::time::now()
     }
 }
@@ -259,6 +265,7 @@ impl<S: 'static> EmbedSurface for LayerHost<S> {
     type Prepared = PreparedEmbedFrame;
 
     fn suspended(&self) -> bool { self.core.suspended }
+    fn surface_health_mut(&mut self) -> &mut EmbedSurfaceHealth { &mut self.core.surface_health }
     fn renderer_srgb_blend(&self) -> bool { self.core.renderer.srgb_blend() }
     fn rt_srgb_blend(&self) -> bool { self.rt.core().srgb_blend() }
     fn reblend(&mut self) -> bool { self.core.reblend(self.rt.core_mut()) }

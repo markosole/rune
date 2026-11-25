@@ -102,6 +102,13 @@ impl Press {
         (self.attach.press)(&mut el, self.cb.clone(), self.key.clone(), fields.into());
         el
     }
+
+    /// Runs the function now, as a `press` of the node with `fields` added to its event: for
+    /// input the host node takes itself, such as a key its element handles (`El::on_key`), where
+    /// there is no press to attach to.
+    pub fn run<S: 'static>(&self, s: &mut S, tx: &mut rune::Tx, fields: Vec<(&'static str, Data)>) {
+        super::run_press(s, tx, &self.cb, self.key.as_deref(), &fields.into());
+    }
 }
 
 impl NodeArgs {
@@ -175,6 +182,20 @@ impl NodeArgs {
     /// Whether the render is for the dark appearance.
     pub fn dark(&self) -> bool {
         self.env.dark
+    }
+
+    /// Whether the render is under reduced motion ([`rune::Cx::is_reduced_motion`]).
+    ///
+    /// ```
+    /// use rune_luau::HostNode;
+    ///
+    /// let _node = HostNode::new("badge", |args| {
+    ///     let label = if args.reduced_motion() { "Still" } else { "Animated" };
+    ///     Ok(rune::text(label))
+    /// });
+    /// ```
+    pub fn reduced_motion(&self) -> bool {
+        self.env.reduced_motion
     }
 
     /// The script function in prop `name`.
@@ -287,7 +308,7 @@ unsafe fn build_from(state: *mut ffi::lua_State, el: El, tables: [c_int; 2], arg
                     let unknown = |name: &str| !own && node.known.as_ref().is_some_and(|known| !known(name));
                     match props::key_atom(state, -2) {
                         // The build attaches the handlers it takes; one it didn't read is unknown.
-                        Ok(Atom::OnPress | Atom::OnHover | Atom::OnMiddlePress) => {
+                        Ok(Atom::OnPress | Atom::OnHover | Atom::OnMiddlePress | Atom::OnScroll) => {
                             if let Some(k) = key
                                 && unknown(k)
                             {

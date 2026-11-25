@@ -12,6 +12,9 @@ pub(crate) struct Mirror {
     pub anchor: u32,
     pub focus: u32,
     pub secure: bool,
+    /// True after the browser mutates the hidden textarea outside a Rust sync (a DOM edit or a
+    /// deferred composition sync), so the next diff resyncs even if the model matches the cache.
+    stale: bool,
 }
 
 /// Read at most 512 UTF-16 units on each side, without scanning the document prefix.
@@ -67,11 +70,14 @@ fn whole_lines<'a>(edit: &'a crate::TextEdit, (start, text, anchor, focus): (usi
 }
 
 impl Mirror {
+    pub(crate) fn invalidate(&mut self) { self.stale = true; }
+
     fn update(&mut self, key: &str, edit: Option<&crate::TextEdit>) -> bool {
         let secure = edit.is_some_and(|e| e.is_secure());
         let (base, text, anchor, focus) = edit.filter(|_| !secure).map(|e| whole_lines(e, context_window(e))).unwrap_or((0, "", 0, 0));
-        if self.key == key && self.base == base && self.text == text && self.anchor == anchor
+        if !self.stale && self.key == key && self.base == base && self.text == text && self.anchor == anchor
             && self.focus == focus && self.secure == secure { return false; }
+        self.stale = false;
         self.key.clear(); self.key.push_str(key);
         self.text.clear(); self.text.push_str(text);
         self.base = base; self.anchor = anchor; self.focus = focus; self.secure = secure;
@@ -95,8 +101,8 @@ impl RuntimeCore {
     /// frame inside that event. The rest (a move's hover, enter and leave, what a frame reports
     /// for the next: layout, visibility, rows shown, a selection's change) waits for the display.
     fn web_needs_event(action: &Action) -> bool {
-        matches!(action, Action::Press(..) | Action::DoublePress(_) | Action::MiddlePress(_) | Action::Link(..) | Action::LinkSecondary(..)
-            | Action::SecondaryPress(..) | Action::Drag(..) | Action::DragRepeat(..) | Action::DragStart(_) | Action::DragEnd(..) | Action::Dismiss(_)
+        matches!(action, Action::Press(..) | Action::DoublePress(..) | Action::MiddlePress(..) | Action::AnyPress(..) | Action::Link(..) | Action::LinkSecondary(..)
+            | Action::SecondaryPress(..) | Action::SecondaryRepost { .. } | Action::Drag(..) | Action::DragRepeat(..) | Action::DragStart(_) | Action::DragEnd(..) | Action::Dismiss(_)
             | Action::FieldMenu(..) | Action::Files(_) | Action::Paste(..) | Action::ClipboardRead(..) | Action::FileDialog(..) | Action::Key { .. }
             | Action::KeyUp(_) | Action::Physical(..) | Action::Focus(..) | Action::FocusControl(_) | Action::Blur)
     }
@@ -131,15 +137,24 @@ impl RuntimeCore {
         let tx = &self.frame.pending;
         if self.web_release_needs_frame() || self.kbd.focus_request.is_some() || tx.blur || tx.focus_to.is_some() || tx.select.is_some() || !tx.keys.is_empty()
             || tx.copy.is_some() || tx.paste || !tx.clipboard_reads.is_empty() || !tx.pick_reads.is_empty()
-            || !tx.open_urls.is_empty() || !tx.file_dialogs.is_empty() || !tx.popups.is_empty() || tx.clear_secret {
+            || !tx.open_urls.is_empty() || !tx.open_paths.is_empty() || !tx.file_dialogs.is_empty() || !tx.popups.is_empty() || tx.field_menu_resolution.is_some() || tx.clear_secret {
             return None;
         }
+        if self.focused_input_read_only() || self.focused_input_disabled() { return None; }
         let access = self.focused_input()?.access.clone()?;
         let key = self.kbd.focus.path()?;
         Some(mirror.update(key, Some(access(app.states()))))
     }
+    /// Whether Rune currently has keyboard focus on an editable text input (plain or secure),
+    /// matching the condition under which [`Self::web_context`] populates `mirror.key`.
+    pub(crate) fn web_has_editable_focus(&self) -> bool {
+        !self.focused_input_read_only()
+            && !self.focused_input_disabled()
+            && self.focused_input().is_some_and(|i| i.access.is_some())
+    }
+
     pub(crate) fn web_context(&self, mirror: &mut Mirror) -> bool {
-        match self.focused_input().filter(|i| i.access.is_some()) {
+        match self.focused_input().filter(|i| i.access.is_some() && !self.focused_input_read_only() && !self.focused_input_disabled()) {
             Some(input) => mirror.update(self.kbd.focus.path().unwrap_or_default(), Some(&input.edit)),
             None => mirror.update("", None),
         }
@@ -153,12 +168,13 @@ impl RuntimeCore {
             .and_then(|c| c.parse::<crate::Shortcut>().ok())
             .map(|s| s.physical_key());
         let key = match crate::input::key_table::named_key_from_str(name) {
+            Some(crate::Key::Media(_)) if !self.kbd.media_keys => return false,
             Some(key) => key,
             None if name == " " => crate::Key::Text(" ".into()),
             None if mods.cmd => {
                 let mut chars = name.chars();
                 match (chars.next(), chars.next()) {
-                    (Some(c), None) => {
+                    (Some(c), None) if !c.is_control() => {
                         let c = if !c.is_ascii() { code.and_then(crate::shortcuts::us_char).unwrap_or(c) } else { c };
                         crate::Key::Command(c.to_ascii_lowercase())
                     }
@@ -167,11 +183,12 @@ impl RuntimeCore {
             }
             None => return false,
         };
+        let base = crate::window::web_key_base_str(name, mods);
         let event_key = crate::KeyEvent { key, mods };
         let activate = event_key.key == crate::Key::Tab;
         let repeat = flag("repeat");
         if let Some(key) = code {
-            self.physical_with_fallback(app, crate::PhysicalInput::Key { key, mods, pressed: true, repeat }, Some(event_key));
+            self.physical_then(app, crate::PhysicalInput::Key { key, mods, pressed: true, repeat }, Some(event_key), base, None);
         } else if repeat {
             self.repeat_key(event_key);
         } else {
@@ -182,14 +199,33 @@ impl RuntimeCore {
 
     pub(crate) fn web_secure(&mut self, key: &str, text: String) {
         let event = crate::KeyEvent { key: crate::Key::Text(text), mods: crate::Mods::default() };
-        if self.kbd.focus.path() == Some(key) && self.has_secure_focus() {
+        if self.kbd.focus.path() == Some(key) && self.has_secure_focus() && !self.focused_input_read_only() {
             self.key(event);
         }
     }
 
-    pub(crate) fn web_edit(&mut self, app: &mut dyn AppDriver, event: &serde_json::Value) {
+    /// Replaces the focused secure field's whole text as one edit (browser autofill or password
+    /// manager fill). Keeps the incoming value in a `Zeroizing` buffer and writes nothing to
+    /// event logs, traces or DOM mirrors.
+    pub(crate) fn web_secure_replace(&mut self, app: &mut dyn AppDriver, key: &str, text: String) {
+        let text = zeroize::Zeroizing::new(text);
+        if self.kbd.focus.path() != Some(key) || !self.has_secure_focus() || self.focused_input_read_only() { return; }
+        let mut tx = self.transaction(app);
+        let changed = self.with_focused(app, |edit| {
+            let len = edit.text.len();
+            edit.set_selection(0, len);
+            edit.paste(&text)
+        }, &mut tx);
+        if changed { self.commit.dirty = true; }
+        merge(&mut self.frame.pending, tx);
+    }
+
+    pub(crate) fn web_edit(&mut self, app: &mut dyn AppDriver, event: &serde_json::Value, mirror: &mut Mirror) {
+        // The browser just mutated its hidden textarea, so the cached mirror no longer matches
+        // the DOM even if the edit is rejected or `on_input_change` reverts or clears the text.
+        if event["kind"] == "edit" { mirror.invalidate(); }
         let Some(key) = event["key"].as_str() else { return };
-        if self.kbd.focus.path() != Some(key) || self.has_secure_focus() { return; }
+        if self.kbd.focus.path() != Some(key) || self.has_secure_focus() || self.focused_input_read_only() { return; }
         let number = |key: &str| event[key].as_u64().and_then(|n| usize::try_from(n).ok());
         let Some(base) = number("base") else { return };
         let Some(expected) = event["expected"].as_str() else { return };

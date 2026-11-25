@@ -21,6 +21,7 @@ use windows_sys::Win32::System::Threading::{
 /// How long a registered wait waits before it gives the frame anyway: a swap chain that was
 /// made again or lost never signals the object the wait holds.
 const GIVE_UP_MS: u32 = 100;
+const MAX_DRAIN: usize = 64;
 
 /// One surface's swap chain, as the next frame sees it: an app window's or an overlay's.
 #[derive(Default)]
@@ -29,9 +30,9 @@ pub(crate) enum Slot {
     #[default]
     Unclaimed,
     /// Can draw or retry this frame until the host actually presents it.
-    Ready { generation: u64, source: usize },
+    Ready { binding: Option<(u64, usize)> },
     /// The wait that asks for the next frame is registered (dropping it unregisters it).
-    Waiting { wait: Wait, generation: u64, source: usize },
+    Waiting { wait: Wait, binding: Option<(u64, usize)> },
 }
 
 /// What the surface's next frame does (`Slot::take`).
@@ -68,27 +69,42 @@ impl Slot {
     /// asks the loop for the frame from the thread-pool thread. `None` draws synchronously.
     fn take(&mut self, generation: u64, waitable: Option<HANDLE>, wake: Option<impl Fn() + Send + 'static>) -> Take {
         let Some(object) = waitable else { self.reset(); return Take::Draw; };
-        let source = object as usize;
+        let binding = (generation, object as usize);
         self.came_back();
-        match *self {
-            Slot::Ready { generation: g, source: s } if g == generation && s == source => return Take::Draw,
-            Slot::Waiting { generation: g, source: s, .. } if g == generation && s == source && wake.is_some() => return Take::Later,
+        match self {
+            Slot::Ready { binding: old } if old.is_none_or(|old| old == binding) => {
+                *old = Some(binding);
+                return Take::Draw;
+            }
+            Slot::Waiting { binding: old, .. } if old.is_none_or(|old| old == binding) && wake.is_some() => {
+                *old = Some(binding);
+                return Take::Later;
+            }
             _ => self.reset(),
         }
         // SAFETY: zero-timeout wait on a live swap-chain handle claims one available permit.
         let claimed = unsafe { WaitForSingleObject(object, 0) } == WAIT_OBJECT_0;
-        if !claimed && let Some(wake) = wake && let Some(wait) = Wait::register(object, Box::new(wake)) {
-            *self = Slot::Waiting { wait, generation, source };
-            return Take::Later;
+        if let Some(wake) = wake {
+            if claimed {
+                // Missed or synchronous frames may leave extra counts on a reused semaphore.
+                // Drain them only on ordinary draws, and bound the probes for other handle types.
+                for _ in 0..MAX_DRAIN {
+                    // SAFETY: this is the live swap-chain handle and the wait cannot block.
+                    if unsafe { WaitForSingleObject(object, 0) } != WAIT_OBJECT_0 { break; }
+                }
+            } else if let Some(wait) = Wait::register(object, Box::new(wake)) {
+                *self = Slot::Waiting { wait, binding: Some(binding) };
+                return Take::Later;
+            }
         }
-        *self = Slot::Ready { generation, source };
+        *self = Slot::Ready { binding: Some(binding) };
         Take::Draw
     }
 
     /// Use this wait's completion. A queued wake from a replaced swap chain cannot grant room.
     pub(crate) fn came_back(&mut self) -> bool {
-        if let Slot::Waiting { wait, generation, source } = self && wait.completed() {
-            *self = Slot::Ready { generation: *generation, source: *source };
+        if let Slot::Waiting { wait, binding } = self && wait.completed() {
+            *self = Slot::Ready { binding: *binding };
             return true;
         }
         false
@@ -96,6 +112,16 @@ impl Slot {
 
     /// A frame was presented on `surface`.
     pub(crate) fn presented(&mut self) { self.reset(); }
+
+    /// A successful in-place resize keeps the kernel semaphore even when DXGI replaces its
+    /// handle. Rebind the existing reservation or wait to the new generation on the next draw.
+    pub(crate) fn reconfigured(&mut self, ok: bool) {
+        if !ok { self.reset(); return; }
+        match self {
+            Slot::Ready { binding } | Slot::Waiting { binding, .. } => *binding = None,
+            Slot::Unclaimed => {}
+        }
+    }
 
     /// Discard the old frame's reservation and cancel any outstanding wait.
     pub(crate) fn reset(&mut self) { *self = Slot::Unclaimed; }

@@ -50,9 +50,9 @@ pub(crate) mod virtual_rows;
 mod visual;
 mod visuals;
 
-pub use a11y::LiveRegion;
+pub use a11y::{AutoComplete, HasPopup, LiveRegion, Orientation};
 pub(crate) use a11y::{A11y, Checked};
-pub use anchor::{Anchor, Side, anchor_rect};
+pub use anchor::{Anchor, Side, anchor_rect, anchor_rect_in};
 pub(crate) use crate::clipboard::tx::{ClipboardRead, ReadFn};
 pub use crate::cursor::{Cursor, CursorImage};
 pub use direction::Direction;
@@ -63,10 +63,13 @@ pub(crate) use focus::ModalSpec;
 pub(crate) use handler_set::Handlers;
 pub use grid::{GridRow, grid};
 pub use handlers::{Drag, Phase, PointerEvent, PointerPress};
-pub(crate) use handlers::{DragEndFn, DragFn, DragOutFn, InputKeyFn, PointerFn, PressFn, StepFn, StepLimitFn, WindowDrag};
+pub(crate) use handlers::{A11yActionFn, AnyPressFn, DragEndFn, DragFn, DragOutFn, InputKeyFn, PointerFn, PressFn, SetValueFn, StepFn, StepLimitFn, WindowDrag};
 pub(crate) use help::{HELP_KEY, HELP_ROW, help_words};
 pub use input::{InputSpec, auto_grow, edit_access, text_input};
+#[doc(hidden)]
+pub use layout::PathBind;
 pub use pills::{InlineIcon, InlineImage};
+pub use rare::OptionAsAlt;
 pub(crate) use rare::{ElCold, ElFlags, RoleTag};
 pub use rune_motion::Cycle;
 pub(crate) use scroll::FadeStyle;
@@ -75,9 +78,10 @@ pub use scroll::ScrollSpec;
 pub(crate) use scroll::{AtBottomFn, ScrollAxes, ScrollEdges, VisibleRowsFn};
 pub use selection_style::SelectionStyle;
 pub(crate) use sticky::{Sticky, StickyEdge};
-pub(crate) use text_spec::{Elide, TextDir, TextDirEvent, step_text_dir};
+pub(crate) use text_spec::{Elide, TextDir, TextDirEvent, step_text_dir, wipe_links, wipe_string};
+pub use text_spec::LineFill;
 pub use text_spec::TextSpec;
-pub(crate) use tx::{Commit, FocusAsk, MotionSource, SelectRequest, TraceCalls};
+pub(crate) use tx::{Commit, FocusAsk, FullScreenRequest, MotionSource, SelectRequest, TraceCalls};
 pub use tx::{Shell, Tx};
 pub(crate) use visual::VisualFlags;
 pub use visual::{Visual, VisualCold};
@@ -147,23 +151,34 @@ pub(crate) struct PasteFn {
 }
 /// A pill's leading icon by its id; see [`El::pill_icon`].
 pub(crate) type PillIconFn = Rc<dyn Fn(&str) -> Option<&'static crate::Icon>>;
+/// A pill's leading full-colour image by its id; see [`El::pill_image`].
+pub(crate) type PillImageFn = Rc<dyn Fn(&str) -> Option<crate::Pixels>>;
 /// A pill's look by its id; see [`El::pill_style`].
 pub(crate) type PillStyleFn = Rc<dyn Fn(&str) -> PillStyle>;
-pub(crate) type PillSecondaryFn = Rc<dyn Fn(crate::states::States<'_>, &str, PointerPress, &mut Tx) -> bool>;
+/// A pill's plain-text copy payload by its id; see [`El::pill_copy_text`].
+pub(crate) type PillCopyTextFn = Rc<dyn Fn(&str) -> Option<String>>;
+pub(crate) type PillPressFn = Rc<dyn Fn(crate::states::States<'_>, &str, PointerPress, &mut Tx) -> bool>;
+pub(crate) type PillSecondaryFn = PillPressFn;
 
 /// How one [`Mark::Pill`](crate::Mark::Pill) chip looks: any part left unset falls back to
 /// [`El::pill_colors`] and [`El::pill_icon`], then the field's defaults. Build one with
-/// `PillStyle::default().bg(..).icon(..)`.
+/// `PillStyle::new().bg(..).ring(..).radius(..)`.
+///
+/// For a full-colour leading logo ([`Pixels`](crate::Pixels)) without giving up `Copy` or
+/// `const` construction on `PillStyle`, attach [`El::pill_image`] on a `text_input` or
+/// [`El::pill_with_image`] on static text.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PillStyle {
     pub(crate) bg: Option<Color>,
     pub(crate) fg: Option<Color>,
     pub(crate) icon: Option<&'static crate::Icon>,
+    pub(crate) ring: Option<(Color, f32)>,
+    pub(crate) radius: Option<f32>,
 }
 
 impl PillStyle {
     pub const fn new() -> Self {
-        Self { bg: None, fg: None, icon: None }
+        Self { bg: None, fg: None, icon: None, ring: None, radius: None }
     }
     /// The chip's colour.
     pub const fn bg(mut self, bg: Color) -> Self {
@@ -180,23 +195,69 @@ impl PillStyle {
         self.icon = Some(icon);
         self
     }
+    /// An inset `color` border ring `width` points wide around the chip (ignored when `width`
+    /// is not finite and positive), matching [`LinkPaint::ring`](crate::text::LinkPaint::ring)
+    /// and [`TextHighlight::ring`](crate::text::TextHighlight::ring).
+    ///
+    /// ```
+    /// use rune::{Color, PillStyle};
+    ///
+    /// const MENTION: PillStyle = PillStyle::new()
+    ///     .bg(Color { r: 0.2, g: 0.4, b: 0.9, a: 0.15 })
+    ///     .ring(Color { r: 0.2, g: 0.4, b: 0.9, a: 0.6 }, 1.0)
+    ///     .radius(999.0);
+    /// ```
+    pub const fn ring(mut self, color: Color, width: f32) -> Self {
+        self.ring = if width > 0.0 && width.is_finite() { Some((color, width)) } else { None };
+        self
+    }
+    /// Corner radius of the chip in points (default `5.0`), clamped to half the chip's height
+    /// at paint time as CSS `border-radius` does. Non-finite or negative values become `0.0`.
+    /// Pass a large value such as `999.0` for a full capsule shape.
+    ///
+    /// ```
+    /// use rune::PillStyle;
+    ///
+    /// const CAPSULE: PillStyle = PillStyle::new().radius(999.0);
+    /// ```
+    pub const fn radius(mut self, points: f32) -> Self {
+        self.radius = Some(if points.is_finite() && points > 0.0 { points } else { 0.0 });
+        self
+    }
 }
 pub(crate) type InputPasteFn = Rc<dyn Fn(crate::states::States<'_>, &crate::ClipboardContent, &mut Tx) -> bool>;
+pub(crate) type InputCopyFn = Rc<dyn Fn(crate::states::States<'_>, bool, &mut Tx) -> Option<crate::ClipboardContent>>;
 pub(crate) type PickFn = Box<dyn FnOnce(crate::states::States<'_>, Option<crate::Picked>, &mut Tx)>;
+pub(crate) type TextOffsetFn = Box<dyn FnOnce(crate::states::States<'_>, Option<usize>, &mut Tx)>;
+pub(crate) type ElementsReadFn = Box<dyn FnOnce(crate::states::States<'_>, &[crate::ElementInfo], &mut Tx)>;
 
 #[derive(Clone)]
-pub(crate) struct PickRead {
-    pub within: Option<String>,
-    pub x: f32,
-    pub y: f32,
-    pub pick: crate::Pick,
-    pub(crate) f: Rc<std::cell::Cell<Option<PickFn>>>,
-}
-impl PickRead {
-    pub fn take(&self) -> Option<PickFn> { self.f.take() }
+pub(crate) enum PickRead {
+    Element {
+        within: Option<String>,
+        x: f32,
+        y: f32,
+        pick: crate::Pick,
+        f: Rc<std::cell::Cell<Option<PickFn>>>,
+    },
+    TextOffset {
+        key: String,
+        x: f32,
+        y: f32,
+        f: Rc<std::cell::Cell<Option<TextOffsetFn>>>,
+    },
+    Elements {
+        f: Rc<std::cell::Cell<Option<ElementsReadFn>>>,
+    },
 }
 impl std::fmt::Debug for PickRead {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("PickRead") }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Element { .. } => f.write_str("PickRead::Element"),
+            Self::TextOffset { .. } => f.write_str("PickRead::TextOffset"),
+            Self::Elements { .. } => f.write_str("PickRead::Elements"),
+        }
+    }
 }
 
 /// What an `El::selection_copy` element copies for a selection inside it.
@@ -349,11 +410,34 @@ impl El {
     pub fn live_offset(mut self, value: impl Into<crate::live::Binding<[f32; 2]>>) -> Self {
         self.bind_live(crate::live::Bound::new(value, crate::live::Property::Offset)); self
     }
-    /// Bind uniform scale around the node's centre; layout remains at its target size. Text,
-    /// icons and images in the subtree scale with it, as under [`El::scale`]. Text rasterizes
-    /// at the scale rounded to 1/32, so a dragged value doesn't fill the glyph atlas.
+    /// Bind uniform scale about the element's [`origin`](Self::origin) (default centre
+    /// `(0.5, 0.5)`); layout remains at its target size, and hit testing follows the drawn rect
+    /// in paint order. Text, icons and images in the subtree scale with it, as under
+    /// [`El::scale`]. While changing, text rasterizes at logarithmic 2^(1/4) scale buckets so a
+    /// zoom gesture doesn't fill the glyph atlas, then re-rasterizes crisp at the exact resting
+    /// scale after holding still for 0.1 s. Scaling does not clip to the parent: put
+    /// [`El::clip_soft`] (e.g. `.clip_soft(0.0)`) or [`El::clip_rounded`] on an unscaled parent
+    /// viewport wrapping this element—not on the scaled element itself, whose own clip scales
+    /// with its drawn rect—or the scaled subtree will paint over siblings and take their presses.
     pub fn live_scale(mut self, value: impl Into<crate::live::Binding<f32>>) -> Self {
         self.bind_live(crate::live::Bound::new(value, crate::live::Property::Scale)); self
+    }
+    /// Bind clockwise rotation in radians about the element's [`origin`](Self::origin) (default
+    /// centre `(0.5, 0.5)`), without rebuilding or laying out the view.
+    ///
+    /// Layout keeps the upright box, so siblings don't move; while turned, the subtree draws into
+    /// its own layer and hit testing follows the turned box, as under [`El::rotate`]. Accepts a
+    /// `&Live<f32>`, a smoothed [`Live::smooth`](crate::Live::smooth) binding, or a
+    /// [`Tween<f32>`](crate::Tween).
+    ///
+    /// ```no_run
+    /// # use rune::{Color, Live, el};
+    /// let angle = Live::new(0.0_f32);
+    /// let needle = el().size(4.0, 48.0).fill(Color::WHITE).origin(0.5, 1.0).live_rotation(&angle);
+    /// angle.set(std::f32::consts::FRAC_PI_4);
+    /// ```
+    pub fn live_rotation(mut self, value: impl Into<crate::live::Binding<f32>>) -> Self {
+        self.bind_live(crate::live::Bound::new(value, crate::live::Property::Rotation)); self
     }
     /// Bind the [start, end] span of a shape's strokes that draws, as fractions (0 to 1) of
     /// their combined length, as [`Shape::trimmed`](crate::Shape::trimmed) cuts them. A

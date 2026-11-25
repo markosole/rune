@@ -24,9 +24,9 @@ impl RuntimeCore {
     /// Recomputes node-derived presence flags in a single pass over `self.nodes`.
     /// Returns whether any node has a loop spec.
     pub(in crate::runtime) fn refresh_node_flags(&mut self) -> bool {
-        let (mut dissolve, mut cache, mut pix, mut drawn_ly, mut key_up, mut sticky, mut raise, mut any_loop) =
-            (false, false, false, false, false, false, false, false);
-        let mut ordered = false;
+        let (mut dissolve, mut cache, mut pix, mut drawn_ly, mut mount, mut key_up, mut any_press, mut sticky, mut raise, mut any_loop) =
+            (false, false, false, false, false, false, false, false, false, false);
+        let (mut ordered, mut above) = (false, false);
         let mut fade_stops: Option<[f32; 2]> = None;
         for n in &self.tree.nodes {
             dissolve |= n.vis_flags.blend() == crate::render::Blend::PlusLighter;
@@ -34,9 +34,14 @@ impl RuntimeCore {
             if let Some(c) = n.cold.get() {
                 pix |= c.pixel_aspect.is_some();
                 sticky |= c.sticky.as_ref().is_some_and(|s| s.edge.is_some());
+                above |= c.above.is_some();
                 any_loop |= c.looping.is_some();
             }
-            drawn_ly |= n.handlers.get().is_some_and(|h| h.on_drawn_layout.is_some() || h.on_visible.is_some() || h.drawn_rect.is_some());
+            if let Some(h) = n.handlers.get() {
+                drawn_ly |= h.on_drawn_layout.is_some() || h.on_visible.is_some() || h.drawn_rect.is_some();
+                mount |= h.on_mount.is_some();
+                any_press |= h.on_any_press.is_some();
+            }
             key_up |= n.focus.get().is_some_and(|f| f.key_up.is_some());
             raise |= n.vis_flags.raise();
             ordered |= n.vis.paint_order != 0;
@@ -52,10 +57,13 @@ impl RuntimeCore {
         self.tree.has_cache = cache;
         self.tree.has_pixel_aspect = pix;
         self.tree.has_drawn_layout = drawn_ly;
+        self.tree.has_mount = mount;
         self.tree.has_key_up = key_up;
+        self.tree.has_any_press = any_press;
         self.tree.has_sticky = self.holding() || sticky;
         self.tree.has_raise = raise;
         self.tree.has_paint_order = ordered;
+        self.tree.has_above = above;
         self.tree.fade_stops = fade_stops.unwrap_or([0.0; 2]);
         any_loop
     }
@@ -65,9 +73,17 @@ impl RuntimeCore {
         self.paint.prune_caches(self.tree.has_cache, &self.scene, &mut self.text.atlas.resident_caches);
         self.paint.prune_static_scales(&self.scene);
         self.motion.prune_detached(&self.scene, &self.tree.node_index, REVEALS_KEPT);
+        if !self.scroll.scrolls.is_empty() {
+            self.scroll.scrolls.retain(|id, _| self.scene.contains(*id));
+        }
         if !self.commit.virtuals.is_empty() {
             let Self { commit, tree, .. } = self;
-            commit.virtuals.retain(|path, _| tree.path_ids.get(path).is_some_and(|id| tree.node_index.contains_key(id)));
+            commit.virtuals.retain(|path, _| {
+                tree.path_ids.get(path)
+                    .and_then(|id| tree.node_index.get(id))
+                    .and_then(|&i| tree.nodes.get(i))
+                    .is_some_and(|n| n.virtual_list)
+            });
         }
         if prune_paths {
             self.prune_path_ids();
@@ -91,7 +107,6 @@ impl RuntimeCore {
             if !self.scene.contains(n.id) {
                 self.hover_pruned(&n);
                 self.motion.remove_reveal(n.id);
-                self.scroll.scrolls.remove(&n.id);
                 continue;
             }
             n.parent = n.parent.and_then(|p| remap[p]);
@@ -105,7 +120,7 @@ impl RuntimeCore {
         remap.clear();
         self.commit.apply_scratch.remap = remap;
         self.prune_detached_tables(false);
-        if !self.paint.layer_paint_order().is_empty() || !self.motion.flying.is_empty() || self.tree.has_sticky || self.tree.has_raise || self.tree.has_paint_order { self.update_layer_paint_order(); }
+        if !self.paint.layer_paint_order().is_empty() || !self.motion.flying.is_empty() || self.tree.has_sticky || self.tree.has_raise || self.tree.has_paint_order || self.tree.has_above { self.update_layer_paint_order(); }
         // A removed element's live sources (a `Pixels` stream) stop waking this window.
         if self.frame.has_live_subscriptions() {
             let keep = self.frame.live.dirty();

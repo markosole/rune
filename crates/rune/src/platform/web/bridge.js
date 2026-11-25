@@ -2,6 +2,27 @@
 const MAC = /Mac|iP/.test(navigator.platform);
 const coarse = () => matchMedia('(pointer: coarse)').matches;
 export function isMac() { return MAC; }
+
+// Detects platforms whose browser dispatches touch `contextmenu` while the finger is still down
+// (Android, ChromeOS, Linux). Excludes Windows (Chrome defers touch contextmenu until finger lift
+// via context_menu_on_mouse_up), iOS/iPadOS (WebKit never fires touch contextmenu, including
+// iPadOS desktop mode where platform is MacIntel with maxTouchPoints > 1), and macOS.
+export function supportsLiveTouchContextMenu(nav = globalThis.navigator) {
+    if (!nav) return false;
+    const uad = (nav.userAgentData?.platform ?? '').toLowerCase();
+    const plat = (nav.platform ?? '').toLowerCase();
+    const ua = (nav.userAgent ?? '').toLowerCase();
+    const maxTouch = typeof nav.maxTouchPoints === 'number' ? nav.maxTouchPoints : 0;
+
+    if (uad.includes('win') || uad.includes('mac') || uad.includes('ios')) return false;
+    if (plat.includes('win') || plat.includes('mac') || /iphone|ipad|ipod/.test(plat)) return false;
+    if (/windows|iphone|ipad|ipod|macintosh|mac os x/.test(ua)) return false;
+    if (plat === 'macintel' && maxTouch > 1) return false;
+
+    if (uad.includes('android') || uad.includes('chrome os') || uad.includes('chromeos') || uad.includes('linux')) return true;
+    if (plat.includes('linux') || plat.includes('android')) return true;
+    return /android|cros|linux/.test(ua);
+}
 const high = n => n >= 0xd800 && n <= 0xdbff;
 const low = n => n >= 0xdc00 && n <= 0xdfff;
 function boundary(text, at, forward) {
@@ -28,6 +49,41 @@ function replacement(old, next, composition, caret) {
     return { start, end, text: next.slice(start, nextEnd) };
 }
 
+// HTML <textarea> normalizes CRLF and lone CR to LF in its API value. Track the normalized mirror
+// and the raw UTF-16 offsets of each CRLF so diffs leave untouched line breaks intact and offsets
+// translate cleanly between DOM coordinates and Rune's text.
+function normalizeTextarea(raw) {
+    if (!raw.includes('\r')) return { dom: raw, crlfs: null };
+    const crlfs = [];
+    const dom = raw.replace(/\r\n?/g, (match, offset) => {
+        if (match.length === 2) crlfs.push(offset);
+        return '\n';
+    });
+    return { dom, crlfs: crlfs.length ? crlfs : null };
+}
+
+function rawToDom(offset, crlfs) {
+    if (!crlfs) return offset;
+    let lo = 0, hi = crlfs.length;
+    while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (crlfs[mid] < offset) lo = mid + 1;
+        else hi = mid;
+    }
+    return offset - lo;
+}
+
+function domToRaw(offset, crlfs) {
+    if (!crlfs) return offset;
+    let lo = 0, hi = crlfs.length;
+    while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (crlfs[mid] - mid < offset) lo = mid + 1;
+        else hi = mid;
+    }
+    return offset + lo;
+}
+
 function browserShortcut(event) {
     const chord = (event.metaKey || event.ctrlKey) && !event.getModifierState?.('AltGraph');
     if (event.key === 'F5' || event.key === 'F12') return true;
@@ -51,6 +107,54 @@ function appWindow() {
 
 // Keys that scroll a page when nothing in Rune has focus.
 const SCROLL_KEYS = [' ', 'PageUp', 'PageDown', 'Home', 'End', 'ArrowUp', 'ArrowDown'];
+// Function keys Rune parses (`named_key_from_str`: F1–F24).
+const FUNCTION_KEY = /^F([1-9]|1\d|2[0-4])$/;
+// Hardware media transport keys Rune parses when opted in via `App::media_keys`.
+const MEDIA_KEYS = ['MediaPlayPause', 'MediaPlay', 'MediaPause', 'MediaTrackNext', 'MediaTrackPrevious', 'MediaStop', 'MediaFastForward', 'MediaRewind'];
+
+const graphemeSegmenter = typeof Intl?.Segmenter === 'function'
+    ? new Intl.Segmenter(undefined, { granularity: 'grapheme' })
+    : null;
+
+function isAutofilled(input) {
+    if (typeof input?.matches !== 'function') return false;
+    for (const selector of [':autofill', ':-webkit-autofill']) {
+        try { if (input.matches(selector)) return true; } catch {}
+    }
+    return false;
+}
+
+function moreThanOneGrapheme(text, segmenter) {
+    if (!segmenter || !text) return false;
+    let count = 0;
+    for (const _ of segmenter.segment(text)) {
+        if (++count > 1) return true;
+    }
+    return false;
+}
+
+// Classifies a password `input` event as whole-value replacement ('secure_replace') for browser or
+// password-manager fills, or incremental typing ('secure') for single-grapheme keystrokes.
+export function secureKind(event, input, segmenter = graphemeSegmenter) {
+    if (isAutofilled(input)) return 'secure_replace';
+    const type = event?.inputType;
+    if (!type || type === 'insertReplacementText') return 'secure_replace';
+    if (type === 'insertText') {
+        const added = event.data ?? input?.value ?? '';
+        if (moreThanOneGrapheme(added, segmenter)) return 'secure_replace';
+    }
+    return 'secure';
+}
+
+// Handles one `input` event on the hidden password input: always empties the DOM value, ignores
+// events while no Rune field has focus, and sends fills even when empty so a clear reaches Rust.
+export function passwordInput(event, input, key, send) {
+    const kind = secureKind(event, input);
+    const text = input.value;
+    input.value = '';
+    if (!key) return;
+    if (kind === 'secure_replace' || text) send({ kind, key, text });
+}
 
 // What a page's mirror needs: focus rings on its links and buttons, and a selection highlight
 // over its transparent text. The page can restyle both.
@@ -69,7 +173,7 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
     const password = document.createElement('input');
     password.type = 'password';
     password.setAttribute('aria-label', 'Password input');
-    password.autocomplete = 'off';
+    password.autocomplete = 'current-password';
     password.setAttribute('autocorrect', 'off');
     password.setAttribute('autocapitalize', 'off');
     password.spellcheck = false;
@@ -77,6 +181,7 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
         field.style.cssText = 'position:fixed;left:0;top:0;width:1px;height:1px;padding:0;border:0;opacity:0;font-size:16px;resize:none;pointer-events:none;';
         field.tabIndex = -1;
         field.inputMode = coarse() ? 'none' : 'text';
+        field.inert = true;
         document.body.append(field);
     }
     // The mirror's text is transparent over the canvas. `forced-color-adjust:none` keeps it so in
@@ -107,10 +212,11 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
         a11y.style.cssText = 'position:fixed;inset:0;overflow:hidden;pointer-events:none;z-index:1;color:transparent;forced-color-adjust:none;';
         document.body.append(a11y);
     }
-    const h = { canvas, textarea, password, a11y, a11yNodes: new Map(), field: textarea, key: '', base: 0, value: '',
-        copyText: '', composing: false, composition: '', shift: false, modBits: 0, listeners: [], syncing: false, disposed: false,
+    const h = { canvas, textarea, password, a11y, a11yNodes: new Map(), field: textarea, key: '', base: 0, value: '', domValue: '', crlfs: null,
+        selection: null, copyText: '', composing: false, composition: '', shift: false, modBits: 0, listeners: [], syncing: false, disposed: false,
         embedded, fitHeight, page, focused: false, presented: false, swapped: false, touchDown: false,
-        lastScrollAt: 0, staticTimer: 0, scrollEls: new Map(), band };
+        touchTimestamps: [], touchHoldConfirm: null, activeTouchId: null,
+        lastScrollAt: 0, staticTimer: 0, scrollEls: new Map(), band, mediaKeys: false };
     const send = event => {
         const message = JSON.stringify(event);
         if (h.syncing) queueMicrotask(() => { if (!h.disposed) callback(message); });
@@ -135,6 +241,34 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
     for (const name of ['pointerdown', 'pointermove', 'pointerup', 'pointerover', 'pointerout', 'wheel', 'keydown']) {
         listen(window, name, event => { if (ownsTarget(event.target)) syncMods(event); }, { capture: true, passive: true });
     }
+    // Capture hardware PointerEvent.timeStamp before winit's canvas listeners drop it, so Rune
+    // gets real event times for pan velocity, fling hold, and long-press delay compensation
+    // without patching vendored winit.
+    const MAX_TOUCH_TIMESTAMPS = 64;
+    const recordTouchTimestamp = (isMove, event) => {
+        if (event.target !== canvas || event.pointerType !== 'touch') return;
+        // winit routes chorded pointermove (button !== -1) as a button press, not a touch move.
+        if (isMove && typeof event.button === 'number' && event.button !== -1) return;
+        const coalesced = isMove && typeof event.getCoalescedEvents === 'function' ? event.getCoalescedEvents() : null;
+        const items = coalesced && coalesced.length > 0 ? coalesced : [event];
+        for (const item of items) {
+            h.touchTimestamps.push({ id: event.pointerId, ts: item.timeStamp });
+            if (h.touchTimestamps.length > MAX_TOUCH_TIMESTAMPS) h.touchTimestamps.shift();
+        }
+    };
+    listen(window, 'pointerdown', event => {
+        if (event.target === canvas && event.pointerType === 'touch' && h.activeTouchId === null) {
+            h.activeTouchId = event.pointerId;
+        }
+        recordTouchTimestamp(false, event);
+    }, { capture: true, passive: true });
+    listen(window, 'pointermove', event => recordTouchTimestamp(true, event), { capture: true, passive: true });
+    const clearActiveTouch = event => {
+        if (event.pointerType === 'touch' && event.pointerId === h.activeTouchId) h.activeTouchId = null;
+        recordTouchTimestamp(false, event);
+    };
+    listen(window, 'pointerup', clearActiveTouch, { capture: true, passive: true });
+    listen(window, 'pointercancel', clearActiveTouch, { capture: true, passive: true });
     listen(window, 'keyup', event => {
         if (ownsTarget(event.target) && !(event.target === canvas && MOD_KEYS.includes(event.key))) syncMods(event);
     }, { capture: true, passive: true });
@@ -143,14 +277,25 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
     listen(window, 'keyup', event => {
         if (event.target === canvas && MOD_KEYS.includes(event.key)) syncMods(event);
     }, { passive: true });
-    listen(window, 'blur', () => { h.modBits = 0; });
-    listen(document, 'visibilitychange', () => { if (document.hidden) h.modBits = 0; });
+    listen(window, 'blur', () => { h.modBits = 0; h.activeTouchId = null; });
+    listen(document, 'visibilitychange', () => { if (document.hidden) { h.modBits = 0; h.activeTouchId = null; } });
     function changed(preedit = false) {
         const backward = textarea.selectionDirection === 'backward';
+        const edit = replacement(h.domValue, textarea.value, preedit ? h.composition : '', textarea.selectionEnd);
+        const start = domToRaw(edit.start, h.crlfs);
+        const end = domToRaw(edit.end, h.crlfs);
+        const mapNext = pos => {
+            const insertedEnd = edit.start + edit.text.length;
+            if (pos <= edit.start) return domToRaw(pos, h.crlfs);
+            if (pos <= insertedEnd) return start + (pos - edit.start);
+            return start + edit.text.length + (domToRaw(edit.end + (pos - insertedEnd), h.crlfs) - end);
+        };
+        const selStart = mapNext(textarea.selectionStart);
+        const selEnd = mapNext(textarea.selectionEnd);
         send({ kind: preedit ? 'preedit' : 'edit', key: h.key, base: h.base, expected: h.value,
-            ...replacement(h.value, textarea.value, preedit ? h.composition : '', textarea.selectionEnd),
-            anchor: backward ? textarea.selectionEnd : textarea.selectionStart,
-            focus: backward ? textarea.selectionStart : textarea.selectionEnd });
+            start, end, text: edit.text,
+            anchor: backward ? selEnd : selStart,
+            focus: backward ? selStart : selEnd });
     }
     const key = (name, event = {}) => send({ kind: 'key', key: name, code: event.code ?? '', shift: !!event.shiftKey,
         ctrl: !!event.ctrlKey, alt: !!event.altKey, meta: !!event.metaKey, repeat: !!event.repeat });
@@ -169,11 +314,7 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
         h.composing = false; h.composition = '';
         send({ kind: 'sync' });
     });
-    listen(password, 'input', () => {
-        const text = password.value;
-        password.value = '';
-        if (text) send({ kind: 'secure', key: h.key, text });
-    });
+    listen(password, 'input', event => passwordInput(event, password, h.key, send));
     for (const field of [textarea, password]) {
         listen(field, 'paste', event => {
             // Only a paste into a Rune field is Rune's; the browser keeps the rest.
@@ -197,6 +338,15 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
                 const forward = event.inputType.endsWith('Forward');
                 key(forward ? 'Delete' : 'Backspace',
                     { altKey: event.inputType.includes('Word'), code: forward ? 'Delete' : 'Backspace' });
+            } else if (field === textarea && !h.composing && !event.isComposing && event.inputType.startsWith('delete')) {
+                if (field.selectionStart === 0 && field.selectionEnd === 0 && event.inputType.endsWith('Backward')) {
+                    event.preventDefault();
+                    key('Backspace', { altKey: event.inputType.includes('Word'), code: 'Backspace' });
+                } else if (field.selectionStart === field.value.length && field.selectionEnd === field.value.length
+                    && event.inputType.endsWith('Forward')) {
+                    event.preventDefault();
+                    key('Delete', { altKey: event.inputType.includes('Word'), code: 'Delete' });
+                }
             }
         });
         listen(field, 'keydown', event => {
@@ -206,7 +356,18 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
             const chord = (event.metaKey || event.ctrlKey) && !event.getModifierState?.('AltGraph');
             const editing = ['Enter', 'Tab', 'Escape', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'];
             if (field === password) editing.push('Backspace', 'Delete');
-            if (!chord && !editing.includes(event.key)) return;
+            else {
+                // At either boundary with nothing selected, the browser deletes nothing and fires
+                // no `input` event, so forward Backspace or Delete as a key as native platforms
+                // and password fields do.
+                if (field.selectionStart === 0 && field.selectionEnd === 0) editing.push('Backspace');
+                if (field.selectionStart === field.value.length && field.selectionEnd === field.value.length) editing.push('Delete');
+            }
+            // Forward function keys other than what `browserShortcut` leaves to the browser so
+            // focused fields receive them as canvas focus does.
+            const functionKey = FUNCTION_KEY.test(event.key) && !browserShortcut(event);
+            const mediaKey = h.mediaKeys && MEDIA_KEYS.includes(event.key);
+            if (!chord && !functionKey && !mediaKey && !editing.includes(event.key)) return;
             if (chord && event.key.toLowerCase() === 'v') return;
             event.preventDefault();
             key(event.key, event);
@@ -217,9 +378,11 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
     listen(textarea, 'select', () => {
         if (h.syncing || h.composing || document.activeElement !== textarea) return;
         const backward = textarea.selectionDirection === 'backward';
+        const selStart = domToRaw(textarea.selectionStart, h.crlfs);
+        const selEnd = domToRaw(textarea.selectionEnd, h.crlfs);
         send({ kind: 'selection', key: h.key, base: h.base, expected: h.value,
-            anchor: backward ? textarea.selectionEnd : textarea.selectionStart,
-            focus: backward ? textarea.selectionStart : textarea.selectionEnd });
+            anchor: backward ? selEnd : selStart,
+            focus: backward ? selStart : selEnd });
     });
     // Synchronous copy support for read-only `El::selectable` selections (`Edit › Copy` / ⌘C).
     listen(document, 'copy', event => {
@@ -250,6 +413,10 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
         if (file.type.startsWith('text/') || file.size < 1048576 && !file.type) send({ kind: 'paste', text: await file.text(), html: '', image: false });
     });
     listen(canvas, 'pointerdown', event => event.preventDefault(), { capture: true });
+    // WebKit on iOS 27 still fires a tap's compatibility mousedown to the canvas after a
+    // prevented pointerdown; preventing it keeps the canvas's tabindex from taking focus
+    // back from the hidden field that activate() just focused on pointerup.
+    listen(canvas, 'mousedown', event => event.preventDefault(), { capture: true });
     // winit's web backend ignores pointercancel for mouse/pen and does not listen to
     // lostpointercapture; forward non-touch cancellations so held presses and drags never stick.
     listen(canvas, 'pointercancel', event => {
@@ -263,6 +430,7 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
     }, { passive: true });
     listen(canvas, 'keydown', event => {
         if (page && !h.focused && SCROLL_KEYS.includes(event.key) && !event.metaKey && !event.ctrlKey) return;
+        if (!h.mediaKeys && MEDIA_KEYS.includes(event.key)) return;
         if (!browserShortcut(event)) event.preventDefault();
     });
     if (page) {
@@ -320,6 +488,16 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
         h.listeners.push(() => style.remove());
     }
     if (!page) {
+        // Flush any deferred scroll or pending idle mirror update immediately when assistive
+        // tech or a browser consumer asks: focus inside the mirror, print, or Find-in-page.
+        listen(a11y, 'focusin', () => send({ kind: 'a11y_flush' }));
+        listen(window, 'beforeprint', () => send({ kind: 'a11y_flush' }));
+        listen(window, 'keydown', event => {
+            const chord = (event.metaKey || event.ctrlKey) && !event.altKey && !event.getModifierState?.('AltGraph');
+            if (chord && event.key?.toLowerCase() === 'f' && (!embedded || ownsTarget(event.target))) {
+                send({ kind: 'a11y_flush' });
+            }
+        }, { capture: true, passive: true });
         // A web link takes the pointer while it's over it, as a page's would: the status bar
         // shows where it goes, and middle-click, Ctrl+click and its own menu open it.
         listen(canvas, 'pointermove', event => {
@@ -348,6 +526,16 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
     if (MAC) listen(canvas, 'pointerdown', armAt);
     else listen(window, 'pointerup', armAt, { capture: true });
     listen(document, 'contextmenu', event => {
+        const touchOrigin = event.target === canvas
+            && h.activeTouchId !== null
+            && event.button !== 2
+            && (event.pointerType === 'touch' || event.pointerType === undefined || event.pointerType === '');
+        if (touchOrigin) {
+            event.preventDefault();
+            const id = typeof event.pointerId === 'number' && event.pointerId > 0 ? event.pointerId : h.activeTouchId;
+            send({ kind: 'touch_hold', id });
+            return;
+        }
         if (h.menu === 'rune' || event.target === canvas) event.preventDefault();
         if (h.menu === 'rune') h.menu = '';
     }, { capture: true });
@@ -355,33 +543,59 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
         listen(window, name, event => { if (name !== 'pointerdown' || !isSecondaryPress(event)) disarmMenu(h); }, { capture: true, passive: true });
     }
     queueMicrotask(() => {
-        if (!h.disposed && !embedded && !page && document.activeElement === document.body) canvas.focus({ preventScroll: true });
+        if (!h.disposed && !embedded && !page && document.activeElement === document.body) {
+            (h.key ? h.field : canvas).focus({ preventScroll: true });
+            if (h.key) reselect(h);
+        }
     });
     return h;
+}
+
+// Reapplies the synced non-secure selection after focus moves to the hidden textarea (browsers
+// collapse an unfocused textarea's selection to 0), without disturbing an active composition.
+function reselect(h) {
+    if (!h.selection || h.field !== h.textarea || h.composing) return;
+    const [start, end, direction] = h.selection;
+    if (h.textarea.selectionStart !== start || h.textarea.selectionEnd !== end || h.textarea.selectionDirection !== direction) {
+        const syncing = h.syncing;
+        h.syncing = true;
+        try { h.textarea.setSelectionRange(start, end, direction); }
+        finally { h.syncing = syncing; }
+    }
 }
 
 export function sync(h, key, text, base, anchor, focus, secure) {
     if (h.composing && key === h.key) return;
     h.composing = false;
     h.syncing = true;
-    const editing = document.activeElement === h.textarea || document.activeElement === h.password;
-    h.key = key; h.base = base; h.value = text;
+    const active = document.activeElement;
+    const editing = active === h.textarea || active === h.password;
+    const { dom, crlfs } = key && !secure ? normalizeTextarea(text) : { dom: '', crlfs: null };
+    h.key = key; h.base = base; h.value = text; h.domValue = dom; h.crlfs = crlfs;
     h.password.value = '';
     h.field = secure ? h.password : h.textarea;
     if (!key) {
+        h.selection = null;
         h.textarea.value = '';
         if (editing) h.canvas.focus({ preventScroll: true });
+        h.textarea.inert = true;
+        h.password.inert = true;
         h.textarea.inputMode = h.password.inputMode = coarse() ? 'none' : 'text';
     } else {
-        if (h.textarea.value !== text) h.textarea.value = text;
-        if (!secure) {
-            const start = Math.min(anchor, focus), end = Math.max(anchor, focus);
-            const direction = anchor > focus ? 'backward' : 'forward';
-            if (h.textarea.selectionStart !== start || h.textarea.selectionEnd !== end || h.textarea.selectionDirection !== direction) {
-                h.textarea.setSelectionRange(start, end, direction);
-            }
+        h.field.inert = false;
+        if (h.textarea.value !== dom) h.textarea.value = dom;
+        if (secure) {
+            h.selection = null;
+        } else {
+            const domAnchor = rawToDom(anchor, crlfs), domFocus = rawToDom(focus, crlfs);
+            const start = Math.min(domAnchor, domFocus), end = Math.max(domAnchor, domFocus);
+            const direction = domAnchor > domFocus ? 'backward' : 'forward';
+            h.selection = [start, end, direction];
         }
-        if (editing && document.activeElement !== h.field) activate(h);
+        if (editing && active !== h.field) activate(h);
+        else if (active === h.canvas) h.field.focus({ preventScroll: true });
+        reselect(h);
+        (secure ? h.textarea : h.password).inert = true;
     }
     h.syncing = false;
 }
@@ -400,6 +614,11 @@ export function syncCopy(h, text) {
 // 'field', 'text' or '' (`Runtime::secondary_claim`).
 export function syncSecondary(h, claim) {
     h.secondary = claim;
+}
+
+// Whether the app opted into hardware media transport keys (`App::media_keys`).
+export function syncMediaKeys(h, enabled) {
+    h.mediaKeys = !!enabled;
 }
 
 // The sans and mono slots' families (CSS lists): the mirror's text sets in them (`family`).
@@ -581,13 +800,14 @@ export function showMenu(h, json, x, y, minWidth, dark) {
     } };
 }
 
-// Takes the menu down; `refocus` gives the canvas its focus back, as a closing menu does.
+// Takes the menu down; `refocus` gives the focused field or canvas its focus back, as a closing
+// menu does.
 function closeMenu(h, refocus) {
-    if (!h.menu) return;
+    if (typeof h.menu?.done !== 'function') return;
     const menu = h.menu;
     h.menu = null;
     menu.done();
-    if (refocus) h.canvas.focus({ preventScroll: true });
+    if (refocus) activate(h);
 }
 
 // The app went away or the menu was answered by Rune itself: no answer is sent.
@@ -670,6 +890,8 @@ function armMenu(h, x, y, browser) {
         selection.addRange(range);
         return true;
     }
+    // Flush any deferred mirror update synchronously before hit-testing links/text for the menu.
+    if (!h.page) h.send({ kind: 'a11y_flush' });
     // A link, the text under the pointer, or the page itself (Back, Reload, Print, Inspect).
     const el = linkAt(h, x, y) ?? textAt(h, x, y) ?? h.a11y;
     h.armed = [el, el.style.pointerEvents];
@@ -710,12 +932,47 @@ function webLink(url) {
     return url.startsWith('https://') || url.startsWith('http://') || url.startsWith('mailto:');
 }
 
-const TAGS = { heading: null, button: 'button', link: 'a', image: 'div', text: 'p', scroll_x: 'div' };
+// Matches Rust's `open_url::check_href`: allows http:, https:, mailto:, or a relative
+// path/query/fragment that isn't scheme-relative (`//`).
+function safeHref(url) {
+    if (typeof url !== 'string') return null;
+    const s = url.trim();
+    if (!s || s.length > 8192 || /[\s\u0000-\u001f\u007f-\u009f\\"<>^`{|}]/.test(s)) return null;
+    if (/%(?![0-9a-fA-F]{2})|%00/.test(s)) return null;
+    const delim = s.search(/[:/?#]/);
+    if (!s.startsWith('//') && (delim === -1 || s[delim] !== ':')) return s;
+    const colon = s.indexOf(':');
+    if (colon <= 0) return null;
+    const scheme = s.slice(0, colon).toLowerCase();
+    const rest = s.slice(colon + 1);
+    if (scheme === 'http' || scheme === 'https') {
+        if (!rest.startsWith('//')) return null;
+        const after = rest.slice(2);
+        const end = after.search(/[/?#]/);
+        const auth = end === -1 ? after : after.slice(0, end);
+        const tail = end === -1 ? '' : after.slice(end);
+        if (!auth || /[\[\]]/.test(tail)) return null;
+        const at = auth.lastIndexOf('@');
+        const hp = at === -1 ? auth : auth.slice(at + 1);
+        if (at !== -1 && (!auth.slice(0, at) || /[\[\]@]/.test(auth.slice(0, at)))) return null;
+        if (!hp || hp.startsWith('.') || hp.includes('..')) return null;
+        return `${scheme}:${rest}`;
+    }
+    if (scheme === 'mailto') {
+        if (!rest || rest.startsWith('//') || /[\[\]]/.test(rest)) return null;
+        return `${scheme}:${rest}`;
+    }
+    return null;
+}
+
+const TAGS = { heading: null, button: 'button', link: 'a', image: 'div', progressbar: 'div', text: 'p', scroll_x: 'div' };
+const RANGE_ROLES = new Set(['slider', 'spinbutton', 'progressbar', 'meter', 'scrollbar']);
 
 function family(name) {
     if (name === 'sans') return 'var(--rune-sans,sans-serif)';
     if (name === 'mono') return 'var(--rune-mono,monospace)';
-    return `"${name.replace(/["\\]/g, '')}",var(--rune-sans,sans-serif)`;
+    const clean = String(name).replace(/[\u0000-\u001f\u007f-\u009f"'\\;{}<>]/g, '').trim();
+    return clean ? `"${clean}",var(--rune-sans,sans-serif)` : 'var(--rune-sans,sans-serif)';
 }
 
 // The mirror's first item element, after its stylesheet.
@@ -727,12 +984,14 @@ function firstItem(el) {
 
 function runs(h, el, item) {
     for (const run of item.u) {
-        if (!run.h) { el.append(document.createTextNode(run.t)); continue; }
+        const href = run.h ? safeHref(run.h) : null;
+        if (!href) { el.append(document.createTextNode(run.t)); continue; }
         const a = document.createElement('a');
         a.textContent = run.t;
+        if (run.d) a.setAttribute('aria-description', run.d);
         a.style.cssText = `color:transparent;text-decoration:none;pointer-events:${h.page ? 'auto' : 'none'};`;
-        if (webLink(run.h)) {
-            a.href = run.h;
+        if (webLink(href)) {
+            a.href = href;
             a.target = '_blank';
             a.rel = 'noopener noreferrer';
         } else {
@@ -746,16 +1005,27 @@ function runs(h, el, item) {
     }
 }
 
+function round1(v) {
+    const r = Math.round(v * 10) / 10;
+    return r === 0 ? 0 : r;
+}
+
+function itemTag(item) {
+    return item.k === 'group' ? (item.g || 'div') : item.k === 'heading' ? `h${item.l || 2}` : TAGS[item.k] ?? 'p';
+}
+
 function itemStyle(h, item, origin) {
     const [x, y, w, bh] = item.r;
-    let css = `position:absolute;left:${x - origin[0]}px;top:${y - origin[1]}px;width:${w}px;height:${bh}px;margin:0;padding:0;border:0;background:transparent;color:transparent;`;
-    if (item.k === 'group') return css + 'overflow:visible;list-style:none;pointer-events:none;';
+    const left = round1(x - origin[0]);
+    const top = round1(y - origin[1]);
+    let css = `position:absolute;left:${left}px;top:${top}px;width:${w}px;height:${bh}px;margin:0;padding:0;border:0;background:transparent;color:transparent;`;
+    if (item.k === 'group') return css + (item.sc ? 'overflow:hidden;list-style:none;pointer-events:none;' : 'overflow:visible;list-style:none;pointer-events:none;');
     // A page's horizontal scroller: the browser scrolls it natively, so a flick inside a code
     // block scrolls the block at the compositor's rate while a vertical drag still scrolls the
     // page.
     if (item.k === 'scroll_x') return css + 'overflow-x:auto;overflow-y:hidden;pointer-events:auto;touch-action:pan-x pan-y pinch-zoom;scrollbar-width:none;';
     if (item.k === 'link') return css + 'display:block;overflow:hidden;text-decoration:none;cursor:pointer;pointer-events:auto;font:14px/1.25 sans-serif;';
-    if (item.k === 'image' || item.k === 'button') return css + 'overflow:hidden;pointer-events:none;font:14px/1.25 sans-serif;';
+    if (item.k === 'image' || item.k === 'button' || item.k === 'progressbar') return css + 'overflow:hidden;pointer-events:none;font:14px/1.25 sans-serif;';
     const fs = item.s || 14;
     if (!item.f) return css + `font:${fs}px/1.25 sans-serif;overflow:hidden;white-space:pre-wrap;pointer-events:none;`;
     const [fam, weight, lh, tracking, italic, align] = item.f;
@@ -763,81 +1033,269 @@ function itemStyle(h, item, origin) {
     return css + (item.e ? 'pointer-events:auto;user-select:text;-webkit-user-select:text;cursor:text;' : 'pointer-events:none;user-select:none;-webkit-user-select:none;');
 }
 
+// Wraps an app-mode scroll container's children in a translated content layer so scroll settle
+// updates one transform instead of rewriting `style.cssText` on every staying child.
+function syncScrollContent(el, sc) {
+    if (sc) {
+        let wrap = el._scrollContent;
+        if (!wrap) {
+            wrap = document.createElement('div');
+            wrap.setAttribute('role', 'none');
+            wrap.setAttribute('data-rune-scroll-content', '');
+            wrap.style.cssText = 'position:absolute;left:0;top:0;width:0;height:0;overflow:visible;pointer-events:none;';
+            while (el.firstElementChild) wrap.insertBefore(el.firstElementChild, null);
+            el.insertBefore(wrap, null);
+            el._scrollContent = wrap;
+        }
+        const sx = sc[0] ? -sc[0] : 0;
+        const sy = sc[1] ? -sc[1] : 0;
+        const tr = `translate3d(${sx}px,${sy}px,0)`;
+        if (wrap._tr !== tr) {
+            wrap._tr = tr;
+            wrap.style.transform = tr;
+        }
+    } else if (el._scrollContent) {
+        const wrap = el._scrollContent;
+        el._scrollContent = null;
+        while (wrap.firstElementChild) el.insertBefore(wrap.firstElementChild, wrap);
+        wrap.remove();
+    }
+}
+
+function contentParent(el) {
+    return el._scrollContent ?? el;
+}
+
+function ensureA11yNode(h, item, tag, key) {
+    let el = h.a11yNodes.get(key);
+    if (!el) {
+        el = document.createElement(tag);
+        if (tag === 'button') {
+            el.type = 'button';
+            el.tabIndex = h.page ? 0 : -1;
+            el.addEventListener('click', ev => {
+                ev.preventDefault();
+                if (el.getAttribute('aria-disabled') === 'true') return;
+                h.send({ kind: 'a11y_press', path: item.p });
+            });
+        }
+        h.a11yNodes.set(key, el);
+    }
+    return el;
+}
+
+function applyA11yItem(h, el, item, tag, origin) {
+    // Writing `cssText` invalidates the node's style and its layout: only do it when the
+    // mirror's item actually moved or changed.
+    const css = itemStyle(h, item, origin);
+    if (el._css !== css) { el._css = css; el.style.cssText = css; }
+    if (item.i) el.id = item.i; else el.removeAttribute('id');
+    // `El::description` and `El::described_by`'s words: what a reader says after the name.
+    if (item.d) el.setAttribute('aria-description', item.d); else el.removeAttribute('aria-description');
+    // Role-carrying containers, live text (`status`, `alert`, `log`), images and progressbars.
+    if (item.k === 'image') {
+        if (el.getAttribute('role') !== 'img') el.setAttribute('role', 'img');
+    } else if (tag !== 'button') {
+        const role = item.o ?? (item.k === 'progressbar' ? 'progressbar' : null);
+        if (role === null) {
+            if (el.getAttribute('role') !== null) el.removeAttribute('role');
+        } else if (el.getAttribute('role') !== role) {
+            el.setAttribute('role', role);
+        }
+    }
+    if (item.lv === undefined) {
+        if (el.getAttribute('aria-live') !== null) el.removeAttribute('aria-live');
+    } else if (el.getAttribute('aria-live') !== item.lv) {
+        el.setAttribute('aria-live', item.lv);
+    }
+    const rangeAttrs = [
+        ['aria-valuemin', item.rg ? String(item.rg[0]) : undefined],
+        ['aria-valuemax', item.rg ? String(item.rg[1]) : undefined],
+        ['aria-valuenow', item.rg ? String(item.rg[2]) : undefined],
+        ['aria-valuetext', item.vt],
+        ['aria-multiselectable', item.ms ? 'true' : undefined],
+        ['aria-required', item.rq ? 'true' : undefined],
+        ['aria-haspopup', item.hp],
+        ['aria-orientation', item.or],
+        ['aria-autocomplete', item.ac],
+        ['aria-controls', item.ct],
+        ['aria-owns', item.ow],
+    ];
+    for (const [name, value] of rangeAttrs) {
+        if (value === undefined) {
+            if (el.getAttribute(name) !== null) el.removeAttribute(name);
+        } else if (el.getAttribute(name) !== value) {
+            el.setAttribute(name, value);
+        }
+    }
+    if (item.dis) {
+        if (el.getAttribute('aria-disabled') !== 'true') el.setAttribute('aria-disabled', 'true');
+    } else if (el.getAttribute('aria-disabled') !== null) {
+        el.removeAttribute('aria-disabled');
+    }
+    if (item.b) {
+        if (el.getAttribute('aria-busy') !== 'true') el.setAttribute('aria-busy', 'true');
+    } else if (el.getAttribute('aria-busy') !== null) {
+        el.removeAttribute('aria-busy');
+    }
+    if (item.dir) {
+        if (el.getAttribute('dir') !== item.dir) el.setAttribute('dir', item.dir);
+    } else if (item.k !== 'scroll_x' && el.getAttribute('dir') !== null) {
+        el.removeAttribute('dir');
+    }
+    if (item.x === true || item.x === false) {
+        const v = String(item.x);
+        if (el.getAttribute('aria-expanded') !== v) el.setAttribute('aria-expanded', v);
+    } else if (el.getAttribute('aria-expanded') !== null) {
+        el.removeAttribute('aria-expanded');
+    }
+    if (item.k !== 'heading') {
+        if (item.l) {
+            const v = String(item.l);
+            if (el.getAttribute('aria-level') !== v) el.setAttribute('aria-level', v);
+        } else if (el.getAttribute('aria-level') !== null) {
+            el.removeAttribute('aria-level');
+        }
+    }
+    if (tag === 'button') {
+        // A control's role and states (a palette's option, a tab, a switch, a toggle button, a range control).
+        const states = [['role', item.o], ['aria-selected', item.se === undefined ? undefined : String(item.se)],
+            ['aria-checked', item.c], ['aria-pressed', item.pr],
+            ['aria-posinset', item.n ? String(item.n[0]) : undefined], ['aria-setsize', item.n ? String(item.n[1]) : undefined]];
+        for (const [name, value] of states) {
+            if (value === undefined) el.removeAttribute(name);
+            else if (el.getAttribute(name) !== value) el.setAttribute(name, value);
+        }
+    }
+    const combobox = item.k === 'button' && item.o === 'combobox';
+    const rangeControl = item.k === 'button' && (item.o === 'slider' || item.o === 'spinbutton');
+    if (item.k === 'group' || item.k === 'image' || item.k === 'progressbar' || combobox || rangeControl) {
+        if (item.t) {
+            if (el.getAttribute('aria-label') !== item.t) el.setAttribute('aria-label', item.t);
+        } else if (el.getAttribute('aria-label') !== null) {
+            el.removeAttribute('aria-label');
+        }
+    } else if (item.k === 'button') {
+        if (el.getAttribute('aria-label') !== null) el.removeAttribute('aria-label');
+    } else if (item.k === 'link') {
+        const href = safeHref(item.h);
+        if (href) {
+            el.href = href;
+            if (!h.page && webLink(href)) { el.target = '_blank'; el.rel = 'noopener noreferrer'; }
+            else { el.removeAttribute('target'); el.removeAttribute('rel'); }
+        } else {
+            el.removeAttribute('href');
+            el.removeAttribute('target');
+            el.removeAttribute('rel');
+        }
+    }
+    if (item.k === 'scroll_x') {
+        if (el.getAttribute('data-rune-scroll-x') === null) el.setAttribute('data-rune-scroll-x', '');
+        if (!el._scrollXBound) {
+            el._scrollXBound = true;
+            // The browser scrolls this container itself; Rune draws the content where the
+            // container says it is.
+            el.addEventListener('scroll', () => {
+                const path = el._path;
+                if (path && !h.disposed) h.send({ kind: 'scroll_x', path, x: readScrollX(el) });
+            }, { passive: true });
+        }
+        if (el._path !== item.p) { el._path = item.p; h.scrollEls.set(item.p, el); }
+    } else {
+        if (el.getAttribute('data-rune-scroll-x') !== null) el.removeAttribute('data-rune-scroll-x');
+        if (el._path && h.scrollEls.get(el._path) === el) { h.scrollEls.delete(el._path); el._path = undefined; }
+    }
+    syncScrollContent(el, item.k === 'group' ? item.sc : null);
+    const container = item.k === 'group' || item.k === 'scroll_x';
+    const noContent = container || item.k === 'image' || item.k === 'progressbar';
+    const content = combobox ? (item.v ?? '') : rangeControl ? '' : (item.t ?? '');
+    const sig = noContent ? '' : item.u?.length ? JSON.stringify(item.u) : content;
+    if (!noContent && el._sig !== sig) {
+        el._sig = sig;
+        if (item.u?.length) {
+            el.replaceChildren();
+            runs(h, el, item);
+        } else {
+            if (el.firstElementChild) el.replaceChildren();
+            el.textContent = content;
+        }
+    }
+    return container;
+}
+
+function syncA11yPatch(h, patch) {
+    if (patch.dir !== undefined) {
+        if (patch.dir) {
+            if (h.a11y.getAttribute('dir') !== patch.dir) h.a11y.setAttribute('dir', patch.dir);
+        } else if (h.a11y.getAttribute('dir') !== null) {
+            h.a11y.removeAttribute('dir');
+        }
+    }
+    if (patch.lang !== undefined) {
+        if (patch.lang) {
+            if (h.a11y.getAttribute('lang') !== patch.lang) h.a11y.setAttribute('lang', patch.lang);
+        } else if (h.a11y.getAttribute('lang') !== null) {
+            h.a11y.removeAttribute('lang');
+        }
+    }
+    if (patch.d) {
+        for (const key of patch.d) {
+            const el = h.a11yNodes.get(key);
+            if (!el) continue;
+            if (el._path && h.scrollEls.get(el._path) === el) h.scrollEls.delete(el._path);
+            el.remove();
+            h.a11yNodes.delete(key);
+        }
+    }
+    if (patch.u) {
+        for (const item of patch.u) {
+            const tag = itemTag(item);
+            const key = `${tag}:${item.p}`;
+            const el = ensureA11yNode(h, item, tag, key);
+            applyA11yItem(h, el, item, tag, [0, 0]);
+        }
+    }
+    if (patch.o) {
+        for (const [parentKey, childKeys] of Object.entries(patch.o)) {
+            const host = parentKey === '' ? h.a11y : h.a11yNodes.get(parentKey);
+            if (!host) continue;
+            const container = parentKey === '' ? h.a11y : contentParent(host);
+            let cursor = parentKey === '' ? firstItem(container) : container.firstElementChild;
+            for (const childKey of childKeys) {
+                const childEl = h.a11yNodes.get(childKey);
+                if (!childEl) continue;
+                if (cursor !== childEl) container.insertBefore(childEl, cursor);
+                else cursor = cursor.nextElementSibling;
+            }
+        }
+    }
+}
+
 export function syncA11y(h, json) {
     if (h.disposed) return;
-    const items = JSON.parse(json);
+    const payload = JSON.parse(json);
+    if (payload && !Array.isArray(payload) && payload.p === 1) {
+        syncA11yPatch(h, payload);
+        return;
+    }
+    const items = payload;
     const seen = new Set();
     const els = [];
     const cursors = new Map([[h.a11y, firstItem(h.a11y)]]);
     for (const item of items) {
-        const tag = item.k === 'group' ? item.g : item.k === 'heading' ? `h${item.l || 2}` : TAGS[item.k] ?? 'p';
+        const tag = itemTag(item);
         const key = `${tag}:${item.p}`;
         seen.add(key);
-        let el = h.a11yNodes.get(key);
-        if (!el) {
-            el = document.createElement(tag);
-            if (tag === 'button') {
-                el.type = 'button';
-                el.tabIndex = h.page ? 0 : -1;
-                el.addEventListener('click', ev => {
-                    ev.preventDefault();
-                    h.send({ kind: 'a11y_press', path: item.p });
-                });
-            }
-            if (item.k === 'image') el.setAttribute('role', 'img');
-            if (item.k === 'scroll_x') {
-                el.setAttribute('data-rune-scroll-x', '');
-                // The browser scrolls this container itself; Rune draws the content where the
-                // container says it is.
-                el.addEventListener('scroll', () => {
-                    const path = el._path;
-                    if (path && !h.disposed) h.send({ kind: 'scroll_x', path, x: readScrollX(el) });
-                }, { passive: true });
-            }
-            h.a11yNodes.set(key, el);
-        }
+        const el = ensureA11yNode(h, item, tag, key);
         const parent = item.a === undefined ? null : items[item.a];
-        const parentEl = item.a === undefined ? h.a11y : els[item.a];
-        // Writing `cssText` invalidates the node's style and its layout: only do it when the
-        // mirror's item actually moved or changed, so one animating element never rewrites a whole
-        // page's worth of nodes mid-scroll.
-        const css = itemStyle(h, item, parent ? parent.r : [0, 0]);
-        if (el._css !== css) { el._css = css; el.style.cssText = css; }
-        if (item.i) el.id = item.i; else el.removeAttribute('id');
-        // `El::description` and `El::described_by`'s words: what a reader says after the name.
-        if (item.d) el.setAttribute('aria-description', item.d); else el.removeAttribute('aria-description');
-        // A table's parts: the role says what the div is (`aria_role`).
-        if ((el.getAttribute('role') ?? undefined) !== item.o && item.k === 'group') {
-            if (item.o) el.setAttribute('role', item.o); else el.removeAttribute('role');
-        }
-        if (tag === 'button') {
-            if (item.x === true || item.x === false) el.setAttribute('aria-expanded', String(item.x));
-            else el.removeAttribute('aria-expanded');
-            // A control's role and states (a palette's option, a tab, a switch): `control_role`.
-            const states = [['role', item.o], ['aria-selected', item.se === undefined ? undefined : String(item.se)], ['aria-checked', item.c],
-                ['aria-posinset', item.n ? String(item.n[0]) : undefined], ['aria-setsize', item.n ? String(item.n[1]) : undefined]];
-            for (const [name, value] of states) {
-                if (value === undefined) el.removeAttribute(name);
-                else if (el.getAttribute(name) !== value) el.setAttribute(name, value);
-            }
-        }
-        if (item.k === 'group' || item.k === 'image') {
-            if (item.t) el.setAttribute('aria-label', item.t); else el.removeAttribute('aria-label');
-        } else if (item.k === 'link') {
-            el.href = item.h;
-            if (!h.page && webLink(item.h)) { el.target = '_blank'; el.rel = 'noopener noreferrer'; }
-        }
-        const container = item.k === 'group' || item.k === 'scroll_x';
-        if (item.k === 'scroll_x' && el._path !== item.p) { el._path = item.p; h.scrollEls.set(item.p, el); }
-        const sig = container || item.k === 'image' ? '' : item.u?.length ? JSON.stringify(item.u) : item.t ?? '';
-        if (!container && el._sig !== sig) {
-            el._sig = sig;
-            el.replaceChildren();
-            if (item.u?.length) runs(h, el, item);
-            else if (item.k !== 'image') el.textContent = item.t ?? '';
-        }
+        const parentHost = item.a === undefined ? h.a11y : els[item.a];
+        const parentEl = item.a === undefined ? h.a11y : contentParent(parentHost);
+        const container = applyA11yItem(h, el, item, tag, parent ? parent.r : [0, 0]);
         els.push(el);
-        if (container && !cursors.has(el)) cursors.set(el, el.firstElementChild);
+        if (container) {
+            const target = contentParent(el);
+            if (!cursors.has(target)) cursors.set(target, target.firstElementChild);
+        }
         const cursor = cursors.get(parentEl) ?? null;
         if (cursor !== el) parentEl.insertBefore(el, cursor);
         else cursors.set(parentEl, cursor.nextElementSibling);
@@ -874,6 +1332,7 @@ export function focusA11y(h, json) {
     }
     if (!f) {
         h.canvas.removeAttribute('aria-activedescendant');
+        h.textarea.removeAttribute('aria-autocomplete');
         return;
     }
     if (f.o === 'textbox') h.textarea.setAttribute('aria-label', f.t || 'Text input');
@@ -881,18 +1340,43 @@ export function focusA11y(h, json) {
     h.focusTurn ^= 1;
     const el = h.focusProxies[h.focusTurn];
     for (const a of [...el.attributes]) if (a.name === 'role' || a.name.startsWith('aria-')) el.removeAttribute(a.name);
+    el.textContent = '';
     el.setAttribute('role', f.o);
     el.setAttribute('aria-label', f.t ?? '');
     if (f.d) el.setAttribute('aria-description', f.d);
     if (f.c) el.setAttribute('aria-checked', f.c);
+    if (f.pr) el.setAttribute('aria-pressed', f.pr);
     if (f.s !== undefined) el.setAttribute('aria-selected', String(f.s));
     if (f.x !== undefined) el.setAttribute('aria-expanded', String(f.x));
     if (f.n) { el.setAttribute('aria-posinset', String(f.n[0])); el.setAttribute('aria-setsize', String(f.n[1])); }
     if (f.l) el.setAttribute('aria-level', String(f.l));
+    if (f.dis) el.setAttribute('aria-disabled', 'true');
+    if (f.b) el.setAttribute('aria-busy', 'true');
+    if (f.ms) el.setAttribute('aria-multiselectable', 'true');
+    if (f.rq) el.setAttribute('aria-required', 'true');
+    if (f.hp) el.setAttribute('aria-haspopup', f.hp);
+    if (f.or) el.setAttribute('aria-orientation', f.or);
+    if (f.ac) el.setAttribute('aria-autocomplete', f.ac);
+    if (f.ct) el.setAttribute('aria-controls', f.ct);
+    if (f.ow) el.setAttribute('aria-owns', f.ow);
+    if (f.rg) {
+        el.setAttribute('aria-valuemin', String(f.rg[0]));
+        el.setAttribute('aria-valuemax', String(f.rg[1]));
+        el.setAttribute('aria-valuenow', String(f.rg[2]));
+    }
+    if (f.vt) {
+        el.setAttribute('aria-valuetext', f.vt);
+    } else if (f.v) {
+        if (RANGE_ROLES.has(f.o)) el.setAttribute('aria-valuetext', f.v);
+        else el.textContent = f.v;
+    }
     h.canvas.setAttribute('aria-activedescendant', el.id);
     // Typing in a field whose highlighted row this is (the palette): the field says it too.
     if (f.o !== 'textbox') h.textarea.setAttribute('aria-activedescendant', el.id);
     else h.textarea.removeAttribute('aria-activedescendant');
+    const taAc = f.fac ?? ((f.o === 'textbox' || f.o === 'combobox') ? f.ac : undefined);
+    if (taAc) h.textarea.setAttribute('aria-autocomplete', taAc);
+    else h.textarea.removeAttribute('aria-autocomplete');
 }
 
 // `Tx::announce`: two live regions in the mirror, polite and assertive, made the first time
@@ -917,16 +1401,117 @@ export function announceA11y(h, text, assertive) {
     requestAnimationFrame(() => { if (!h.disposed) el.textContent = text; });
 }
 
-// Rune skipped rebuilding the mirror while it scrolls: it asks again once the scroll has rested.
-// The mirror's first build, in the page's idle time (its first frame's input goes first).
-export function scheduleA11yIdle(h) {
-    const due = () => { if (!h.disposed) h.send({ kind: 'a11y_due' }); };
-    if (globalThis.requestIdleCallback) requestIdleCallback(due, { timeout: 100 }); else setTimeout(due, 0);
+// Pops the oldest captured PointerEvent.timeStamp (ms since timeOrigin) for touch pointer `id`,
+// clamped to performance.now(), or NaN when absent, non-finite, or non-positive.
+export function takeTouchTimestamp(h, id) {
+    const idx = h.touchTimestamps.findIndex(entry => entry.id === id);
+    if (idx < 0) return Number.NaN;
+    const [{ ts }] = h.touchTimestamps.splice(idx, 1);
+    if (typeof ts !== 'number' || !Number.isFinite(ts) || ts <= 0) return Number.NaN;
+    const now = performance.now();
+    return Number.isFinite(now) && now > 0 ? Math.min(ts, now) : ts;
 }
 
-export function scheduleA11y(h) {
-    clearTimeout(h.a11yTimer);
-    h.a11yTimer = setTimeout(() => { h.a11yTimer = 0; if (!h.disposed) h.send({ kind: 'a11y_due' }); }, 160);
+export function performanceNow() {
+    return performance.now();
+}
+
+// Cancels any pending touch-hold confirmation frames or trailing macrotask.
+export function cancelTouchHoldConfirm(h) {
+    const pending = h.touchHoldConfirm;
+    if (!pending) return;
+    h.touchHoldConfirm = null;
+    pending.cancelled = true;
+    if (pending.raf && typeof globalThis.cancelAnimationFrame === 'function') globalThis.cancelAnimationFrame(pending.raf);
+    if (pending.controller) pending.controller.abort();
+    if (pending.timer) clearTimeout(pending.timer);
+}
+
+// Waits two animation frames and a trailing low-priority macrotask (re-yielding up to 2 turns if
+// input is pending) before confirming a due touch hold. After a main-thread stall, the first rAF
+// commits any overdue frame from the stall (flushing compositor/browser acks), the second rAF
+// runs on a fresh post-stall BeginMainFrame after rAF-aligned touchmove and discrete pointerup
+// delivery, and the trailing task lets any remaining input drain (~33 ms on 60 Hz, ~17 ms on
+// 120 Hz for an unstalled hold).
+export function scheduleTouchHoldConfirm(h, attempt) {
+    cancelTouchHoldConfirm(h);
+    if (h.disposed) return;
+    const token = { cancelled: false, raf: 0, controller: null, timer: 0 };
+    h.touchHoldConfirm = token;
+    let yields = 0;
+    const isCancelled = () => token.cancelled || h.disposed || h.touchHoldConfirm !== token;
+    const run = () => {
+        token.controller = null;
+        token.timer = 0;
+        if (isCancelled()) return;
+        if (yields < 2 && globalThis.navigator?.scheduling?.isInputPending?.({ includeContinuous: true })) {
+            yields += 1;
+            scheduleTask();
+            return;
+        }
+        h.touchHoldConfirm = null;
+        h.send({ kind: 'touch_hold_confirm', attempt });
+    };
+    const scheduleTask = () => {
+        if (typeof globalThis.scheduler?.postTask === 'function') {
+            const controller = typeof AbortController === 'function' ? new AbortController() : null;
+            token.controller = controller;
+            const opts = controller ? { priority: 'background', signal: controller.signal } : { priority: 'background' };
+            Promise.resolve(globalThis.scheduler.postTask(run, opts)).catch(() => {});
+        } else {
+            token.timer = setTimeout(run, 0);
+        }
+    };
+    if (typeof globalThis.requestAnimationFrame === 'function') {
+        token.raf = globalThis.requestAnimationFrame(() => {
+            token.raf = 0;
+            if (isCancelled()) return;
+            token.raf = globalThis.requestAnimationFrame(() => {
+                token.raf = 0;
+                if (isCancelled()) return;
+                scheduleTask();
+            });
+        });
+    } else {
+        scheduleTask();
+    }
+}
+
+// Cancels any pending post-scroll settle timer or post-frame idle mirror flush.
+export function cancelA11y(h) {
+    if (h.a11yTimer) {
+        clearTimeout(h.a11yTimer);
+        h.a11yTimer = 0;
+    }
+    if (h.a11yIdle) {
+        if (h.a11yIdle.kind === 'idle' && globalThis.cancelIdleCallback) cancelIdleCallback(h.a11yIdle.id);
+        else clearTimeout(h.a11yIdle.id);
+        h.a11yIdle = null;
+    }
+}
+
+// Schedules a post-frame idle mirror flush off `rAF` (`requestIdleCallback` with bounded timeout,
+// falling back to `setTimeout(..., 0)`).
+export function scheduleA11yIdle(h, attempt = 0, timeoutMs = 100) {
+    cancelA11y(h);
+    const due = () => {
+        h.a11yIdle = null;
+        if (!h.disposed) h.send({ kind: 'a11y_idle', attempt });
+    };
+    if (globalThis.requestIdleCallback) {
+        h.a11yIdle = { kind: 'idle', id: requestIdleCallback(due, { timeout: timeoutMs }) };
+    } else {
+        h.a11yIdle = { kind: 'timeout', id: setTimeout(due, 0) };
+    }
+}
+
+// Arms or resets the post-scroll settle timer so mirror updates wait until scrolling rests.
+export function scheduleA11y(h, attempt = 0, delayMs = 150) {
+    cancelA11y(h);
+    h.a11yTimer = setTimeout(() => {
+        h.a11yTimer = 0;
+        if (!h.disposed) h.send({ kind: 'a11y_settle', attempt });
+    }, delayMs);
 }
 
 // A page's height and whether a Rune control has the keyboard (scroll keys are the page's
@@ -1075,12 +1660,15 @@ function deferStatic(h) {
 }
 
 export function activate(h) {
+    // Keep DOM focus inside an open Rune popup menu until it closes.
+    if (typeof h.menu?.done === 'function') return;
     // A page's canvas is `tabindex="-1"`: focusing it on a tap would only drop the reader's text
     // selection or a link's focus. An input that took the keyboard still gets it.
     if (h.page && !h.key) return;
     const field = h.key ? h.field : h.canvas;
     if (h.key) field.inputMode = 'text';
     if (document.activeElement !== field) field.focus({ preventScroll: true });
+    if (h.key) reselect(h);
 }
 
 export async function pastedImage(h, max) {
@@ -1094,9 +1682,12 @@ export function destroy(h) {
     h.disposed = true;
     h.image = undefined;
     clearTimeout(h.staticTimer);
-    clearTimeout(h.a11yTimer);
+    cancelTouchHoldConfirm(h);
+    h.touchTimestamps.length = 0;
+    h.activeTouchId = null;
+    cancelA11y(h);
     for (const remove of h.listeners) remove();
-    h.password.value = ''; h.textarea.value = ''; h.copyText = '';
+    h.password.value = ''; h.textarea.value = ''; h.value = ''; h.domValue = ''; h.crlfs = null; h.copyText = ''; h.selection = null;
     h.a11yNodes.clear();
     h.scrollEls.clear();
     h.a11y.remove();

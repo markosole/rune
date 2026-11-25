@@ -26,7 +26,7 @@
 //!   `version`. For a text field that's the
 //!   `TextEdit` itself, which hashes its text, selection, composition and focus.
 //! - **`Cx` reads.** `Cx::layout`, `Cx::layout_with`, `Cx::layout_size`, `Cx::window_layout`,
-//!   `Cx::window_layout_with` and `Cx::caret` called inside the closure are recorded with
+//!   `Cx::window_layout_with`, `Cx::anchor_placement`, `Cx::caret`, `Cx::selection_rects` and `Cx::field_selection_rects` called inside the closure are recorded with
 //!   what they returned. A reuse counts them as read
 //!   again, so the view still re-runs when they move, and builds again when one returns
 //!   something else. They needn't be in `version`.
@@ -41,7 +41,8 @@
 //! The id names the subtree within the window, so it must be unique among the memos of one
 //! view build (a message id, say). A memo inside another's closure is named within it, so
 //! `memo("b0", ..)` inside each message's memo doesn't collide. A second memo with an id
-//! already used in the same build just builds, uncached.
+//! already used in the same build just builds, uncached, and warns once per call site in debug
+//! builds (`RUNE_PERF_WARN=0` silences it).
 //!
 //! Layout isn't stored: a reused subtree still lays out each commit it is mounted, but Taffy
 //! keeps each unchanged node's measured size, so this is cheap while width and constraints hold.
@@ -52,7 +53,7 @@ use std::rc::Rc;
 
 use crate::El;
 use crate::runtime::HashMap;
-use crate::runtime::layout_read::{LayoutRects, SELECTION, note_read};
+use crate::runtime::layout_read::{LayoutRects, SELECTION, anchor_key, field_selection_key, note_read};
 
 mod built;
 mod reads;
@@ -67,13 +68,16 @@ pub(crate) use built::Shared;
 pub(crate) use built::has_focused_input;
 pub(crate) use reads::Reads;
 pub(crate) use reads::Replayed;
+pub(crate) use reads::read_anchor_placement;
 pub(crate) use reads::read_caret;
+pub(crate) use reads::read_field_selection;
 pub(crate) use reads::read_layout;
 pub(crate) use reads::read_layout_with;
 pub(crate) use reads::read_selection;
 pub(crate) use reads::recording;
 use reads::{Read, Seen, dedup_states};
 
+pub use reads::anchor_placement;
 pub use reads::layout;
 pub use reads::layout_size;
 pub use reads::layout_with;
@@ -215,8 +219,9 @@ pub(crate) fn enter(
     accent: crate::SystemAccent,
     reduced_motion: bool,
     system_text_scale: f32,
+    languages_gen: u64,
     srgb_blend: bool,
-    chrome: [u32; 4],
+    chrome: [u32; 5],
     caret: Option<(String, [f32; 4])>,
     layout: LayoutRects,
 ) -> Guard {
@@ -225,11 +230,10 @@ pub(crate) fn enter(
     let accent = [accent.accent(env.system_dark), accent.focus(env.system_dark)].map(|c| [c.r, c.g, c.b, c.a].map(f32::to_bits));
     let scale = env.scale;
     // Theme colours resolve per blend mode (`theme::blends_srgb`), so a switch rebuilds memos.
-    // So do changes to what the window's controls take (`Cx::chrome_insets`), the system text
-    // scale a responsive control can read, and the icon swap, whose icons can take another size
-    // (`text::set_icon_swap_size`).
+    // So does a change to what the window's controls take (`Cx::chrome_insets`), to the icon
+    // swap (`text::set_icon_swap_size`), and to overridden languages (`Runtime::set_languages`).
     let icons = crate::text::icon::swap_state();
-    let env = hash_of(&(env.system_dark, scale.to_bits(), reduced_motion, system_text_scale.to_bits(), accent, crate::platform::scroll_bars::scoped(), srgb_blend, chrome, icons));
+    let env = hash_of(&(env.system_dark, scale.to_bits(), reduced_motion, system_text_scale.to_bits(), languages_gen, accent, crate::platform::scroll_bars::scoped(), srgb_blend, chrome, icons));
     let scope = Scope {
         cache,
         env,
@@ -285,8 +289,9 @@ pub(crate) fn enter_partial(
     accent: crate::SystemAccent,
     reduced_motion: bool,
     system_text_scale: f32,
+    languages_gen: u64,
     srgb_blend: bool,
-    chrome: [u32; 4],
+    chrome: [u32; 5],
     caret: Option<(String, [f32; 4])>,
     layout: LayoutRects,
 ) -> Guard {
@@ -303,7 +308,7 @@ pub(crate) fn enter_partial(
         keep_nested_rows(&mut cache, &mut nested, next);
     }
     cache.nested_scratch = nested;
-    enter(cache, env, accent, reduced_motion, system_text_scale, srgb_blend, chrome, caret, layout)
+    enter(cache, env, accent, reduced_motion, system_text_scale, languages_gen, srgb_blend, chrome, caret, layout)
 }
 
 /// Ends the view build [`enter`] began; dropped without [`Guard::finish`] (a panicking view),
@@ -367,15 +372,29 @@ pub fn as_next_build<R>(f: impl FnOnce() -> R) -> R {
 /// environment) differs from the last build's. Otherwise `build` isn't called and the
 /// previous subtree is reused, with the same node ids and state.
 ///
-/// ```ignore
-/// col().growth(GrowthSpec::default()).virtualize(72.0).children(s.messages.iter().map(|m| {
-///     memo(format!("msg-{}", m.id), (m.revision, s.theme), || message_view(m))
-/// }))
+/// ```no_run
+/// # use rune::{El, GrowthSpec, ScrollSpec, col, memo, text};
+/// # struct Message { id: String, revision: u64, body: String }
+/// # struct App { messages: Vec<Message>, theme: u64 }
+/// # fn message_view(m: &Message) -> El { text(&m.body) }
+/// # fn view(s: &App) -> El {
+/// col().scroll(ScrollSpec { stick_bottom: true }).grow(1.0).child(
+///     col().key("rows").growth(GrowthSpec::default()).virtual_rows(
+///         s.messages.len(),
+///         72.0,
+///         |s: &App, i| s.messages[i].id.as_str().into(),
+///         |s: &App, i| {
+///             let m = &s.messages[i];
+///             memo(format!("msg-{}", m.id), (m.revision, s.theme), || message_view(m))
+///         },
+///     ),
+/// )
+/// # }
 /// ```
 ///
 /// Anything the closure reads that can change belongs in `version`, apart from `Cx::layout`,
 /// `Cx::layout_with`, `Cx::layout_size` and `Cx::caret`, which are tracked; see the
-/// [module docs](crate::memo) for handlers, live values and what else invalidates. Outside a view (a test calling a view function directly)
+/// [module docs](mod@crate::memo) for handlers, live values and what else invalidates. Outside a view (a test calling a view function directly)
 /// it just builds.
 #[inline]
 #[cfg_attr(debug_assertions, track_caller)]
@@ -431,7 +450,9 @@ fn memo_inner(key: String, version: u64, region: bool, build: &mut dyn FnMut() -
                         Read::Caret(..) => s.replayed.caret = true,
                         Read::Layout(k, _) => note_read(&mut s.replayed.layout, k, None),
                         Read::LayoutWith(k, same, _) => note_read(&mut s.replayed.layout, k, Some(same.clone())),
+                        Read::AnchorPlacement(k, _) => note_read(&mut s.replayed.layout, &anchor_key(k), None),
                         Read::Selection(_) => note_read(&mut s.replayed.layout, SELECTION, None),
+                        Read::FieldSelection(k, _) => note_read(&mut s.replayed.layout, &field_selection_key(k), None),
                         Read::State(..) => {}
                     }
                 }
@@ -468,6 +489,10 @@ fn memo_inner(key: String, version: u64, region: bool, build: &mut dyn FnMut() -
         Step::Plain => return keyed(build(), key),
         Step::Build { id, version, store } => (id, version, store),
     };
+    #[cfg(debug_assertions)]
+    if !store {
+        crate::tooling::perf_warn::memo_id_reused(&id, std::panic::Location::caller());
+    }
     // A region's `Tracked` reads join its reads; a memo's closure records none of its own (a
     // region inside it still does, and they reach it as any nested read does).
     let (el, states) = if region {
@@ -518,7 +543,9 @@ fn report_miss(key: &str, same_version: bool, reads: &[Read], seen: &Seen) {
         Read::State(id, v) => format!("state {id} v{v}"),
         Read::Layout(k, _) | Read::LayoutWith(k, _, _) => format!("layout {k}"),
         Read::Caret(k, _) => format!("caret {k}"),
+        Read::AnchorPlacement(k, _) => format!("anchor_placement {k}"),
         Read::Selection(_) => "selection".into(),
+        Read::FieldSelection(k, _) => format!("field_selection {k}"),
     };
     eprintln!("rune-miss {key} {why}");
 }
@@ -579,7 +606,9 @@ fn cached_inner((h1, h2): (u64, u64), build: &mut dyn FnMut() -> El) -> El {
                     Read::Caret(..) => s.replayed.caret = true,
                     Read::Layout(k, _) => note_read(&mut s.replayed.layout, k, None),
                     Read::LayoutWith(k, same, _) => note_read(&mut s.replayed.layout, k, Some(same.clone())),
+                    Read::AnchorPlacement(k, _) => note_read(&mut s.replayed.layout, &anchor_key(k), None),
                     Read::Selection(_) => note_read(&mut s.replayed.layout, SELECTION, None),
+                    Read::FieldSelection(k, _) => note_read(&mut s.replayed.layout, &field_selection_key(k), None),
                     Read::State(..) => {}
                 }
             }

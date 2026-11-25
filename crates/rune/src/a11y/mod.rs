@@ -12,13 +12,23 @@ use accesskit::{ActionHandler, ActionRequest, ActivationHandler, DeactivationHan
 use crate::runtime::Runtime;
 
 pub(crate) mod actions;
+#[cfg(test)]
+mod actions_tests;
+#[cfg(test)]
+mod aria_tests;
+#[cfg(test)]
+mod auto_complete_tests;
 pub(crate) mod dump;
-mod node;
+#[cfg(test)]
+mod dump_tests;
+pub(crate) mod node;
 pub(crate) mod roles;
 #[cfg(test)]
 mod tests;
 mod text;
 pub(crate) mod tree;
+#[cfg(test)]
+mod tree_tests;
 
 #[cfg(all(feature = "accessibility", target_os = "macos"))]
 mod macos;
@@ -167,6 +177,11 @@ impl AccessibilityLink {
         self.shared.inbox.lock().map(|mut i| std::mem::take(&mut *i)).unwrap_or_default()
     }
 
+    #[cfg(test)]
+    pub(crate) fn receive_core(&mut self, rt: &mut crate::runtime::RuntimeCore, name: &str) -> bool {
+        self.receive(rt, name)
+    }
+
     fn receive(&mut self, rt: &mut crate::runtime::RuntimeCore, name: &str) -> bool {
         self.adopt(rt);
         let inbox = self.take();
@@ -180,7 +195,10 @@ impl AccessibilityLink {
             queued |= !was_dirty && rt.commit.dirty;
         }
         match inbox.asked {
-            Asked::Activate => rt.a11y_activate(name),
+            Asked::Activate => {
+                rt.a11y_activate(name);
+                queued |= rt.a11y_activation_build_pending();
+            }
             Asked::Deactivate => rt.a11y_deactivate(),
             Asked::Nothing => {}
         }

@@ -103,6 +103,8 @@ pub(in crate::runtime) struct PaintKeep {
     why: [usize; 6],
     /// The next paint paints everything (the raster check's fresh paint).
     pub(in crate::runtime) off_once: bool,
+    #[cfg(test)]
+    pub(in crate::runtime) check_mismatches: usize,
 }
 
 fn disabled() -> bool {
@@ -150,7 +152,12 @@ pub(in crate::runtime) fn inh_key(p: &Inh) -> u64 {
     bits(&mut h, &[p.still.0]);
     bits(&mut h, &p.still.1);
     bits(&mut h, &p.still.2);
-    (p.in_cache, p.skip_paint, p.anchor_hidden, p.turn).hash(&mut h);
+    bits(&mut h, &[p.held.0]);
+    bits(&mut h, &p.held.1);
+    bits(&mut h, &p.held.2);
+    bits(&mut h, &[p.scale_target]);
+    bits(&mut h, &p.press_off_by);
+    (p.held_moving, p.scale_tracked, p.in_cache, p.skip_paint, p.anchor_hidden, p.turn).hash(&mut h);
     p.snap.hash_bits(&mut h);
     h.finish()
 }
@@ -202,7 +209,7 @@ impl RuntimeCore {
         self.paint.keep.painted = self.paint.keep.frame;
         // Paint goes depth first, siblings in paint order (`update_layer_paint_order`), so a subtree
         // paints in one run unless it holds a node lifted out to paint last.
-        let lifted = !self.motion.flying.is_empty() || self.tree.has_raise;
+        let lifted = !self.motion.flying.is_empty() || self.tree.has_raise || self.paint.has_lifted_anchors();
         let shareable = !lifted && self.motion.flights().is_empty() && self.paint.paint_rank.is_none()
             && self.kbd.modal_scope.is_none() && !self.commit.defaults.force_focus_rings && !disabled();
         let key = shareable.then(|| {
@@ -549,6 +556,8 @@ impl RuntimeCore {
         if now.glyphs[1] - now.glyphs[0] != was.glyphs[1] - was.glyphs[0] { differ.push("glyph count"); }
         if k.pages[range(now.pages)] != k.prev_pages[range(was.pages)] { differ.push("atlas pages"); }
         if !differ.is_empty() {
+            #[cfg(test)]
+            { self.paint.keep.check_mismatches += 1; }
             eprintln!("rune: paint keep: {} would have copied what differs: {}", self.tree.nodes[r].path, differ.join(", "));
         }
     }
@@ -582,7 +591,8 @@ fn static_ok(n: &Node) -> bool {
         && n.vis.backdrop_blur <= 0.0 && n.vis.effect.is_none() && n.vis.pixels.is_none()
         && n.sticky.is_none() && n.above.is_none() && n.matched.is_none()
         && n.static_scale == 1.0 && !n.scale_track && n.vis.mark == 0
-        && n.text.as_ref().is_none_or(|t| t.cold.links.is_empty() && t.cold.live.is_none() && t.cold.advance_in.is_none())
+        && n.text.as_ref().is_none_or(|t| t.cold.links.is_empty() && t.cold.advance_in.is_none()
+            && !t.cold.pills.iter().any(crate::text::PillChip::has_image))
 }
 
 /// What the runtime holds for a node besides it: selection, marks, reveals, loops, scales
@@ -595,3 +605,7 @@ fn dynamic_ok(rt: &RuntimeCore, i: usize, sel: &[(usize, usize, usize)], marks: 
         && (rt.paint.static_scales.is_empty() || !rt.paint.static_scales.contains_key(&id))
         && rt.paint.row_mask[i] < 0.0
 }
+
+#[cfg(test)]
+#[path = "keep_tests.rs"]
+mod tests;

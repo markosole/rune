@@ -155,6 +155,12 @@ struct Fake {
     player: bool,
     now: Instant,
     log: Vec<Cmd>,
+    output_devices: Vec<Option<String>>,
+    seeks: Vec<(f64, bool)>,
+    steps: Vec<i32>,
+    can_step_forward: bool,
+    can_step_backward: bool,
+    poster_pts: f64,
 }
 
 impl Port for Fake {
@@ -171,20 +177,20 @@ impl Port for Fake {
             return Some((attempt, Err("load failed".into())));
         }
         self.kept = Some(done);
-        Some((attempt, Ok(Meta { duration: 1.0, size: Some((64, 36)), frame: 0.25, sound: false })))
+        Some((attempt, Ok(Meta { duration: 1.0, size: Some((64, 36)), frame: Some(0.25), sound: false })))
     }
-    fn show_poster(&mut self, next_id: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    fn show_poster(&mut self, next_id: &mut dyn FnMut() -> u64) -> Result<Option<f64>, String> {
         match (self.kept.take(), self.surface) {
             (Some(Done::Frame), true) => {
                 let id = next_id();
                 self.log.push(Cmd::Poster(id));
-                Ok(())
+                Ok(Some(self.poster_pts))
             }
             (Some(Done::FrameFails), true) => {
                 next_id();
                 Err("poster push failed".into())
             }
-            _ => Ok(()),
+            _ => Ok(None),
         }
     }
     fn ask_poster(&mut self, at: f64, attempt: Attempt) {
@@ -218,7 +224,7 @@ impl Port for Fake {
         self.log.push(Cmd::Orient);
     }
     fn item_facts(&self) -> Meta {
-        Meta { duration: 2.0, size: Some((32, 18)), frame: 1.0 / 30.0, sound: false }
+        Meta { duration: 2.0, size: Some((32, 18)), frame: Some(1.0 / 30.0), sound: false }
     }
     fn alive(&self) -> bool {
         self.player
@@ -227,8 +233,19 @@ impl Port for Fake {
         self.log.push(Cmd::Muted(muted));
     }
     fn set_volume(&mut self, _: f32) {}
-    fn seek_to(&mut self, at: f64) {
+    fn set_output_device(&mut self, uid: Option<&str>) {
+        self.output_devices.push(uid.map(str::to_owned));
+    }
+    fn seek_to(&mut self, at: f64, exact: bool) {
         self.log.push(Cmd::Seek(at));
+        self.seeks.push((at, exact));
+    }
+    fn step_by(&mut self, frames: i32) -> bool {
+        let can = if frames > 0 { self.can_step_forward } else if frames < 0 { self.can_step_backward } else { true };
+        if can {
+            self.steps.push(frames);
+        }
+        can
     }
     fn set_rate(&mut self, rate: f32) {
         self.log.push(Cmd::Rate(rate));
@@ -271,7 +288,7 @@ impl New {
         let kind = if audio { Kind::Audio } else { Kind::Video };
         Self {
             c: Control { muted: !audio, kind, ..Control::default() },
-            fake: Fake { script: Script::READY, checked: false, surface: !audio, done: None, kept: None, asked: Attempt::default(), pending: Vec::new(), player: false, now, log: Vec::new() },
+            fake: Fake { script: Script::READY, checked: false, surface: !audio, done: None, kept: None, asked: Attempt::default(), pending: Vec::new(), player: false, now, log: Vec::new(), output_devices: Vec::new(), seeks: Vec::new(), steps: Vec::new(), can_step_forward: true, can_step_backward: true, poster_pts: 0.0 },
         }
     }
 
@@ -342,11 +359,11 @@ impl New {
         match sym {
             Sym::Play => self.send(Event::Play),
             Sym::Pause => self.send(Event::Pause),
-            Sym::Seek(t) => self.send(Event::Seek(t)),
+            Sym::Seek(t) => self.send(Event::Seek { to: t, exact: true }),
             Sym::Rate(r) => self.send(Event::Rate(r)),
             Sym::Looping(l) => self.c.looping = l,
             Sym::Muted(m) => self.c.muted = m,
-            Sym::Open => self.c.open(Ok(Meta { duration: 1.0, size: Some((64, 36)), frame: 0.25, sound: false })),
+            Sym::Open => self.c.open(Ok(Meta { duration: 1.0, size: Some((64, 36)), frame: Some(0.25), sound: false })),
             Sym::OpenFails => self.c.open(Err("open failed".into())),
             Sym::Fail => self.c.fail("failed".into()),
             Sym::Clock(t) => self.c.advance_virtual(t),
@@ -381,7 +398,7 @@ impl New {
             drawn: matches!(c.run, Run::Failed { drawn: true, .. }),
             anchor: if let Run::Playing { anchor } = c.run { anchor } else { None },
             rate: c.rate,
-            seek: c.seek,
+            seek: match c.pending { Some(Pending::Seek(s)) => Some(s.at), _ => None },
             time: c.time,
             duration: c.duration,
             size: c.size,
@@ -541,6 +558,9 @@ fn a_loading_player_times_out_like_the_old_flags() {
 #[path = "phases_poster_tests.rs"]
 mod poster;
 
+#[path = "phases_step_tests.rs"]
+mod step_tests;
+
 #[test]
 fn the_newest_seek_replaces_an_earlier_one() {
     let now = rune_core::time::now();
@@ -597,4 +617,185 @@ fn a_seek_that_never_lands_expires() {
     s.seek(1.0, true, now);
     s.expire(now + Duration::from_secs(60));
     assert_eq!(s, Settle::Holding { to: 1.0 });
+}
+
+#[test]
+fn output_device_default_emits_nothing() {
+    let now = rune_core::time::now();
+    let mut new = New::new(true, now);
+    new.run(Open);
+    new.run(Play);
+    new.run(Pull(Script::LOADING));
+    new.run(Pull(Script::READY));
+    new.run(Pause);
+    new.run(Park);
+    new.run(Play);
+    new.run(Pull(Script::READY));
+    assert!(new.fake.output_devices.is_empty(), "default output never calls set_output_device");
+}
+
+#[test]
+fn output_device_applies_on_change_skips_unchanged_and_resets_to_none() {
+    let now = rune_core::time::now();
+    let mut new = New::new(true, now);
+    new.run(Open);
+    new.c.set_output_device(Some("USB-DAC"));
+    new.run(Play);
+    // Applied as soon as the player is made, even while still Loading.
+    new.run(Pull(Script::LOADING));
+    assert_eq!(new.fake.output_devices, [Some("USB-DAC".into())]);
+    // Preserved across Loading -> Ready without re-emitting.
+    new.run(Pull(Script::READY));
+    assert_eq!(new.fake.output_devices, [Some("USB-DAC".into())]);
+    // Re-setting the same UID emits nothing.
+    new.c.set_output_device(Some("USB-DAC"));
+    new.run(Apply);
+    assert_eq!(new.fake.output_devices, [Some("USB-DAC".into())]);
+    // Switching devices emits once with the new UID.
+    new.c.set_output_device(Some("BuiltInSpeakerDevice"));
+    new.run(Apply);
+    assert_eq!(new.fake.output_devices, [Some("USB-DAC".into()), Some("BuiltInSpeakerDevice".into())]);
+    // Resetting to None emits once with None; empty/None again emits nothing.
+    new.c.set_output_device(None);
+    new.run(Apply);
+    new.c.set_output_device(Some(""));
+    new.run(Apply);
+    assert_eq!(new.fake.output_devices, [Some("USB-DAC".into()), Some("BuiltInSpeakerDevice".into()), None]);
+}
+
+#[test]
+fn output_device_reapplies_after_player_drop_and_recreate() {
+    let now = rune_core::time::now();
+    let mut new = New::new(false, now);
+    new.run(Open);
+    new.c.set_output_device(Some("USB-DAC"));
+    new.run(Play);
+    new.run(Pull(Script::READY));
+    assert_eq!(new.fake.output_devices, [Some("USB-DAC".into())]);
+
+    // Parking drops the native player; resuming creates a fresh one and re-applies the UID.
+    new.run(Pause);
+    new.run(Park);
+    new.run(Play);
+    new.run(Pull(Script::READY));
+    assert_eq!(new.fake.output_devices, [Some("USB-DAC".into()), Some("USB-DAC".into())]);
+
+    // After resetting to system output, recreating a parked player does not re-emit None.
+    new.c.set_output_device(None);
+    new.run(Apply);
+    assert_eq!(new.fake.output_devices, [Some("USB-DAC".into()), Some("USB-DAC".into()), None]);
+    new.run(Pause);
+    new.run(Park);
+    new.run(Play);
+    new.run(Pull(Script::READY));
+    assert_eq!(new.fake.output_devices, [Some("USB-DAC".into()), Some("USB-DAC".into()), None]);
+}
+
+#[test]
+fn output_device_reapplies_when_generation_wraps_to_zero() {
+    let now = rune_core::time::now();
+    let mut c = Control { kind: Kind::Audio, muted: false, output_generation: u64::MAX, ..Control::default() };
+    c.set_output_device(Some("USB-DAC"));
+    assert_eq!(c.output_generation, 0);
+    step(&mut c, Event::PlayerMade { created: now });
+    let effects = step(&mut c, Event::Reconcile { now });
+    assert!(effects.into_iter().any(|e| e == Effect::SetOutputDevice));
+}
+
+#[test]
+fn seek_fast_passes_exact_false_and_exact_seek_passes_exact_true() {
+    let now = rune_core::time::now();
+    let mut new = New::new(false, now);
+    new.run(Open);
+    new.run(Play);
+    new.run(Pull(Script::READY));
+    assert!(!new.c.is_seeking());
+
+    // Fast seek propagates exact=false and marks is_seeking() until a frame lands.
+    new.send(Event::Seek { to: 0.7, exact: false });
+    assert!(new.c.is_seeking(), "pending before reconcile");
+    new.run(Apply);
+    assert_eq!(new.fake.seeks, [(0.7, false)]);
+    assert!(new.c.is_seeking(), "waiting for frame after fast seek");
+
+    // Frame lands at keyframe time (0.5): is_seeking clears and time reports the keyframe.
+    let keyframe = Script { frame: Frame::New(0.5), item_time: 0.5, current: 0.5, ..Script::READY };
+    new.run(Pull(keyframe));
+    assert!(!new.c.is_seeking());
+    assert_eq!(new.c.time, 0.5);
+
+    // Exact seek on release propagates exact=true.
+    new.send(Event::Seek { to: 0.7, exact: true });
+    new.run(Apply);
+    assert_eq!(new.fake.seeks, [(0.7, false), (0.7, true)]);
+    assert!(new.c.is_seeking());
+    let exact_frame = Script { frame: Frame::New(0.7), item_time: 0.7, current: 0.7, ..Script::READY };
+    new.run(Pull(exact_frame));
+    assert!(!new.c.is_seeking());
+    assert_eq!(new.c.time, 0.7);
+}
+
+#[test]
+fn is_seeking_handles_same_frame_paused_seek_expiry_audio_and_failure() {
+    let now = rune_core::time::now();
+    let mut new = New::new(false, now);
+    new.run(Open);
+    new.run(Play);
+    new.run(Pull(Script::FRAME)); // shown = 0.3 (frame 1 of 0.25 s frames)
+    new.run(Pause);
+    new.run(Apply);
+    assert!(!new.c.is_seeking());
+
+    // Paused seek within the same frame (0.25..0.5): Settle::Holding -> not waiting.
+    new.send(Event::Seek { to: 0.35, exact: false });
+    new.run(Apply);
+    assert!(!new.c.is_seeking(), "same-frame paused seek needs no new frame");
+
+    // Paused seek to a different frame: waits until frame arrives or SEEK_PATIENCE expires.
+    new.send(Event::Seek { to: 0.8, exact: false });
+    new.run(Apply);
+    assert!(new.c.is_seeking());
+    new.run(Wait(3));
+    new.run(Pull(Script::READY));
+    assert!(!new.c.is_seeking(), "expired seek stops waiting");
+
+    // Audio seek clears when current reaches target within AUDIO_SEEK_SLOP.
+    let mut audio = New::new(true, now);
+    audio.run(Open);
+    audio.run(Play);
+    audio.run(Pull(Script::READY));
+    audio.send(Event::Seek { to: 0.8, exact: false });
+    assert!(audio.c.is_seeking());
+    audio.run(Pull(Script::READY)); // current = 0.4, still far from 0.8
+    assert_eq!(audio.fake.seeks, [(0.8, false)]);
+    assert!(audio.c.is_seeking());
+    audio.run(Pull(Script { current: 0.8, item_time: 0.8, ..Script::READY }));
+    assert!(!audio.c.is_seeking());
+
+    // Failed clips never report seeking.
+    audio.send(Event::Seek { to: 0.2, exact: false });
+    assert!(audio.c.is_seeking());
+    audio.run(Fail);
+    assert!(!audio.c.is_seeking());
+}
+
+#[test]
+fn is_seeking_tracks_paused_poster_seek_until_poster_lands() {
+    let now = rune_core::time::now();
+    let mut new = New::new(false, now);
+    // Initial poster load is not a seek.
+    new.run(Pull(Script::LOADING));
+    assert!(!new.c.is_seeking());
+    new.run(Land(Done::Frame));
+    new.run(Pull(Script::LOADING));
+    assert!(!new.c.is_seeking());
+
+    // Paused seek with no player: seeking stays true across poster decode until ShowPoster.
+    new.send(Event::Seek { to: 0.6, exact: false });
+    assert!(new.c.is_seeking());
+    new.run(Pull(Script::LOADING));
+    assert!(new.c.is_seeking(), "waiting on poster worker for seek");
+    new.run(Land(Done::Frame));
+    new.run(Pull(Script::LOADING));
+    assert!(!new.c.is_seeking(), "poster landed");
 }

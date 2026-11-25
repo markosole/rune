@@ -18,11 +18,12 @@ use super::cpu_frame::{Cpu, Shown};
 use crate::platform::win32::dcomp_handover::Handover;
 use crate::platform::win32::dib::{Dib, free_later};
 use crate::render::cpu_boot::HalfRounding;
-use crate::render::{Gpu, Renderer};
+use crate::render::{Gpu, Renderer, SurfaceSetupError, format_window_setup_error, with_wine_hwnd_hint};
 use crate::time::Instant;
+pub(super) use crate::window::warm_frame::{warm_frame, warm_instances};
 use crate::window::WakeEvent;
 use crate::window::host::{CompositorFrame, Host};
-use crate::window::surface::{Win, acquire, configure, reblend_core, rebuild_renderer_core, surface_config};
+use crate::window::surface::{Win, acquire, configure_checked, drawable_size, max_surface_dim, reblend_core, rebuild_renderer_core, surface_config};
 
 /// Where a window's frames go. Windows that need the GPU from their first frame (a compositor,
 /// a translucent window, an overlay) are `Gpu` from the start, as on every other platform.
@@ -90,13 +91,14 @@ const RETRY_AFTER: Duration = Duration::from_secs(30);
 /// Tries in all before the window stays on the CPU.
 const TRIES: u8 = 3;
 
-/// What the GPU thread makes for a window.
+/// What the GPU thread makes for a window. `handover` is `Some` on DirectComposition and
+/// `None` when `WGPU_DX12_PRESENTATION_SYSTEM=hwnd` selects a plain HWND swap chain (opaque only).
 pub(in crate::window) struct Prepared {
     gpu: Gpu,
     renderer: Renderer,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
-    handover: Handover,
+    handover: Option<Handover>,
 }
 
 // SAFETY: wgpu's objects are `Send`; a new `Renderer` has no native surface renderer (the one
@@ -136,16 +138,16 @@ impl SurfaceMode {
 
 impl Host {
     /// The first idle turn after the window's first CPU frame: the GPU starts on its thread
-    /// (`RUNE_CPU_FIRST=only`: not until a frame needs it, for checking the CPU window alone).
+    /// (`CpuFirst::Only` or `RUNE_CPU_FIRST=only`: not until a frame needs it).
     pub(in crate::window) fn cpu_idle(&mut self) {
         if self.gpu_owed() { self.start_gpu(true); }
     }
 
     /// Whether the GPU is due to start now (`cpu_idle`).
     pub(in crate::window) fn gpu_owed(&self) -> bool {
-        if std::env::var_os("RUNE_CPU_FIRST").is_some_and(|v| v == "only") { return false; }
         let now = crate::time::now();
-        self.win.as_ref().is_some_and(|w| matches!(w.native.mode, SurfaceMode::Cpu { job: GpuJob::Waiting { retry_at, .. }, .. } if retry_at.is_none_or(|at| at <= now)) && w.first_frame.ready())
+        let due = self.win.as_ref().is_some_and(|w| matches!(w.native.mode, SurfaceMode::Cpu { job: GpuJob::Waiting { retry_at, .. }, .. } if retry_at.is_none_or(|at| at <= now)) && w.first_frame.ready());
+        self.effective_cpu_first().gpu_owed(due)
     }
 
     /// Starts making the GPU for this window on a thread (`below`: at below-normal priority, as
@@ -213,9 +215,27 @@ impl Host {
         crate::render::surface_gpu(&gpu);
         let size = w.window.inner_size();
         let SurfaceMode::Cpu { mut cpu, .. } = std::mem::replace(&mut w.native.mode, SurfaceMode::Gpu) else { unreachable!() };
-        cpu.half = HalfRounding::of_vendor(gpu.adapter.get_info().vendor);
-        w.native.video_layers.hold_premultiplied(vrr_guard(gpu.adapter.get_info().vendor));
-        w.native.mode = SurfaceMode::HandingOver { cpu, handover, done: None, readback: None, since: crate::time::now(), nudged: None, tries, paused: false };
+        match handover {
+            Some(handover) => {
+                cpu.half = HalfRounding::of_vendor(gpu.adapter.get_info().vendor);
+                w.native.video_layers.hold_premultiplied(vrr_guard(gpu.adapter.get_info().vendor));
+                w.native.mode = SurfaceMode::HandingOver { cpu, handover, done: None, readback: None, since: crate::time::now(), nudged: None, tries, paused: false };
+            }
+            None => {
+                // Plain HWND swap chain (`DxgiFromHwnd`): no DirectComposition visual to commit
+                // seamlessly, so free the CPU DIB, skip the premultiplied video-layer VRR hold,
+                // and transition straight to `SurfaceMode::Gpu`.
+                if let Some(dib) = cpu.into_dib() {
+                    free_later(dib);
+                }
+                if w.native.cloak.held() {
+                    w.native.cloak.lift(&w.window);
+                    crate::marks::mark("window.shown");
+                }
+                w.presented = None;
+                crate::marks::mark("gpu.window.handed");
+            }
+        }
         w.native.slot.reset();
         w.native.damage.reset();
         // D3D12's idle-priority threads compile the first frame's shaders: on a busy machine they
@@ -224,8 +244,16 @@ impl Host {
         w.surface = Some(surface);
         w.config = config;
         w.surface_ok = true;
+        if gpu.adapter.get_info().device_type == wgpu::DeviceType::Cpu {
+            w.surface_retries.note_software();
+        }
         // The window changed size while the GPU was made.
         if size.width > 0 && size.height > 0 { w.resize_surface(Some(&*gpu), size); }
+        // A window that hands over names its effects when the hand-over is committed
+        // (`hand_over_if_done`). Named here, the hand-over frame's own prepare would start the
+        // warm worker, and while the GPU finishes that frame nothing is prepared: a frame it is
+        // slow to finish would read to the worker as a window at rest.
+        if !matches!(w.native.mode, SurfaceMode::HandingOver { .. }) { renderer.set_prewarm_effects(self.prewarm_effects); }
         self.gpu = Some((gpu, renderer));
         w.request_redraw();
     }
@@ -237,8 +265,9 @@ impl Host {
         if !matches!(l.native.mode, SurfaceMode::HandingOver { paused: false, .. }) { return; }
         if renderer.srgb_blend() != self.app.rt().srgb_blend() {
             let Some(surface) = l.surface.as_ref() else { return };
-            l.native.slot.reset();
-            if !reblend_core(surface, gpu, &mut l.config, renderer, &mut l.alpha, self.app.rt_mut()) {
+            let ok = reblend_core(surface, gpu, &mut l.config, renderer, &mut l.alpha, self.app.rt_mut());
+            l.native.slot.reconfigured(ok);
+            if !ok {
                 l.surface_ok = false;
                 return;
             }
@@ -312,7 +341,7 @@ impl Host {
     /// visual (DWM shows the GPU from its next composition) and leave the CPU behind; the CPU's
     /// buffer goes on a worker after counting the frame's drift.
     pub(in crate::window) fn hand_over_if_done(&mut self) {
-        let (Some(w), Some((gpu, _))) = (self.win.as_mut(), self.gpu.as_ref()) else { return };
+        let (Some(w), Some((gpu, renderer))) = (self.win.as_mut(), self.gpu.as_mut()) else { return };
         match &mut w.native.mode {
             SurfaceMode::HandingOver { done: Some((done, _)), tries, .. } => {
                 let tries = *tries;
@@ -323,6 +352,10 @@ impl Host {
                 if let Err(error) = committed { return self.fail_gpu(format!("the GPU couldn't take over the window: {error}"), tries); }
                 let SurfaceMode::HandingOver { cpu, handover, readback, .. } = std::mem::replace(&mut w.native.mode, SurfaceMode::Gpu) else { unreachable!() };
                 crate::marks::mark("gpu.window.handed");
+                // The window is the GPU's: its effects are named now (`gpu_ready`), and the warm
+                // worker starts its rest from here.
+                renderer.set_prewarm_effects(self.prewarm_effects);
+                renderer.warm_effects(&gpu.device);
                 crate::platform::win32::unidle_d3d_threads_soon();
                 // A first frame only the GPU could draw showed cloaked: it comes on screen now.
                 if w.native.cloak.held() {
@@ -368,6 +401,7 @@ impl Host {
         w.native.slot.reset();
         w.surface = None;
         self.gpu = None;
+        self.app.release_compositor_gpu();
         w.request_redraw();
     }
 
@@ -437,75 +471,69 @@ fn raise_priority(thread: &std::thread::JoinHandle<()>) {
 
 static FIRST_GPU: AtomicBool = AtomicBool::new(false);
 
+/// Creates a plain HWND `wgpu::Surface` from a raw Win32 `hwnd` on a `DxgiFromHwnd` instance.
+#[allow(unsafe_code)]
+fn create_hwnd_surface(instance: &wgpu::Instance, hwnd: isize) -> Result<wgpu::Surface<'static>, String> {
+    let hwnd = std::num::NonZeroIsize::new(hwnd).ok_or_else(|| "window handle is null".to_owned())?;
+    let raw_window_handle = winit::raw_window_handle::RawWindowHandle::Win32(
+        winit::raw_window_handle::Win32WindowHandle::new(hwnd),
+    );
+    let raw_display_handle = winit::raw_window_handle::RawDisplayHandle::Windows(
+        winit::raw_window_handle::WindowsDisplayHandle::new(),
+    );
+    // SAFETY: `hwnd` is a live window of this process, and `Win` drops its `wgpu::Surface` before
+    // dropping the native `winit::window::Window`.
+    unsafe {
+        instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle: Some(raw_display_handle),
+            raw_window_handle,
+        })
+    }
+    .map_err(|e| e.to_string())
+}
+
 /// On the GPU thread: the device (the one `warm_gpu` made, if it did), the renderer, the
-/// uncommitted visual and a swap chain on it, configured for `size`.
+/// uncommitted DirectComposition visual (when DirectComposition is active) and a swap chain
+/// configured for `size`.
 #[allow(unsafe_code)]
 fn prepare(hwnd: isize, size: (u32, u32), srgb: bool, features: wgpu::Features, latest: &Mutex<Vec<crate::render::Instance>>) -> Result<Prepared, String> {
-    let handover = Handover::new(hwnd)?;
-    let visual = handover.visual();
-    // SAFETY: the visual stays alive while the surface does: the surface takes its own reference
-    // to it, and the window keeps the `Handover` as long as it keeps the surface.
-    let (gpu, surface, renderer) = Gpu::for_surface(features, false,
-        |instance| unsafe { instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CompositionVisual(visual)) }.map_err(|e| e.to_string()))?;
-    let (config, _) = surface_config(&surface, &gpu.adapter, (size.0.max(1), size.1.max(1)), srgb).ok_or("the GPU can't present to this window")?;
-    configure(&surface, &gpu, &config)?;
+    let handover = match Gpu::dx12_swapchain_kind() {
+        wgpu::Dx12SwapchainKind::DxgiFromHwnd => None,
+        wgpu::Dx12SwapchainKind::DxgiFromVisual => Some(Handover::new(hwnd).map_err(with_wine_hwnd_hint)?),
+    };
+    let (gpu, surface, (config, mut renderer)) = Gpu::for_surface_setup(
+        features,
+        false,
+        |instance| match &handover {
+            Some(handover) => {
+                // SAFETY: the visual stays alive while the surface does: the surface takes its own
+                // reference to it, and the window keeps the `Handover` as long as it keeps the surface.
+                unsafe { instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CompositionVisual(handover.visual())) }
+                    .map_err(|e| e.to_string())
+            }
+            None => create_hwnd_surface(instance, hwnd),
+        },
+        |gpu, surface, prewarmed| {
+            let size = drawable_size(None, size, max_surface_dim(Some(gpu)));
+            let (config, _) = surface_config(surface, &gpu.adapter, size, srgb)
+                .ok_or_else(|| SurfaceSetupError::unsupported("the GPU can't present to this window"))?;
+            configure_checked(surface, gpu, &config).map_err(|error| SurfaceSetupError::from_configure("", error))?;
+            let target_format = if srgb { config.format.remove_srgb_suffix() } else { config.format };
+            let renderer = match prewarmed {
+                Some(mut renderer) => {
+                    renderer.try_set_format(&gpu.device, target_format).map_err(SurfaceSetupError::from_shader)?;
+                    renderer
+                }
+                None => Renderer::try_new_classified(&gpu.device, target_format).map_err(SurfaceSetupError::from_shader)?,
+            };
+            Ok((config, renderer))
+        },
+    ).map_err(format_window_setup_error)?;
     let target_format = if srgb { config.format.remove_srgb_suffix() } else { config.format };
-    let mut renderer = renderer.unwrap_or_else(|| Renderer::new(&gpu.device, target_format));
     let instances = std::mem::take(&mut *latest.lock().unwrap_or_else(|e| e.into_inner()));
     warm_frame(&gpu, &mut renderer, target_format, srgb, (config.width, config.height), &instances);
     crate::marks::mark("gpu.window.warmed");
     Ok(Prepared { gpu, renderer, surface, config, handover })
-}
-
-/// On the GPU thread, before the hand-over: the renderer draws the window's latest CPU frame once,
-/// into a target of the swap chain's format, and waits for the GPU. Its first frame's costs are
-/// paid here, so the hand-over frame on the app's thread costs what a frame does: the pipelines
-/// its layers' formats need, its layers' targets (the hand-over frame's layers are the latest
-/// frame's, or nearly), the staging space and the instance buffer. Its own target goes as soon as
-/// the GPU is done with it. The atlas is an empty one: the glyphs land with the hand-over frame's
-/// own prepare.
-fn warm_frame(gpu: &Gpu, renderer: &mut Renderer, format: wgpu::TextureFormat, srgb: bool, size: (u32, u32), instances: &[crate::render::Instance]) {
-    renderer.set_format(&gpu.device, format);
-    renderer.set_srgb_blend(srgb);
-    debug_assert_eq!(renderer.format(), format);
-    let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("rune warm frame"),
-        size: wgpu::Extent3d { width: size.0.max(1), height: size.1.max(1), depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
-    let view = target.create_view(&Default::default());
-    let mut atlas = crate::text::Atlas::new();
-    let mut enc = gpu.device.create_command_encoder(&Default::default());
-    renderer.prepare_ui(&gpu.device, &gpu.queue, &mut atlas, instances, size);
-    renderer.draw(&mut enc, &view, [0.0; 4]);
-    renderer.submit(&gpu.queue, enc);
-    rune_gpu::health::poll(&gpu.device, wgpu::PollType::wait_indefinitely()).ok();
-    target.destroy();
-    rune_gpu::health::poll(&gpu.device, wgpu::PollType::Poll).ok();
-}
-
-/// A CPU frame's instances as the warm frame draws them: what reads the app's own state (an
-/// image's slot, a glyph's atlas page, a compositor's effect) draws as a plain box, so the frame
-/// needs nothing but the renderer.
-pub(super) fn warm_instances(instances: &[crate::render::Instance]) -> Vec<crate::render::Instance> {
-    use crate::render::{KIND_RECT, Kind};
-    instances
-        .iter()
-        .map(|i| {
-            let mut i = *i;
-            match i.kind() {
-                Some(Kind::Image | Kind::Effect) => i.params[1] = KIND_RECT,
-                Some(Kind::Glyph) => i.params[2] = 0.0,
-                _ => {}
-            }
-            i
-        })
-        .collect()
 }
 
 /// On a worker: maps the GPU frame's copy, counts the pixels that differ from the CPU's buffer
@@ -521,6 +549,24 @@ fn count_drift(gpu: Arc<Gpu>, readback: Readback, mut dib: Dib) {
         crate::render::cpu_boot::drift(crate::render::cpu_boot::Pixels::bgra(dib.bytes(), width, height, stride), crate::render::cpu_boot::Pixels::bgra(&gpu_px, width, height, readback.row as usize));
     });
     if let Err(error) = spawned { eprintln!("rune: could not count the hand-over's drift: {error}"); }
+}
+
+/// `crate::warm_gpu_cache` on Windows: a window that is never shown, the GPU thread's own
+/// `prepare` on it with no frame to draw, and the pinned pipelines waited for.
+#[allow(unsafe_code)]
+pub(crate) fn warm_gpu_cache() -> Result<(), String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WS_POPUP};
+    let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+    // SAFETY: a window of the system's own class with no parent, menu or data; never shown.
+    let hwnd = unsafe { CreateWindowExW(0, class.as_ptr(), std::ptr::null(), WS_POPUP, 0, 0, 1280, 800, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null()) };
+    if hwnd.is_null() { return Err("no window could be made to warm the GPU on".into()); }
+    // What a window's hand-over makes: the device, the frame and fill pipelines for its swap
+    // chain's format, then (started by the warm frame's prepare) the pinned ones.
+    let made = prepare(hwnd as isize, (1280, 800), true, wgpu::Features::empty(), &Mutex::new(Vec::new()));
+    let result = made.map(|mut prepared| prepared.renderer.wait_pinned());
+    // SAFETY: the window made above, on this thread; the surface on it is gone with `prepared`.
+    unsafe { DestroyWindow(hwnd) };
+    result
 }
 
 #[allow(unsafe_code)]

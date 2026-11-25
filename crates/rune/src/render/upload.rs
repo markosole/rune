@@ -55,7 +55,7 @@ impl Default for Uploads {
 
 impl Uploads {
     /// Forgets what the instance buffer holds, so the next frame writes and batches it all.
-    fn forget_instances(&mut self) {
+    pub(super) fn forget_instances(&mut self) {
         self.instances.clear();
         self.batched = false;
         self.held_paint = None;
@@ -68,6 +68,19 @@ impl Uploads {
     /// Frees the staging chunks kept for reuse (`Renderer::give_back`).
     pub(super) fn trim(&self) {
         if let Some(staging) = &self.staging { staging.trim(); }
+        if let Some(frame_writes) = &self.frame_writes { frame_writes.trim(); }
+    }
+
+    /// Frees only oversized (> 4 MiB) staging chunks at idle rest, keeping <= 4 MiB chunks.
+    pub(super) fn trim_oversized(&self) {
+        if let Some(staging) = &self.staging { staging.trim_oversized(); }
+        if let Some(frame_writes) = &self.frame_writes { frame_writes.trim_oversized(); }
+    }
+
+    /// Whether any recyclable oversized staging chunks are in flight on the GPU.
+    pub(super) fn has_oversized_in_flight(&self) -> bool {
+        self.staging.as_ref().is_some_and(Staging::has_oversized_in_flight)
+            || self.frame_writes.as_ref().is_some_and(Staging::has_oversized_in_flight)
     }
 
     #[cfg(test)]
@@ -148,7 +161,11 @@ impl Renderer {
         let mut changed = self.images.len() != images.pages.len();
         self.images.resize_with(images.pages.len(), || None);
         for (index, page) in images.pages.iter_mut().enumerate() {
-            if page.data.is_empty() { changed |= self.images[index].is_some(); self.images[index] = None; continue; }
+            // A page past the device's largest texture (placed before this renderer said its limit)
+            // draws nothing rather than failing validation.
+            if page.data.is_empty() || page.width.max(page.height) > self.max_texture_dim {
+                changed |= self.images[index].is_some(); self.images[index] = None; continue;
+            }
             if self.images[index].as_ref().is_none_or(|(t, _)| t.width() != page.width || t.height() != page.height) {
                 let texture = Self::image_texture(device, page.width, page.height);
                 let bind = Self::bind_group(device, &self.bind_layout, &self.globals, self.uber.outlines(), &self.atlas, &texture, None);
@@ -161,6 +178,26 @@ impl Renderer {
         }
         if changed { self.images_changed(); }
         self.refresh_layer_bindings(device);
+    }
+
+    /// Drops every uploaded image page's GPU texture and any layer bind groups referencing them.
+    /// Returns whether any texture was held. The next `upload_images` recreates textures for pages
+    /// still present in `ImageAtlas`.
+    #[cfg_attr(not(any(test, not(any(target_os = "macos", target_arch = "wasm32")))), allow(dead_code))]
+    pub(crate) fn clear_images(&mut self) -> bool {
+        let had = self.images.iter().any(Option::is_some);
+        if self.images.is_empty() && !had { return false; }
+        self.images.clear();
+        self.layers.clear_images();
+        self.images_changed();
+        #[cfg(all(feature = "alloc-sites", not(target_arch = "wasm32")))]
+        self.report_pools();
+        had
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_images(&self) -> bool {
+        self.images.iter().any(Option::is_some)
     }
 
     /// Uploads several instance lists back to back (one buffer, one glyph upload) and returns
@@ -222,6 +259,7 @@ impl Renderer {
         // The pinned pipelines (`variant::start_pinned`): asked for at the first prepare, taken once their thread has them.
         if self.pinned.is_none() && self.pinned_building.is_none() { self.start_pinned(device); }
         self.take_pinned();
+        self.poll_effect_warm();
         #[cfg(feature = "frame-profile")]
         super::report_pinned();
         let staging = self.uploads.staging(device, queue);
@@ -316,6 +354,9 @@ impl Renderer {
             }
         }
         self.prepare_backdrop_blur(device, queue, viewport);
+        if self.first_frame_submitted.load(Ordering::Acquire) {
+            self.warm_effects(device);
+        }
         #[cfg(all(feature = "alloc-sites", not(target_arch = "wasm32")))]
         self.report_pools();
     }
@@ -327,6 +368,13 @@ impl Renderer {
     pub(crate) fn build_surfaces(&mut self, device: &wgpu::Device, draws: &[crate::native_surface::SurfaceDraw], done: impl FnOnce() + Send + 'static) {
         if draws.is_empty() || self.surfaces.is_some() || self.surfaces_building.is_some() { return; }
         self.surfaces_building = Some(crate::native_surface::SurfaceRenderer::build(device, self.format, Box::new(done)));
+    }
+
+    /// Whether the native-surface pipeline is still compiling (`build_surfaces`), so the frame
+    /// skipped drawing surfaces and must not be recorded as a presented resting frame.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn surfaces_pending(&self) -> bool {
+        self.surfaces.is_none() && self.surfaces_building.is_some()
     }
 
     /// Punches these native surfaces' places out of the window's pixels from the next

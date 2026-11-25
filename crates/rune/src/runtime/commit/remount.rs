@@ -43,7 +43,7 @@ impl CommitState {
             return false;
         }
         if !tree.nodes.iter().all(|n| {
-            relayout::reusable(n) && n.text.as_ref().is_none_or(|t| !t.redacted && t.cold.live.is_none())
+            relayout::reusable(n) && n.text.as_ref().is_none_or(|t| !t.redacted)
         }) {
             return false;
         }
@@ -53,7 +53,7 @@ impl CommitState {
             }
             let Some(&list_id) = tree.path_ids.get(path) else { return false };
             let Some(&list_idx) = tree.node_index.get(&list_id) else { return false };
-            if !tree.nodes.get(list_idx).is_some_and(|n| n.id == list_id && n.path == *path && n.growth.is_some()) {
+            if !tree.nodes.get(list_idx).is_some_and(|n| n.id == list_id && n.path == *path && n.virtual_list && n.growth.is_some()) {
                 return false;
             }
             let Some(&scroll_id) = tree.path_ids.get(&v.scroll_path) else { return false };
@@ -182,16 +182,17 @@ impl Measurement<'_> {
             let offset = old_scroll.map_or(0.0, |s| s.offset as f32);
             v.viewport = self.nodes[scroll_idx].local.h;
             let (mut offset, pinned) = v.locate(offset, held);
-            v.anchor = if pinned || v.passed() { None } else { v.first_visible(offset, |_| true) };
-            let delta = v.anchor_delta();
+            v.anchor = if pinned || v.passed() || v.no_anchor { None } else { v.first_visible(offset, |_| true) };
+            let owned = self.scroll_requests.owns(&v.scroll_path);
+            let delta = if held || owned { 0.0 } else { v.anchor_delta() };
             offset = (offset + delta).max(0.0);
-            if let Some(st) = self.scrolls.get_mut(&scroll_id) && !held {
-                st.offset = (st.offset + f64::from(delta)).max(0.0);
+            if let Some(st) = self.scrolls.get_mut(&scroll_id) && !held && !owned {
+                st.shift_anchor(delta);
             }
             let shown = std::mem::take(&mut v.shown);
             v.select(offset, pinned, Some(&shown));
             for key in shown.iter().filter(|k| v.index_of(k).is_some_and(|i| !v.range.contains(&i))) {
-                self.virtual_culled.insert(format!("{path}/{key}"));
+                self.virtual_culled.insert(node_path(path, Some(key), 0));
             }
             v.shown = shown;
 
@@ -255,6 +256,7 @@ impl Measurement<'_> {
             self.system_accent,
             self.system_reduced_motion,
             self.system_text_scale,
+            self.languages_gen,
             crate::theme::blends_srgb(),
             self.chrome_bits(),
             self.caret.clone(),
@@ -298,6 +300,8 @@ impl Measurement<'_> {
             for (pos, row_i) in plan.range.clone().enumerate() {
                 let key = &v.keys[row_i];
                 if !plan.mounted_rows.contains_key(key) {
+                    #[cfg(debug_assertions)]
+                    v.check_append_row_key(&plan.path, row_i, self.commits, |i| (plan.rows.key)(state, i));
                     let row = build_indexed_row(&plan.rows, state, &plan.path, key, row_i, self.key_warnings);
                     if row.flags.has(crate::el::ElFlags::HAS_VIRTUAL) {
                         nested_virtual = true;
@@ -325,8 +329,10 @@ impl Measurement<'_> {
             let v = self.virtuals.get_mut(&plan.path).unwrap();
             plan.quiet = plan.range.clone().map(|i| v.mounts_quietly(i, self.commits)).collect();
             for (pos, row) in &mut plan.built_rows {
+                v.set_row_no_anchor(plan.range.start + *pos, row.cold.scroll_edges.no_anchor);
                 row.flags.set(crate::el::ElFlags::VIRTUAL_MOUNT, plan.quiet[*pos]);
             }
+            v.reanchor_if_excluded();
         }
 
         let mut on_spine = vec![false; self.nodes.len()];
@@ -421,6 +427,7 @@ impl Measurement<'_> {
                             path_ids: &mut *self.path_ids,
                             next_id: &mut *self.next_id,
                             foreground: self.defaults.foreground,
+                            missed_virtual_memo: false,
                         };
                         let (kid_slot, kid_dirty) = flatten_with_buf(
                             row_el,

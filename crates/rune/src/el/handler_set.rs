@@ -2,13 +2,14 @@
 //! `Cold<Handlers>`, so elements without callbacks pay one pointer.
 use crate::cold::Empty;
 use crate::el::{
-    AtBottomFn, Cursor, DragEndFn, DragFn, DragOutFn, DropSpec, LanguagesFn, LayoutFn, LayoutTxFn, ModalSpec,
-    PasteFn, PointerFn, PressFn, ScrollOffsetFn, SelectionChangeFn, SelectionCopy, VisibleRowsFn,
-    WindowFocusFn,
+    A11yActionFn, AnyPressFn, AtBottomFn, Cursor, DragEndFn, DragFn, DragOutFn, DropSpec, LanguagesFn, LayoutFn,
+    LayoutTxFn, ModalSpec, PasteFn, PointerFn, PressFn, ScrollOffsetFn, SelectionChangeFn, SelectionCopy,
+    VisibleRowsFn, WindowFocusFn,
 };
 
 #[derive(Clone)]
 pub(crate) struct Handlers {
+    pub on_a11y_action: Option<A11yActionFn>,
     pub on_paste: Option<PasteFn>,
     pub on_window_focus: Option<WindowFocusFn>,
     /// `El::on_spellcheck`: the app's spell checking setting and what flips it.
@@ -21,10 +22,18 @@ pub(crate) struct Handlers {
     pub on_secondary_press: Option<PointerFn>,
     /// `El::on_middle_press`.
     pub on_middle_press: Option<PressFn>,
+    /// `El::on_any_press`: passive window-wide mouse button-down observer.
+    pub on_any_press: Option<AnyPressFn>,
     pub on_hover: Option<PressFn>,
     pub on_hover_change: Option<WindowFocusFn>,
+    /// `El::on_focus_change`: this element gained (`true`) or lost (`false`) focus.
+    pub on_focus_change: Option<WindowFocusFn>,
+    /// `El::on_focus_within_change`: focus entered (`true`) or left (`false`) this element or a descendant.
+    pub on_focus_within_change: Option<WindowFocusFn>,
     /// Seconds the pointer must stay inside, then outside, before `on_hover_change` hears it.
     pub hover_delay: [f32; 2],
+    /// `El::hover_tracks_bounds`.
+    pub hover_tracks_bounds: bool,
     pub on_pointer_move: Option<PointerFn>,
     /// `on_wheel`, `on_magnify` and the other canvas handlers (`canvas_input.rs`).
     pub gestures: Option<Box<crate::input::canvas_input::CanvasInput>>,
@@ -48,6 +57,8 @@ pub(crate) struct Handlers {
     pub on_drawn_layout: Option<LayoutTxFn>,
     /// `El::on_visible`: the element came on screen (`true`) or left it.
     pub on_visible: Option<WindowFocusFn>,
+    /// `El::on_mount`: runs once when this element mounts, in the same frame before drawing.
+    pub on_mount: Option<PressFn>,
     /// `El::drawn_rect_into`: where each frame draws the element.
     pub drawn_rect: Option<crate::Live<[f32; 4]>>,
     pub on_scroll_offset: Option<ScrollOffsetFn>,
@@ -55,6 +66,7 @@ pub(crate) struct Handlers {
     pub on_selection_change: Option<SelectionChangeFn>,
     pub cursor: Option<Cursor>,
     pub press_scale: Option<f32>,
+    pub press_offset: Option<[f32; 2]>,
     /// Debug builds: where the app set the handlers the commit warnings name.
     #[cfg(debug_assertions)]
     pub sites: HandlerSites,
@@ -104,6 +116,7 @@ impl Handlers {
 
 impl Empty for Handlers {
     const EMPTY: &'static Self = &Handlers {
+        on_a11y_action: None,
         on_paste: None,
         on_window_focus: None,
         on_spellcheck: None,
@@ -113,9 +126,13 @@ impl Empty for Handlers {
         on_double_press: None,
         on_secondary_press: None,
         on_middle_press: None,
+        on_any_press: None,
         on_hover: None,
         on_hover_change: None,
+        on_focus_change: None,
+        on_focus_within_change: None,
         hover_delay: [0.0; 2],
+        hover_tracks_bounds: false,
         on_pointer_move: None,
         gestures: None,
         on_drag: None,
@@ -133,12 +150,14 @@ impl Empty for Handlers {
         on_screen_layout: None,
         on_drawn_layout: None,
         on_visible: None,
+        on_mount: None,
         drawn_rect: None,
         on_scroll_offset: None,
         selection_copy: None,
         on_selection_change: None,
         cursor: None,
         press_scale: None,
+        press_offset: None,
         #[cfg(debug_assertions)]
         sites: HandlerSites { hover: None, hover_change: None, pointer_move: None, layout: None, drawn_layout: None, visible_rows: None },
     };

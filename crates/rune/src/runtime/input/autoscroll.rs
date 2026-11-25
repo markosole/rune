@@ -182,6 +182,12 @@ impl capture::PointerState {
         let _ = self.autoscroll_step(Event::Cancel);
     }
 
+    /// Whether an active autoscroll has an armed step waiting for the next frame.
+    #[inline]
+    pub(in crate::runtime) fn autoscroll_armed(&self) -> bool {
+        matches!(self.autoscroll.state, State::Active { attempt: Some(_), .. })
+    }
+
     /// The pan cursor while it runs: which way it scrolls, or the axes it can.
     #[inline]
     pub(in crate::runtime) fn autoscroll_cursor(&self) -> Option<crate::el::Cursor> {
@@ -259,6 +265,7 @@ impl RuntimeCore {
             st.x.motion = XMotion::Rest;
             st.moved();
             if st.x.offset != before {
+                st.note_source(crate::ScrollSource::Direct);
                 moved = true;
                 self.pointer.scroll_cancels_press(&self.tree.nodes, id);
             }
@@ -271,6 +278,7 @@ impl RuntimeCore {
                 st.moved();
                 st.land(stick && by.1 >= 0.0);
                 if st.offset != before {
+                    st.note_source(crate::ScrollSource::Direct);
                     moved = true;
                     self.pointer.scroll_cancels_press(&self.tree.nodes, id);
                 }

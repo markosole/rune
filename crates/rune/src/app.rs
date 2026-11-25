@@ -35,6 +35,34 @@ pub(crate) use web::with_font;
 pub(crate) type Update<S> = Box<dyn FnOnce(&mut S, &mut Tx) -> bool + Send>;
 /// `App::on_window`'s hook, run after each native window creation.
 pub(crate) type OnWindow = Box<dyn FnMut(&crate::WindowHandle)>;
+/// `App::on_display_close`'s hook, run once on the UI thread before the event loop drops windows
+/// and closes the native display connection.
+pub(crate) type OnDisplayClose = Box<dyn FnOnce()>;
+
+/// Decision returned by [`App::on_close_request`] and
+/// [`WindowSpec::on_close_request`](crate::WindowSpec::on_close_request) when a native window
+/// receives a close request (`WindowEvent::CloseRequested`).
+///
+/// ```no_run
+/// use rune::{App, AppSpec, CloseResponse, el};
+///
+/// let spec = AppSpec::new("Draft", (480.0, 320.0), || true, |_, _| el());
+/// App::new(spec)
+///     .on_close_request(|has_unsaved, _| {
+///         if *has_unsaved { CloseResponse::Defer } else { CloseResponse::Close }
+///     })
+///     .run();
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseResponse {
+    /// Proceed with closing the window as usual (running [`App::on_close`], and finishing or
+    /// hiding the window according to [`App::keep_running`]).
+    Close,
+    /// Keep the window open and commit any state or [`Tx`] changes made in the hook. Close the
+    /// window later with [`Tx::close_window`], [`AppHandle::close`], or
+    /// [`WindowHandle::close`](crate::WindowHandle::close).
+    Defer,
+}
 
 /// `App::turn_scope`'s hooks.
 pub(crate) struct TurnScope<S> {
@@ -58,27 +86,41 @@ pub struct App<S: 'static> {
     argv: Option<Vec<String>>,
     pub(crate) open: bool,
     pub(crate) release_gpu: bool,
+    pub(crate) cpu_first: crate::CpuFirst,
+    pub(crate) prewarm_effects: crate::PrewarmEffects,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) accessory: bool,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) standard_menus: bool,
     pub(crate) keep_running: bool,
+    pub(crate) on_close_request: Option<fn(&mut S, &mut Tx) -> CloseResponse>,
     pub(crate) on_close: Option<fn(&mut S, &mut Tx)>,
     pub(crate) on_quit: Option<fn(&mut S, &mut Tx)>,
     pub(crate) turn_scope: Option<TurnScope<S>>,
     pub(crate) on_rest: Option<fn(&mut S, &mut Tx) -> bool>,
     pub(crate) on_reopen: Option<fn(&mut S, bool, &mut Tx) -> bool>,
     pub(crate) on_open_url: Option<crate::open_url::incoming::OnOpenUrl<S>>,
+    pub(crate) on_open_files: Option<crate::open_url::incoming::OnOpenFiles<S>>,
     pub(crate) shared: Arc<Shared<S>>,
     pub(crate) overlays: Vec<Box<dyn crate::overlay::PendingOverlay>>,
     pub(crate) windows: Vec<crate::AnyWindowSpec>,
     pub(crate) on_window: Option<OnWindow>,
     pub(crate) on_ready: Option<OnWindow>,
+    pub(crate) on_display_close: Option<OnDisplayClose>,
     pub(crate) on_frame_encoded: Option<crate::frame::encoded::OnFrameEncoded>,
+    pub(crate) on_frame_presented: Option<crate::frame::presented::OnFramePresented>,
     pub(crate) on_frame_drawn: Option<crate::frame::encoded::OnFrameDrawn<S>>,
+    /// `App::layout_seed`'s seed and keeper; only desktop windows use them.
+    #[cfg_attr(any(target_arch = "wasm32", target_os = "ios", target_os = "android"), allow(dead_code))]
+    pub(crate) layout_seed: Option<crate::LayoutSeed>,
+    #[cfg_attr(any(target_arch = "wasm32", target_os = "ios", target_os = "android"), allow(dead_code))]
+    pub(crate) keep_layout: Option<Box<dyn FnMut(crate::LayoutSeed)>>,
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     pub(crate) same_tab_router: Option<Box<dyn Fn(&str) -> bool>>,
     pub(crate) macos_window: crate::MacWindowOptions,
+    pub(crate) windows_window: crate::WindowsWindowOptions,
+    pub(crate) exclude_from_capture: Option<bool>,
+    pub(crate) color_scheme: crate::ColorScheme,
     pub(crate) compositor: Option<Box<dyn crate::compose::Compositor<S>>>,
     pub(crate) window_options: crate::WindowOptions,
     pub(crate) canvas_id: Option<String>,
@@ -115,24 +157,35 @@ impl<S: 'static> App<S> {
             argv: None,
             open: true,
             release_gpu: false,
+            cpu_first: crate::CpuFirst::Auto,
+            prewarm_effects: crate::PrewarmEffects::NONE,
             accessory: false,
             standard_menus: false,
             keep_running: false,
+            on_close_request: None,
             on_close: None,
             on_quit: None,
             turn_scope: None,
             on_rest: None,
             on_reopen: None,
             on_open_url: None,
+            on_open_files: None,
             shared,
             overlays: Vec::new(),
             windows: Vec::new(),
             on_window: None,
             on_ready: None,
+            on_display_close: None,
             on_frame_encoded: None,
+            on_frame_presented: None,
             on_frame_drawn: None,
+            layout_seed: None,
+            keep_layout: None,
             same_tab_router: None,
             macos_window: crate::MacWindowOptions::default(),
+            windows_window: crate::WindowsWindowOptions::default(),
+            exclude_from_capture: None,
+            color_scheme: crate::ColorScheme::System,
             compositor: None,
             window_options: crate::WindowOptions::default(),
             canvas_id: None,
@@ -161,12 +214,64 @@ impl<S: 'static> App<S> {
         self
     }
 
-    /// How this app's windows rasterise and place glyphs (see [`crate::FontSmoothing`]):
-    /// `On` by default on macOS and in a Mac's browser, `Off` elsewhere (CoreGraphics' pipeline
-    /// without font smoothing's dilation, as `-webkit-font-smoothing: antialiased` draws).
+    /// Maximum number of native `El::system_material` views this window may host at once
+    /// (default [`crate::MAX_NATIVE_MATERIALS`], clamped to 64).
+    ///
+    /// Visible material elements past this limit draw their fallback fill (or neutral tint),
+    /// report [`ElementInfo::material_fallback`](crate::ElementInfo::material_fallback), emit
+    /// `"materialFallback": true` in `--tree` JSON, and log a one-time notice to stderr when
+    /// native materials are active. Passing `0` disables native material views for this window.
+    ///
+    /// ```no_run
+    /// use rune::{App, AppSpec, el};
+    ///
+    /// App::new(AppSpec::new("Notifications", (360.0, 520.0), || (), |_, _| el()))
+    ///     .max_native_materials(8)
+    ///     .run();
+    /// ```
+    pub fn max_native_materials(mut self, max: usize) -> Self {
+        self.runtime.max_native_materials = crate::system_material::clamp_max_native_materials(max);
+        self
+    }
+
+    /// How this app's windows and overlays rasterise and place glyphs (see [`crate::FontSmoothing`]):
+    /// `On` by default on macOS and in a Mac's browser, `WindfoilChromium` elsewhere.
+    /// `ConfiguredOverlay::font_smoothing` overrides it per overlay, and
     /// `Tx::set_font_smoothing` switches it while running.
     pub fn font_smoothing(mut self, mode: crate::FontSmoothing) -> Self {
         self.runtime.font_smoothing = mode;
+        for overlay in &mut self.overlays {
+            overlay.inherit_font_smoothing(mode);
+        }
+        self
+    }
+
+    /// Opt-in preferred colour emoji font family (or comma-separated CSS family list) tried first
+    /// for emoji graphemes (`Emoji_Presentation`, `U+FE0F`, ZWJ sequences, keycaps, skin tones,
+    /// and regional-indicator flags) across every text slot (`Family::Sans`, `Family::Mono`,
+    /// `Family::SystemMono`, `Family::Named`, and inline mono spans).
+    ///
+    /// Precedence for emoji graphemes is: this explicit `emoji_family` first, then any colour
+    /// emoji font explicitly named in the active family stack (`AppSpec::families`,
+    /// `Tx::set_font_families`, or `Family::Named`), then the lazily loaded system emoji font,
+    /// then the active text stack. Plain text symbols without `U+FE0F` (such as `❤` or
+    /// `☺\u{FE0E}`) keep their monochrome text faces. Uncovered emoji still fall back to the
+    /// system emoji font, and the system emoji font is not loaded when every emoji in a string is
+    /// already covered.
+    ///
+    /// Passing an empty or whitespace-only string normalizes to `None` (default system emoji
+    /// fallback). Switch or clear at runtime with [`Tx::set_emoji_family`] or
+    /// [`Runtime::set_emoji_family`](crate::Runtime::set_emoji_family).
+    ///
+    /// ```no_run
+    /// use rune::{App, AppSpec, el};
+    ///
+    /// let spec = AppSpec::new("Chat", (640.0, 480.0), || (), |_, _| el());
+    /// App::new(spec).emoji_family("Twemoji").run();
+    /// ```
+    pub fn emoji_family(mut self, family: impl Into<String>) -> Self {
+        let family = family.into();
+        self.runtime.emoji_family = crate::text::normalize_emoji_family(Some(&family));
         self
     }
 
@@ -241,6 +346,35 @@ impl<S: 'static> App<S> {
         self
     }
 
+    /// Opt into hardware media transport keys ([`Key::Media`](crate::Key::Media): Play/Pause,
+    /// Play, Pause, Next, Previous, Stop, Fast Forward, Rewind) in `on_key`, `El::on_key`,
+    /// `El::on_key_preview`, `El::on_key_up`, and `Chord`.
+    ///
+    /// Off by default so apps that do not control media playback receive no new keys and, on
+    /// macOS, never install the local `NSEventTypeSystemDefined` monitor that claims system
+    /// media keys while the window is key. Text fields ignore media keys so they still reach
+    /// `on_key` while typing.
+    ///
+    /// ```no_run
+    /// use rune::{App, AppSpec, Key, MediaKey, el};
+    ///
+    /// let spec = AppSpec {
+    ///     on_key: Some(|playing: &mut bool, ev, _| {
+    ///         if ev.key == Key::Media(MediaKey::PlayPause) {
+    ///             *playing = !*playing;
+    ///             return true;
+    ///         }
+    ///         false
+    ///     }),
+    ///     ..AppSpec::new("Player", (480.0, 320.0), || false, |_, _| el())
+    /// };
+    /// App::new(spec).media_keys().run();
+    /// ```
+    pub fn media_keys(mut self) -> Self {
+        self.runtime.media_keys = true;
+        self
+    }
+
     /// Tab and Shift-Tab visit every focusable control, buttons included, whatever the system's
     /// keyboard navigation setting. Off (the default), Tab follows macOS: with Keyboard
     /// navigation off it visits only text fields and lists.
@@ -253,12 +387,71 @@ impl<S: 'static> App<S> {
     pub fn configured_options(mut self, options: crate::ConfiguredWindowOptions) -> Self {
         self.window_options = options.options;
         self.macos_window = options.native;
+        self.windows_window = options.windows;
         self
     }
 
     /// Native window policy, also retained by a single-window App.
     pub fn macos_window(mut self, options: crate::MacWindowOptions) -> Self {
         self.macos_window = options;
+        self
+    }
+
+    /// Win32 native window policy, retained across recreation and ignored on other platforms.
+    ///
+    /// ```no_run
+    /// use rune::{App, AppSpec, WindowsWindowOptions, el};
+    ///
+    /// App::new(AppSpec::new("Panel", (320.0, 200.0), || (), |_, _| el()))
+    ///     .windows_window(WindowsWindowOptions::default().no_activate(true).tool_window(true))
+    ///     .run();
+    /// ```
+    pub fn windows_window(mut self, options: crate::WindowsWindowOptions) -> Self {
+        self.windows_window = options;
+        self
+    }
+
+    /// Excludes this window from screen captures on Windows (`WDA_EXCLUDEFROMCAPTURE`) and macOS
+    /// (`NSWindowSharingNone`), applied before the window first shows and reapplied on native
+    /// recreation. `false` explicitly restores normal capture visibility. Ignored on Linux and web.
+    ///
+    /// When set, this takes precedence over `WindowsWindowOptions::exclude_from_capture` and
+    /// `MacWindowOptions::exclude_from_capture`; when unset, those platform options still apply.
+    /// Toggle at runtime with [`WindowHandle::set_exclude_from_capture`](crate::WindowHandle::set_exclude_from_capture).
+    /// Capture exclusion is native best effort, not a security boundary.
+    ///
+    /// ```no_run
+    /// use rune::{App, AppSpec, el};
+    ///
+    /// App::new(AppSpec::new("Private Notes", (480.0, 360.0), || (), |_, _| el()))
+    ///     .exclude_from_capture(true)
+    ///     .run();
+    /// ```
+    pub fn exclude_from_capture(mut self, exclude: bool) -> Self {
+        self.exclude_from_capture = Some(exclude);
+        self
+    }
+
+    /// Preferred native light or dark chrome for this window, applied on creation and retained
+    /// across native recreation. Defaults to [`ColorScheme::System`](crate::ColorScheme::System).
+    ///
+    /// On Windows this controls the native titlebar (`DWMWA_USE_IMMERSIVE_DARK_MODE`), on macOS
+    /// `NSWindow.appearance`, on Wayland client-side decorations, and on X11
+    /// `_GTK_THEME_VARIANT`. Update at runtime with
+    /// [`Tx::set_color_scheme`](crate::Tx::set_color_scheme) or
+    /// [`WindowHandle::set_color_scheme`](crate::WindowHandle::set_color_scheme), or override
+    /// the whole app with [`AppHandle::set_color_scheme`](crate::AppHandle::set_color_scheme).
+    /// Ignored on web and headless.
+    ///
+    /// ```no_run
+    /// use rune::{App, AppSpec, ColorScheme, el};
+    ///
+    /// App::new(AppSpec::new("Notes", (480.0, 360.0), || (), |_, _| el()))
+    ///     .color_scheme(ColorScheme::Dark)
+    ///     .run();
+    /// ```
+    pub fn color_scheme(mut self, scheme: crate::ColorScheme) -> Self {
+        self.color_scheme = scheme;
         self
     }
 
@@ -320,12 +513,41 @@ impl<S: 'static> App<S> {
         self
     }
 
+    /// Fallback handler for a text field's context menu (right-click, Menu key, Shift+F10) on
+    /// platforms where [`crate::popup_menu_supported`] is false (such as Linux).
+    ///
+    /// When set and `!popup_menu_supported()`, Rune hands the ready-built
+    /// [`crate::FieldMenuRequest`] to `f` instead of queuing a native pop-up menu, so the app
+    /// can render it in-window (for example with `rune_kit::Menu`) and answer with
+    /// [`Tx::resolve_field_menu`]. On macOS and Windows (`popup_menu_supported()` is true),
+    /// native field menus continue to open as usual and `f` is not called.
+    ///
+    /// ```
+    /// use rune::{App, AppSpec, FieldMenuRequest, Tx, el};
+    ///
+    /// struct S { menu: Option<FieldMenuRequest> }
+    /// let _app = App::new(AppSpec::new("Notes", (480.0, 320.0), || S { menu: None }, |_, _| el()))
+    ///     .on_field_menu(|s: &mut S, req: FieldMenuRequest, _tx: &mut Tx| {
+    ///         s.menu = Some(req);
+    ///     });
+    /// ```
+    pub fn on_field_menu(mut self, f: fn(&mut S, crate::FieldMenuRequest, &mut Tx)) -> Self {
+        self.runtime.on_field_menu = Some(f);
+        self
+    }
+
     /// Adds a transparent overlay with its own state, hidden until `OverlayHandle::show`.
     /// Bare specs preserve primary-display edge placement and never request key focus;
     /// `OverlaySpec::options` selects displays, placement and native input policy.
-    /// Uses this app's fonts. Headless runs don't draw overlays.
+    /// Uses this app's fonts and font smoothing (`ConfiguredOverlay::font_smoothing` overrides it).
+    /// Headless runs don't draw overlays.
     pub fn overlay<T: 'static>(&mut self, spec: impl Into<crate::ConfiguredOverlay<T>>, state: T) -> crate::overlay::OverlayHandle<T> {
-        let (overlay, handle) = crate::overlay::OverlayHost::new(spec.into(), state, &self.spec);
+        let mut configured = spec.into();
+        if configured.runtime.emoji_family.is_none() {
+            configured.runtime.emoji_family = self.runtime.emoji_family.clone();
+        }
+        let (mut overlay, handle) = crate::overlay::OverlayHost::new(configured, state, &self.spec, self.runtime.font_smoothing);
+        overlay.set_prewarm_effects(self.prewarm_effects);
         self.overlays.push(Box::new(overlay));
         handle
     }
@@ -369,8 +591,8 @@ impl<S: 'static> App<S> {
         self
     }
 
-    /// Closing the window keeps the app, its state and its event loop running until
-    /// `AppHandle::quit` or `Tx::quit`.
+    /// Closing the window, or a failed window creation, keeps the app and event loop running
+    /// until `AppHandle::quit` or `Tx::quit` (for tray apps and apps that retry on `window_error`).
     pub fn keep_running(mut self) -> Self {
         self.keep_running = true;
         self
@@ -384,6 +606,60 @@ impl<S: 'static> App<S> {
         self
     }
 
+    /// Controls CPU-first startup and GPU handover for this app's window ([`crate::CpuFirst`]).
+    ///
+    /// Defaults to [`crate::CpuFirst::Auto`], which opens opaque Windows/Linux windows and
+    /// full-window web pages on `CpuPainter` before handing over to the GPU in the background.
+    /// [`crate::CpuFirst::Only`] keeps opaque windows on `CpuPainter` without starting background
+    /// GPU handover on idle (on Windows and Linux, a frame that hits a GPU-only feature still
+    /// triggers GPU handover so it can render; on web, stays on the 2D canvas without requesting
+    /// WebGPU/WebGL2). [`crate::CpuFirst::Off`] skips CPU-first startup and opens directly on the
+    /// GPU. Ignored on macOS, iOS, headless runs, and inline/document web pages.
+    ///
+    /// `RUNE_CPU_FIRST` (or `globalThis.RUNE_CPU_FIRST` on web) overrides this setting without a
+    /// rebuild (`0`/`off`, `only`, `auto`), matching `RUNE_GPU_BACKEND`.
+    ///
+    /// ```no_run
+    /// use rune::{App, AppSpec, CpuFirst, el};
+    ///
+    /// App::new(AppSpec::new("Plan", (960.0, 640.0), || (), |_, _| el()))
+    ///     .cpu_first(CpuFirst::Only)
+    ///     .run();
+    /// ```
+    pub fn cpu_first(mut self, mode: crate::CpuFirst) -> Self {
+        self.cpu_first = mode;
+        self
+    }
+
+    /// Names the optional effect GPU pipelines this app's windows and overlays compile in the
+    /// background before their first use ([`PrewarmEffects`](crate::PrewarmEffects)): isolated
+    /// layers (`Rgba16Float`), `Blend::PlusLighter`, Gaussian layer blur, and
+    /// `El::backdrop_blur`. `true` names all four.
+    ///
+    /// Defaults to none, so an app pays no background pipeline-compile CPU, driver memory, or
+    /// worker thread for effects it never draws. Name the effects the app does draw so that
+    /// the first frame that shows one (a frosted button fading in mid-scroll) does not stall
+    /// while the driver compiles its pipelines: they compile on a low-priority thread once
+    /// the window has drawn its first frames and rests, and a frame that needs one sooner
+    /// compiles it as before, once. Ignored on `wasm32`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use rune::{App, AppSpec, PrewarmEffects, el};
+    ///
+    /// App::new(AppSpec::new("Frosted", (640.0, 480.0), || (), |_, _| el()))
+    ///     .prewarm_effects(PrewarmEffects::BACKDROP_BLUR)
+    ///     .run();
+    /// ```
+    pub fn prewarm_effects(mut self, effects: impl Into<crate::PrewarmEffects>) -> Self {
+        self.prewarm_effects = effects.into();
+        for overlay in &mut self.overlays {
+            overlay.set_prewarm_effects(self.prewarm_effects);
+        }
+        self
+    }
+
     /// Draws with `backend` on macOS. Without a call, a Mac app draws with Rune's native Metal
     /// backend (the `metal-backend` feature, on by default), so `GpuBackend::Wgpu` opts out;
     /// `GpuBackend::Metal` needs the feature. `RUNE_GPU_BACKEND=wgpu` or `=metal` overrides it
@@ -394,6 +670,36 @@ impl<S: 'static> App<S> {
     /// calls `rune::prewarm_gpu_on`. Does nothing elsewhere.
     pub fn gpu_backend(self, backend: crate::GpuBackend) -> Self {
         crate::render::choose_gpu_backend(backend);
+        self
+    }
+
+    /// Sets the startup GPU suballocation policy for wgpu devices ([`crate::GpuMemoryPolicy`]).
+    ///
+    /// Without a call, Rune uses [`crate::GpuMemoryPolicy::MemoryUsage`]. Call this (or
+    /// [`crate::set_gpu_memory_policy`] before [`crate::prewarm_gpu`], [`crate::warm_gpu`], or
+    /// [`crate::warm_gpu_cache`]) to pick [`crate::GpuMemoryPolicy::Performance`] or a
+    /// [`crate::GpuMemoryPolicy::Manual`] block-size range before windows or overlays create
+    /// their GPU devices.
+    ///
+    /// Applies process-wide to every wgpu device created from here on, and restarts or discards
+    /// any prewarmed or parked device built under a different policy. Honored by D3D12 (Windows)
+    /// and Vulkan (Linux); ignored by Rune's native Metal backend, wgpu's Metal backend, and
+    /// web backends. Resources larger than a `Manual` block range still succeed via dedicated
+    /// allocations.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use rune::{App, AppSpec, GpuMemoryPolicy, el};
+    ///
+    /// App::new(AppSpec::new("Low memory", (640.0, 480.0), || (), |_, _| el()))
+    ///     .gpu_memory_policy(GpuMemoryPolicy::Manual {
+    ///         block_size: (4 * 1024 * 1024)..(8 * 1024 * 1024),
+    ///     })
+    ///     .run();
+    /// ```
+    pub fn gpu_memory_policy(self, policy: crate::GpuMemoryPolicy) -> Self {
+        crate::render::set_gpu_memory_policy(policy);
         self
     }
 
@@ -423,6 +729,46 @@ impl<S: 'static> App<S> {
         self
     }
 
+    /// Intercepts a user-initiated window-close request (the native close button, Alt+F4, the
+    /// window menu's Close, macOS unhandled ⌘W / Window › Close, and assistive activation of the
+    /// custom close button) before the window hides, changes lifecycle or first-frame state, or
+    /// runs [`App::on_close`].
+    ///
+    /// Runs inside a normal update transaction so the callback may update state or issue [`Tx`]
+    /// requests (for example showing an unsaved-changes confirmation dialog). Returning
+    /// [`CloseResponse::Defer`] keeps the window open, commits those changes, and requests a
+    /// redraw; close the window later with [`Tx::close_window`], [`AppHandle::close`], or
+    /// [`WindowHandle::close`](crate::WindowHandle::close). Returning [`CloseResponse::Close`]
+    /// proceeds with closing as usual (running [`App::on_close`]).
+    ///
+    /// Programmatic close (`Tx::close_window`, `AppHandle::close`, `WindowHandle::close`),
+    /// application quit/relaunch, teardown, and an already-exiting event loop bypass this hook
+    /// so an approved close completes without re-asking. Apps that do not register this hook
+    /// keep the existing close behaviour. Headless scripts deliver it with
+    /// `{"close_request": true}`. Ignored on web.
+    ///
+    /// ```no_run
+    /// use rune::{App, AppSpec, CloseResponse, el};
+    ///
+    /// struct Draft { dirty: bool, confirm_close: bool }
+    ///
+    /// let spec = AppSpec::new("Draft", (480.0, 320.0), || Draft { dirty: true, confirm_close: false }, |_, _| el());
+    /// App::new(spec)
+    ///     .on_close_request(|draft, _| {
+    ///         if draft.dirty {
+    ///             draft.confirm_close = true;
+    ///             CloseResponse::Defer
+    ///         } else {
+    ///             CloseResponse::Close
+    ///         }
+    ///     })
+    ///     .run();
+    /// ```
+    pub fn on_close_request(mut self, f: fn(&mut S, &mut Tx) -> CloseResponse) -> Self {
+        self.on_close_request = Some(f);
+        self
+    }
+
     /// Runs whenever the window closes (close button, `Tx::close_window`, `AppHandle::close`,
     /// macOS Quit from the menu, Cmd-Q or the Dock), before it goes: flush drafts, stop previews.
     /// Its `Tx::quit` quits.
@@ -432,15 +778,17 @@ impl<S: 'static> App<S> {
     }
 
     /// Runs once in every open window when the app starts to quit, before any window closes
-    /// for it: `Tx::quit` or `AppHandle::quit` from any window, the last window closing (in the
-    /// windows still open), macOS Quit (⌘Q, the Dock, logout, restart and shutdown), and a
-    /// Windows logoff or shutdown (`WM_QUERYENDSESSION`, or `WM_ENDSESSION` when no query came
-    /// first), as Electron's `before-quit` and `session-end` do between them. Save what must
-    /// survive the quit here, synchronously: a Windows session may end the process once the
-    /// hooks returned. From then on [`crate::quitting`] holds, so an `on_close` that follows
-    /// (macOS, the end of a Windows session) can tell the app ending from its window closing
-    /// alone. A Windows shutdown another app refuses clears it, and a later quit runs this again.
-    /// What it asks of its `Tx` beyond state is moot once the loop ends. Native windows only.
+    /// for it, and in the last main window whose close ends the app (after its `on_close`):
+    /// `Tx::quit` or `AppHandle::quit` from any window, the last main window closing, macOS
+    /// Quit (⌘Q, the Dock, logout, restart and shutdown), and a Windows logoff or shutdown
+    /// (`WM_QUERYENDSESSION`, or `WM_ENDSESSION` when no query came first), as Electron's
+    /// `before-quit` and `session-end` do between them. Save what must survive the quit here,
+    /// synchronously: a Windows session may end the process once the hooks returned. From then
+    /// on [`crate::quitting`] holds, so an `on_close` that follows (macOS, the end of a Windows
+    /// session, or another window closing for the quit) can tell the app ending from its window
+    /// closing alone. A Windows shutdown another app refuses clears it, and a later quit runs
+    /// this again. What it asks of its `Tx` beyond state is moot once the loop ends. Native
+    /// windows only.
     pub fn on_quit(mut self, f: fn(&mut S, &mut Tx)) -> Self {
         self.on_quit = Some(f);
         self
@@ -493,6 +841,35 @@ impl<S: 'static> App<S> {
         self
     }
 
+    /// macOS: runs on the main thread with each batch of files the system opens with this app
+    /// (Finder double-click or "Open With", files dropped on the Dock icon, or `open -a MyApp
+    /// file.ext`), including the `kAEOpenDocuments` (`'odoc'`) Apple Event that launched it,
+    /// which runs before the window's first frame. Each batch runs in arrival order as an
+    /// `AppHandle::update`, so a window it opens through a handle opens in the same turn. Never
+    /// called with an empty slice (non-file URLs in the event are skipped). Paths come from
+    /// outside the app, so validate them before acting. Bringing a window forward is up to the app
+    /// (`AppHandle::open`). The app's bundle must declare its document types
+    /// (`CFBundleDocumentTypes`, see the README). With several windows whose apps have the hook,
+    /// the first still running receives files.
+    ///
+    /// Never called on Windows or Linux, which pass opened files to a new process as launch
+    /// arguments. Headless scripts deliver it with `{"open_files": ["a.torrent"]}`.
+    ///
+    /// ```no_run
+    /// use std::path::PathBuf;
+    /// use rune::{App, AppSpec, el};
+    ///
+    /// let spec = AppSpec::new("Viewer", (640.0, 420.0), Vec::<PathBuf>::new, |_, _| el());
+    /// let app = App::new(spec).on_open_files(|opened, paths, _| {
+    ///     opened.extend(paths.iter().cloned());
+    /// });
+    /// let _ = app;
+    /// ```
+    pub fn on_open_files(mut self, f: fn(&mut S, &[std::path::PathBuf], &mut Tx)) -> Self {
+        self.on_open_files = Some(f);
+        self
+    }
+
     /// On web, routes [`Tx::open_url_same_tab`] links inside a single-page app: `route` gets the
     /// absolute URL of each link on the page's own origin and returns true when it handled it
     /// (`history.pushState` and a render), or false to let the browser load it with
@@ -514,9 +891,38 @@ impl<S: 'static> App<S> {
     /// hidden, after GPU completion of its cached surface frame. A window that isn't on screen
     /// (covered, occluded, hidden or on another Space) doesn't wait to draw: this runs at its
     /// first frame skipped for that, or a second after it opens with no frame at all.
-    /// Not called by headless tooling. May queue a show through the supplied handle.
+    /// Headless tooling skips this unless `--realtime` is passed, which runs it after
+    /// the first frame. May queue a show through the supplied handle.
     pub fn on_ready(mut self, f: impl FnMut(&crate::WindowHandle) + 'static) -> Self {
         self.on_ready = Some(Box::new(f));
+        self
+    }
+
+    /// Runs once on the UI thread immediately before the event loop drops windows and tears down
+    /// the native display connection, after any `on_close` and `on_quit` hooks have run.
+    ///
+    /// Pair this with [`WindowHandle::with_raw_display_handle`](crate::WindowHandle::with_raw_display_handle)
+    /// to destroy foreign protocol proxies or event queues bound on winit's display (such as
+    /// Wayland objects created via `Backend::from_foreign_display`) before the display closes.
+    /// Runs on normal quits, OS-initiated termination, fast exit, and display or startup error
+    /// exits; closing one window while another window or `keep_running` keeps the event loop
+    /// alive does not run it until the loop itself exits. Native windows only (ignored on
+    /// headless and web).
+    ///
+    /// ```no_run
+    /// use rune::{App, AppSpec, el};
+    ///
+    /// App::new(AppSpec::new("Display", (320.0, 200.0), || (), |_, _| el()))
+    ///     .on_window(|window| {
+    ///         let _ = window.with_raw_display_handle(|d| format!("{:?}", d.as_raw()));
+    ///     })
+    ///     .on_display_close(|| {
+    ///         // Destroy foreign display proxies before the event loop closes the display.
+    ///     })
+    ///     .run();
+    /// ```
+    pub fn on_display_close(mut self, f: impl FnOnce() + 'static) -> Self {
+        self.on_display_close = Some(Box::new(f));
         self
     }
 
@@ -536,13 +942,73 @@ impl<S: 'static> App<S> {
         self
     }
 
-    /// Runs on the UI thread after each `Drawn` frame of the app's window, with the runtime as
-    /// that frame presented it (`Runtime::elements`, `Runtime::state`), for an app that watches
-    /// its own motion. Pair it with [`last_input`](crate::last_input) to tell motion the user
-    /// caused from motion they didn't. Like `on_frame_encoded`, it changes nothing about when
-    /// or what the window draws, and only desktop windows call it.
+    /// Runs on the UI thread in submission order once a `Drawn` frame actually reaches the screen
+    /// (or is skipped by the system, reported as
+    /// [`FramePresented::presented_at`](crate::FramePresented::presented_at) returning `None`).
+    ///
+    /// [`FramePresented::seq`](crate::FramePresented::seq) matches
+    /// [`FrameEncoded::seq`](crate::FrameEncoded::seq) for the same `Drawn` frame, and
+    /// `on_frame_encoded` always runs before `on_frame_presented` for a given sequence number.
+    /// Pair them to measure real input-to-photon latency or detect missed vsyncs against
+    /// [`FrameEncoded::presents_at`](crate::FrameEncoded::presents_at).
+    ///
+    /// Only platforms with reliable actual presentation timestamps call it (currently macOS
+    /// Metal, via `MTLDrawable::addPresentedHandler`). Windows, Linux, the web, overlays, and
+    /// headless runs never call it, matching
+    /// [`FrameEncoded::presents_at`](crate::FrameEncoded::presents_at). Without it, no layer
+    /// hook is attached and each frame pays only an `Option` check; once in-flight drawables
+    /// finish presenting, the watch clears automatically so an idle window never wakes or draws.
+    ///
+    /// ```no_run
+    /// use rune::{App, AppSpec, el};
+    ///
+    /// let spec = AppSpec::new("Demo", (320.0, 240.0), || (), |_, _| el());
+    /// App::new(spec)
+    ///     .on_frame_presented(|p| {
+    ///         let _ = (p.seq(), p.window(), p.presented_at());
+    ///     })
+    ///     .run();
+    /// ```
+    pub fn on_frame_presented(mut self, f: impl FnMut(&crate::FramePresented) + 'static) -> Self {
+        self.on_frame_presented = Some(Box::new(f));
+        self
+    }
+
+    /// Runs on the UI thread after each `Drawn` frame of the app's window (desktop windows and
+    /// the web runner, and never on unchanged or skipped frames), with the runtime as that frame
+    /// presented it (`Runtime::elements`, `Runtime::state`), for an app that watches its own
+    /// motion or waits for presented frames. Pair it with [`last_input`](crate::last_input) to
+    /// tell motion the user caused from motion they didn't. Like `on_frame_encoded`, it changes
+    /// nothing about when or what the window draws.
+    ///
+    /// ```no_run
+    /// use rune::{App, AppSpec, el};
+    ///
+    /// let spec = AppSpec::new("Demo", (320.0, 240.0), || 0u32, |_, _| el());
+    /// App::new(spec)
+    ///     .on_frame_drawn(|rt| {
+    ///         let _count = rt.elements().len();
+    ///     })
+    ///     .run();
+    /// ```
     pub fn on_frame_drawn(mut self, f: impl FnMut(&crate::Runtime<S>) + 'static) -> Self {
         self.on_frame_drawn = Some(Box::new(f));
+        self
+    }
+
+    /// Keep the view's layout reads across launches, so the window's first frame builds the
+    /// view once. A view that reads a rect ([`Cx::layout`](crate::Cx::layout), `layout_with`,
+    /// `layout_size`) gets nothing in a window's first commit and runs again once layout knows
+    /// it. `keep` is given what the window's first view read (its first frame's reads, as layout
+    /// settled them: what the next launch's first frame reads again), once, when the window
+    /// rests, closes or quits, unless they are the seed's own: save it with the window's own
+    /// state, and pass it back here as `seed` at the next launch. The first view is then given
+    /// those rects, and runs once when layout agrees with them. A seed for another window size
+    /// or scale isn't used, and one from another state costs what no seed costs: every read is
+    /// still checked against the layout. Desktop windows only.
+    pub fn layout_seed(mut self, seed: Option<crate::LayoutSeed>, keep: impl FnMut(crate::LayoutSeed) + 'static) -> Self {
+        self.layout_seed = seed;
+        self.keep_layout = Some(Box::new(keep));
         self
     }
 
@@ -587,14 +1053,18 @@ impl<S: 'static> App<S> {
 
     /// Runs until the app quits. Agent-tooling arguments (`--snap`, `--tree`, ...) render
     /// headless instead: the window requests are ignored there, and updates apply each frame.
-    /// Prints the error to stderr and exits 1 when the app can't start, such as without a
-    /// display (wasm32 has no process exit, so there it panics); `try_run` returns that error.
+    /// Prints the error to stderr and exits 1 when the app can't start (no display, or the first
+    /// window can't be created) or loses its display connection (panics on wasm32); `try_run`
+    /// returns it. See `keep_running`.
     pub fn run(self) {
+        #[cfg(target_arch = "wasm32")]
         crate::tooling::started(self.try_run());
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::tooling::finish_start(self.try_run_start());
     }
 
-    /// `run`, returning an error instead of exiting when the event loop can't start (no
-    /// display over ssh or in CI, no Wayland or X11 server) or fails.
+    /// `run`, returning an error instead of exiting when the event loop can't start or fails, or
+    /// the first window can't be created (unless `keep_running` or `windowless` is set).
     #[cfg(target_arch = "wasm32")]
     pub fn try_run(mut self) -> Result<(), String> {
         if let Some(argv) = self.argv.take() {
@@ -604,7 +1074,12 @@ impl<S: 'static> App<S> {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn try_run(mut self) -> Result<(), String> {
+    pub fn try_run(self) -> Result<(), String> {
+        self.try_run_start().map_err(crate::tooling::StartError::message)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn try_run_start(mut self) -> Result<(), crate::tooling::StartError> {
         // Windows' word dictionaries start loading now, on their own thread (`rune_text::segmenter`).
         #[cfg(all(target_os = "windows", not(feature = "segmenter-dictionaries")))]
         rune_text::segmenter::install();
@@ -619,9 +1094,9 @@ impl<S: 'static> App<S> {
                 crate::tooling::try_headless(self, args)
             }
             #[cfg(not(any(feature = "tooling", debug_assertions)))]
-            Err(crate::tooling::WITHOUT_TOOLING.into())
+            Err(crate::tooling::StartError::Window(crate::tooling::WITHOUT_TOOLING.into()))
         } else {
-            crate::window::run(self, args)
+            crate::window::run(self, args).map_err(crate::tooling::StartError::Window)
         }
     }
 }
@@ -740,13 +1215,34 @@ impl<S: 'static> AppHandle<S> {
     #[inline]
     pub fn set_dock_icon(&self, visible: bool) { self.shared.core.set_dock_icon(visible); }
 
+    /// Override the native light or dark appearance across the whole application.
+    ///
+    /// On macOS this sets `NSApplication.sharedApplication.appearance` (`nil` for
+    /// [`ColorScheme::System`](crate::ColorScheme::System), `NSAppearanceNameAqua` for `Light`,
+    /// `NSAppearanceNameDarkAqua` for `Dark`), so native menus, open/save panels, traffic lights,
+    /// system materials, and windows with no per-window override follow it. On Windows and Linux
+    /// this applies to every window whose own color scheme is `ColorScheme::System`, including
+    /// windows created or recreated later. Windows with an explicit per-window `Light` or `Dark`
+    /// override keep their own scheme. Safe to call from any thread; no-op on web and headless.
+    ///
+    /// ```no_run
+    /// use rune::{App, AppSpec, ColorScheme, el};
+    ///
+    /// let app = App::new(AppSpec::new("Notes", (480.0, 360.0), || (), |_, _| el()));
+    /// let handle = app.handle();
+    /// handle.set_color_scheme(ColorScheme::Dark);
+    /// app.run();
+    /// ```
+    #[inline]
+    pub fn set_color_scheme(&self, scheme: crate::ColorScheme) { self.shared.core.set_color_scheme(scheme); }
+
     /// Whether the window is on screen (shown, not hidden or closed). Minimized and occluded
     /// windows count as shown.
     #[inline]
     pub fn is_visible(&self) -> bool { self.shared.core.is_visible() }
 
-    /// Why the window couldn't be created the last time it was asked for (no display, no GPU
-    /// adapter or device), until a later creation succeeds. The app keeps running windowless.
+    /// Why the window couldn't be created last time (no display, no GPU adapter or device),
+    /// until a later creation succeeds. Needs `keep_running` or `windowless` to stay alive.
     #[inline]
     pub fn window_error(&self) -> Option<String> { self.shared.core.window_error() }
 

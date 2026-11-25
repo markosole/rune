@@ -45,6 +45,9 @@ impl HitState {
     pub(in crate::runtime) fn hits(&self) -> &[(NodeId, [f32; 4])] { &self.hits }
 
     #[inline]
+    pub(in crate::runtime) fn drop_hits(&self) -> &[(NodeId, [f32; 4], usize)] { &self.drop_hits }
+
+    #[inline]
     pub(in crate::runtime) fn hits_len(&self) -> usize { self.hits.len() }
 
     #[inline]
@@ -116,6 +119,12 @@ impl HitState {
         self.hits.iter().rev().find_map(|&(id, r)| f(id, r))
     }
 
+    /// Walks drop targets top-to-bottom and returns the first match from `f`.
+    #[inline]
+    pub(in crate::runtime) fn find_drop_hit<T>(&self, mut f: impl FnMut(NodeId, [f32; 4]) -> Option<T>) -> Option<T> {
+        self.drop_hits.iter().rev().find_map(|&(id, r, _)| f(id, r))
+    }
+
     /// Walks wheel hits top-to-bottom and returns the first match from `f`.
     #[inline]
     pub(in crate::runtime) fn find_wheel_hit<T>(&self, mut f: impl FnMut(NodeId, [f32; 4]) -> Option<T>) -> Option<T> {
@@ -164,7 +173,7 @@ impl RuntimeCore {
     /// Window point (x, y) as node `i`'s handlers see it.
     pub(crate) fn pointer_event(&self, i: usize, x: f32, y: f32) -> PointerEvent {
         let [lx, ly] = self.to_local(i, x, y);
-        PointerEvent { x: lx, y: ly, window_x: x, window_y: y }
+        PointerEvent { x: lx, y: ly, window_x: x, window_y: y, pressing: self.pointer.any_button_down() }
     }
 
     /// Window point (x, y) in node `i`'s own layout points: from its top-left as drawn, divided
@@ -294,41 +303,138 @@ impl RuntimeCore {
         inputs.next().is_none().then_some(first)
     }
 
+    /// The topmost live, allowed element in `hits` under (x, y), in paint order.
+    pub(in crate::runtime) fn top_hit(&self, x: f32, y: f32) -> Option<usize> {
+        self.hit.find_hit(|id, r| {
+            if !self.hit_contains(id, r, x, y) { return None; }
+            let i = *self.tree.node_index.get(&id)?;
+            (!self.subtree_exiting(i) && self.allowed(i)).then_some(i)
+        })
+    }
+
+    /// [`Self::top_hit`] for hover: a layer that hover passes through (`El::hover_passes_below`)
+    /// doesn't count, so what lies under it hovers as with no layer there.
+    pub(in crate::runtime) fn top_hover_hit(&self, x: f32, y: f32) -> Option<usize> {
+        self.hit.find_hit(|id, r| {
+            if !self.hit_contains(id, r, x, y) { return None; }
+            let i = *self.tree.node_index.get(&id)?;
+            (!self.subtree_exiting(i) && self.allowed(i) && !self.tree.nodes[i].focus.hover_below).then_some(i)
+        })
+    }
+
+    /// Whether `(x, y)` lies inside active modal `i` or its live modal scope: either a live,
+    /// allowed hit target contains `(x, y)`, or `(x, y)` falls inside the geometry of a live,
+    /// authored-visible modal member (covering frame 0 of a default opacity entrance fade when
+    /// `register_node_hits` has not yet registered the modal's hits).
+    pub(in crate::runtime) fn point_in_modal(&self, i: usize, x: f32, y: f32) -> bool {
+        if self.top_hit(x, y).is_some_and(|t| self.allowed(t)) {
+            return true;
+        }
+        (0..self.tree.nodes.len()).any(|j| {
+            self.allowed(j)
+                && !self.subtree_exiting(j)
+                && (j == i || self.tree.nodes[j].above.is_some()
+                    || self.tree.nodes[j].handlers.get().is_some_and(crate::el::Handlers::takes_hit)
+                    || self.tree.nodes[j].focus.get().is_some_and(|f| f.enabled))
+                && self.authored_opaque(j)
+                && self.node_contains(j, x, y)
+        })
+    }
+
+    /// Whether node `j` and every ancestor have authored `El::opacity` above the hit threshold
+    /// (independent of presence entrance fades).
+    fn authored_opaque(&self, mut j: usize) -> bool {
+        loop {
+            if self.tree.nodes[j].vis.opacity <= 0.001 { return false; }
+            let Some(p) = self.tree.nodes[j].parent else { return true };
+            j = p;
+        }
+    }
+
+    /// Whether node `i` is `target` or an ancestor of it.
+    pub(in crate::runtime) fn node_holds(&self, i: usize, target: usize) -> bool {
+        std::iter::successors(Some(target), |&p| self.tree.nodes[p].parent).any(|p| p == i)
+    }
+
+    /// Whether node `i` is a live, allowed primary input target (selectable text included).
+    fn is_primary_target(&self, i: usize) -> bool {
+        let n = &self.tree.nodes[i];
+        // A secondary-only child must not obscure primary input or background blur.
+        !self.subtree_exiting(i) && self.allowed(i) && (n.has_primary_handler() || n.input.is_some() || n.role == "textbox"
+            || (n.role == "button" && n.vis_flags.hit()) || n.window_drag != crate::el::WindowDrag::None || n.focus.enabled || n.handlers.modal.is_some()
+            || self.is_selectable(i))
+    }
+
     /// The topmost element under (x, y) that takes primary input, selectable text included.
     pub(in crate::runtime) fn top_target(&self, x: f32, y: f32) -> Option<usize> {
         self.hit.find_hit(|id, r| {
             if !self.hit_contains(id, r, x, y) { return None; }
             let i = *self.tree.node_index.get(&id)?;
-            let n = &self.tree.nodes[i];
-            // A secondary-only child must not obscure primary input or background blur.
-            (!self.subtree_exiting(i) && self.allowed(i) && (n.has_primary_handler() || n.input.is_some() || n.role == "textbox"
-                || (n.role == "button" && n.vis_flags.hit()) || n.window_drag != crate::el::WindowDrag::None || n.focus.enabled || n.handlers.modal.is_some()
-                || self.is_selectable(i))).then_some(i)
+            self.is_primary_target(i).then_some(i)
         })
+    }
+
+    /// The element under (x, y) that chooses the pointer's cursor: the topmost live, allowed hit
+    /// target painted above any primary target that sets a cursor (itself or on an ancestor not
+    /// also enclosing the primary target), else the topmost primary target.
+    pub(in crate::runtime) fn cursor_target(&self, x: f32, y: f32) -> Option<usize> {
+        let primary = self.top_target(x, y);
+        let shared_ancestor = |a: usize| primary.is_some_and(|p| self.node_holds(a, p));
+        for &(id, r) in self.hit.hits().iter().rev() {
+            if !self.hit_contains(id, r, x, y) { continue; }
+            let Some(&i) = self.tree.node_index.get(&id) else { continue };
+            if self.subtree_exiting(i) || !self.allowed(i) { continue; }
+            if Some(i) == primary { return primary; }
+            if std::iter::successors(Some(i), |&k| self.tree.nodes[k].parent)
+                .take_while(|&k| !shared_ancestor(k))
+                .any(|k| self.tree.nodes[k].handlers.cursor.is_some())
+            {
+                return Some(i);
+            }
+        }
+        primary
     }
 
     /// The element a press, hover or drag at (x, y) goes to. Selectable text passes them to the
     /// nearest ancestor that handles them (a clickable or draggable row), unless the text has
     /// its own handlers or the point is on one of its links; selecting goes on beside that
     /// (`selectable_at`).
-    pub(in crate::runtime) fn primary_target(&self, x: f32, y: f32) -> Option<usize> {
-        let i = self.top_target(x, y)?;
+    fn resolve_selectable_target(&self, i: usize, x: f32, y: f32) -> usize {
         let n = &self.tree.nodes[i];
-        if !self.is_selectable(i) || n.has_primary_handler() || self.link_at(i, x, y).is_some() { return Some(i); }
+        if !self.is_selectable(i) || n.has_primary_handler() || self.link_at(i, x, y).is_some() { return i; }
         let handles = |n: &Node| n.has_primary_handler() || n.focus.enabled;
         let mut p = n.parent;
         while let Some(a) = p {
             if self.subtree_exiting(a) || !self.allowed(a) || self.tree.nodes[a].handlers.modal.is_some() { break; }
-            if handles(&self.tree.nodes[a]) { return Some(a); }
+            if handles(&self.tree.nodes[a]) { return a; }
             p = self.tree.nodes[a].parent;
         }
-        Some(i)
+        i
+    }
+
+    pub(in crate::runtime) fn primary_target(&self, x: f32, y: f32) -> Option<usize> {
+        let i = self.top_target(x, y)?;
+        Some(self.resolve_selectable_target(i, x, y))
+    }
+
+    /// The hovered primary target at `(x, y)` (for `on_hover` and `focus_highlight`), gated
+    /// against `top_hover_hit` to match CSS `:hover` occlusion: any overlying `.hit()` cover
+    /// blocks targets beneath it, while layers marked `El::hover_passes_below` let hover pass.
+    pub(in crate::runtime) fn hover_target(&self, x: f32, y: f32) -> Option<usize> {
+        let top = self.top_hover_hit(x, y)?;
+        let i = self.hit.find_hit(|id, r| {
+            if !self.hit_contains(id, r, x, y) { return None; }
+            let i = *self.tree.node_index.get(&id)?;
+            (!self.tree.nodes[i].focus.hover_below && self.is_primary_target(i)).then_some(i)
+        })?;
+        let h = self.resolve_selectable_target(i, x, y);
+        (self.node_holds(h, top) || self.node_holds(top, h)).then_some(h)
     }
 
     /// A focusable scroll region, which a press on plain content inside it focuses, as a web
     /// page focuses a `tabIndex` scroller.
     pub(in crate::runtime) fn focuses_on_click(&self, i: usize) -> bool {
-        self.tree.nodes[i].scroll.is_some() && self.tree.nodes[i].focus.enabled
+        self.tree.nodes[i].scroll.is_some() && self.tree.nodes[i].focus.enabled && !self.tree.nodes[i].focus.keyboard_only
     }
 
     /// The focusable scroll region a press at (x, y) lands in beneath `layer`
@@ -364,7 +470,7 @@ impl RuntimeCore {
         pinh_clip: [f32; 4],
         (effective_opacity, visible): (f32, bool),
         rect_pt: [f32; 4],
-        (press_k, press_anchor): (f32, [f32; 2]),
+        (press_k, press_anchor, press_off): (f32, [f32; 2], [f32; 2]),
     ) {
         let s = self.env.scale;
         let n = &self.tree.nodes[i];
@@ -379,6 +485,10 @@ impl RuntimeCore {
                 let [ax, ay] = press_anchor;
                 [ax + (rect_pt[0] - ax) / press_k, ay + (rect_pt[1] - ay) / press_k,
                     ax + (rect_pt[2] - ax) / press_k, ay + (rect_pt[3] - ay) / press_k]
+            } else { rect_pt };
+            let rect_pt = if press_off != [0.0; 2] {
+                [rect_pt[0] - press_off[0], rect_pt[1] - press_off[1],
+                    rect_pt[2] - press_off[0], rect_pt[3] - press_off[1]]
             } else { rect_pt };
             let cr = [
                 rect_pt[0].max(c[0] / s),

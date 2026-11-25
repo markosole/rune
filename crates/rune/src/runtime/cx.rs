@@ -24,6 +24,8 @@ pub(crate) struct ViewDefaults {
     pub(crate) focus_ring: Option<crate::el::Outline>,
     /// [`Cx::help_look`].
     pub(crate) help: Option<super::HelpLook>,
+    /// [`Cx::press_cursor`].
+    pub(crate) press_cursor: Option<crate::el::Cursor>,
     /// [`Cx::web_focus`].
     pub(crate) web_focus: bool,
     /// [`Cx::force_focus_rings`].
@@ -52,6 +54,8 @@ pub(crate) struct CxCore {
     pub(super) env: Env,
     pub(super) titlebar_inset: f32,
     pub(super) chrome: crate::ChromeInsets,
+    pub(super) maximized: bool,
+    pub(super) full_screen: bool,
     /// `Cx::caption_color`, read once the view returns.
     pub(super) caption_color: Option<Color>,
     /// `Cx::foreground` and `Cx::focus_ring`, read once the view returns.
@@ -62,6 +66,7 @@ pub(crate) struct CxCore {
     pub(super) system_contrast: Option<crate::SystemContrast>,
     pub(super) system_increased_contrast: bool,
     pub(super) system_scroll_bars: crate::platform::scroll_bars::SystemScrollBars,
+    pub(super) system_languages: Option<Rc<[String]>>,
     pub(super) system_reduced_motion: bool,
     pub(super) system_text_scale: f32,
     pub(super) reduced_motion: bool,
@@ -94,29 +99,23 @@ impl CxCore {
     pub(crate) fn clear_chrome(&mut self) {
         self.titlebar_inset = 0.0;
         self.chrome = crate::ChromeInsets::default();
-    }
-
-    #[cfg(feature = "hot")]
-    pub(crate) fn settings_from(&mut self, other: CxCore) {
-        self.reduced_motion = other.reduced_motion;
-        self.time_scale = other.time_scale;
-        self.zoom = other.zoom;
-        self.caption_color = other.caption_color;
-        self.titlebar = other.titlebar;
-        self.caret_read = other.caret_read;
-        self.layout_reads = other.layout_reads;
+        self.maximized = false;
+        self.full_screen = false;
     }
 
     pub(crate) fn env(&self) -> Env { self.env }
     pub(crate) fn system_dark(&self) -> bool { self.env.system_dark }
     pub(crate) fn titlebar_inset(&self) -> f32 { self.titlebar_inset }
     pub(crate) fn chrome_insets(&self) -> crate::ChromeInsets { self.chrome }
+    pub(crate) fn is_maximized(&self) -> bool { self.maximized }
+    pub(crate) fn is_full_screen(&self) -> bool { self.full_screen }
     pub(crate) fn caption_color(&mut self, color: Color) { self.caption_color = Some(color); }
     pub(crate) fn foreground(&mut self, color: Color) { self.defaults.foreground = Some(color); }
     pub(crate) fn focus_ring(&mut self, width: f32, offset: f32, color: Color) {
         self.defaults.focus_ring = Some(crate::el::Outline { width, offset, color });
     }
     pub(crate) fn help_look(&mut self, look: crate::HelpLook) { self.defaults.help = Some(look); }
+    pub(crate) fn press_cursor(&mut self, cursor: crate::el::Cursor) { self.defaults.press_cursor = Some(cursor); }
     pub(crate) fn force_focus_rings(&mut self) { self.defaults.force_focus_rings = true; }
     pub(crate) fn web_focus(&mut self) { self.defaults.web_focus = true; }
     pub(crate) fn titlebar_height(&mut self, points: f32) { self.titlebar.height = Some(points.max(1.0)); }
@@ -145,6 +144,15 @@ impl CxCore {
     pub(crate) fn system_increased_contrast(&self) -> bool { self.system_increased_contrast }
     pub(crate) fn system_reduced_motion(&self) -> bool { self.system_reduced_motion }
     pub(crate) fn system_text_scale(&self) -> f32 { self.system_text_scale }
+    pub(crate) fn system_languages(&self) -> &[String] {
+        match &self.system_languages {
+            Some(langs) => langs,
+            None => crate::platform::languages::cached(),
+        }
+    }
+    pub(crate) fn locale(&self) -> Option<&str> {
+        self.system_languages().first().map(String::as_str)
+    }
     pub(crate) fn scroll_bars(&self) -> crate::ScrollBars { self.system_scroll_bars.bars }
     pub(crate) fn overlay_scroll_bars(&self) -> bool { self.system_scroll_bars.is_overlay() }
     pub(crate) fn is_reduced_motion(&self) -> bool { self.reduced_motion }
@@ -194,12 +202,6 @@ impl<S> Cx<S> {
         self.core.clear_chrome();
     }
 
-    #[cfg(feature = "hot")]
-    #[inline(always)]
-    pub(crate) fn settings_from<T>(&mut self, other: Cx<T>) {
-        self.core.settings_from(other.core);
-    }
-
     #[inline(always)]
     pub fn env(&self) -> Env { self.core.env() }
     #[inline(always)]
@@ -219,6 +221,36 @@ impl<S> Cx<S> {
     /// window would.
     #[inline(always)]
     pub fn chrome_insets(&self) -> crate::ChromeInsets { self.core.chrome_insets() }
+    /// Whether the host window is currently maximized (zoomed on macOS), as confirmed by the
+    /// window system. The view and any `memo` closures rebuild automatically when this changes;
+    /// `Tx::toggle_maximized` never flips it optimistically before the OS confirms the change.
+    /// Returns `false` in headless runs unless set with [`Runtime::set_maximized`], and for
+    /// overlays, adopted macOS panels, and staged playground subviews.
+    ///
+    /// ```
+    /// # use rune::{Cx, El, text};
+    /// fn titlebar(_: &(), cx: &mut Cx<()>) -> El {
+    ///     text(if cx.is_maximized() { "Restore" } else { "Maximize" })
+    /// }
+    /// ```
+    #[inline(always)]
+    pub fn is_maximized(&self) -> bool { self.core.is_maximized() }
+    /// Whether the host window is currently in full screen (a native full-screen Space on
+    /// macOS, borderless full screen over its display on Windows and Linux), as confirmed by
+    /// the window system. The view and any `memo` closures rebuild automatically when this
+    /// changes, including when the user enters or leaves full screen from the window manager
+    /// or macOS Esc / green button. Returns `false` in headless runs unless set with
+    /// [`Runtime::set_full_screen`], and for overlays, adopted macOS panels, and staged
+    /// playground subviews.
+    ///
+    /// ```
+    /// # use rune::{Cx, El, text};
+    /// fn titlebar(_: &(), cx: &mut Cx<()>) -> El {
+    ///     text(if cx.is_full_screen() { "Exit full screen" } else { "Full screen" })
+    /// }
+    /// ```
+    #[inline(always)]
+    pub fn is_full_screen(&self) -> bool { self.core.is_full_screen() }
     /// The colour of the Windows caption buttons' symbols (Electron's `titleBarOverlay`
     /// `symbolColor`), for a titlebar whose colours follow the app's theme rather than the
     /// system's light or dark setting: by default black in light mode, white in dark. Their
@@ -245,6 +277,28 @@ impl<S> Cx<S> {
     /// of AppKit's. Set it on every run of the view.
     #[inline(always)]
     pub fn help_look(&mut self, look: crate::HelpLook) { self.core.help_look(look); }
+    /// Default cursor for pressable elements (those with [`El::on_press`](crate::El::on_press)
+    /// or [`El::on_double_press`](crate::El::on_double_press)) that do not set their own
+    /// [`El::cursor`](crate::El::cursor): e.g. `Cursor::Pointer` for a web-style pointing hand
+    /// over buttons, menu items and clickable rows. Wins over a cursor inherited from an
+    /// ancestor, while an element's own `.cursor(..)` still wins, [`El::disabled`](crate::El::disabled)
+    /// / [`El::aria_disabled`](crate::El::aria_disabled) controls show `Cursor::Default`, and
+    /// text fields and links keep their own cursors. Off by default. Set it on every run of the
+    /// view.
+    ///
+    /// ```
+    /// # use rune::{Cursor, Cx, El, Env, Runtime, col, el};
+    /// fn view(_: &(), cx: &mut Cx<()>) -> El {
+    ///     cx.press_cursor(Cursor::Pointer);
+    ///     col().size(120.0, 40.0).child(el().size(120.0, 40.0).on_press(|_: &mut ()| {}))
+    /// }
+    /// # let mut rt = Runtime::new((), view, (120.0, 40.0), Env::new(true, 1.0));
+    /// # rt.frame(0.0);
+    /// # rt.pointer_move(20.0, 20.0);
+    /// # assert_eq!(rt.cursor(), Cursor::Pointer);
+    /// ```
+    #[inline(always)]
+    pub fn press_cursor(&mut self, cursor: crate::el::Cursor) { self.core.press_cursor(cursor); }
     /// Every control that can take focus draws its keyboard focus ring (and its focus fill) as
     /// if the keyboard had focused it, whether or not it has focus: a developer tool for checking
     /// focus styles at a glance, as forcing `:focus` and `:focus-visible` on every focusable
@@ -323,6 +377,60 @@ impl<S> Cx<S> {
     /// before primary controls clip.
     #[inline(always)]
     pub fn system_text_scale(&self) -> f32 { self.core.system_text_scale() }
+
+    /// The user's preferred languages as BCP 47 tags (RFC 5646), most preferred first (for
+    /// example `["ar-EG", "en-US"]`). Queries the platform lazily on first read
+    /// (`GetUserPreferredUILanguages` on Windows, `NSLocale.preferredLanguages` on macOS/iOS,
+    /// `navigator.languages` on web, and POSIX `LANGUAGE`/`LC_ALL`/`LC_MESSAGES`/`LANG`
+    /// elsewhere), performing no work before the first frame. Tests and hosts can override
+    /// the list with [`Runtime::set_languages`](crate::Runtime::set_languages).
+    ///
+    /// ```
+    /// use std::cell::RefCell;
+    /// use std::rc::Rc;
+    /// use rune::{Env, Runtime, el};
+    ///
+    /// let seen = Rc::new(RefCell::new(Vec::new()));
+    /// let mut rt = Runtime::new(
+    ///     seen.clone(),
+    ///     |out: &Rc<RefCell<Vec<String>>>, cx| {
+    ///         *out.borrow_mut() = cx.system_languages().to_vec();
+    ///         el()
+    ///     },
+    ///     (200.0, 100.0),
+    ///     Env::default(),
+    /// );
+    /// rt.set_languages(["ar-EG", "en-US"]);
+    /// rt.frame(0.0);
+    /// assert_eq!(*seen.borrow(), vec!["ar-EG", "en-US"]);
+    /// ```
+    #[inline(always)]
+    pub fn system_languages(&self) -> &[String] { self.core.system_languages() }
+    /// The user's primary preferred language tag (`Self::system_languages().first()`), as a
+    /// BCP 47 tag (RFC 5646), or `None` when none is configured. Useful for deriving layout
+    /// direction or passing to [`rune::text::set_language`](crate::text::set_language).
+    ///
+    /// ```
+    /// use std::cell::RefCell;
+    /// use std::rc::Rc;
+    /// use rune::{Env, Runtime, el};
+    ///
+    /// let seen = Rc::new(RefCell::new(None));
+    /// let mut rt = Runtime::new(
+    ///     seen.clone(),
+    ///     |out: &Rc<RefCell<Option<String>>>, cx| {
+    ///         *out.borrow_mut() = cx.locale().map(str::to_owned);
+    ///         el()
+    ///     },
+    ///     (200.0, 100.0),
+    ///     Env::default(),
+    /// );
+    /// rt.set_languages(["ar-EG", "en-US"]);
+    /// rt.frame(0.0);
+    /// assert_eq!(seen.borrow().as_deref(), Some("ar-EG"));
+    /// ```
+    #[inline(always)]
+    pub fn locale(&self) -> Option<&str> { self.core.locale() }
     /// The user's "Show scroll bars" preference (System Settings › Appearance on macOS;
     /// [`ScrollBars::WhenScrolling`](crate::ScrollBars::WhenScrolling) elsewhere and headless).
     /// The view and its memos re-run when it changes.
@@ -366,5 +474,5 @@ impl<S> Cx<S> {
 /// [`Cx::caret`] for the caret `caret` (the focused field's path and rect).
 pub(crate) fn caret_of(caret: &Option<(String, [f32; 4])>, key: &str) -> Option<[f32; 4]> {
     let (path, rect) = caret.as_ref()?;
-    path.split('/').any(|seg| seg == key).then_some(*rect)
+    path.split('/').any(|seg| element_path::segment_matches_key(seg, key)).then_some(*rect)
 }

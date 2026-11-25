@@ -28,7 +28,7 @@ use crate::window::host::stepping::FrameMove;
 use crate::window::state::FirstFrame;
 use crate::window::surface::{
     Backoff, BackoffEvent, FRAME_LATENCY, HiddenPace, LoopFrame, Native, Presented, Redraw,
-    SurfaceRetries, TIMER_FRAME, TimerFrame, Win, native, win,
+    SurfaceRetries, TIMER_FRAME, TimerFrame, Win, drawable_size, max_surface_dim, native, win,
 };
 use crate::window::{WakeEvent, sync_screen_origin_core};
 
@@ -124,13 +124,12 @@ fn painter_threads() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 6)
 }
 
-/// Whether a window opens on the CPU: an opaque window while no window has a GPU yet (with one,
-/// a new window's swap chain is ready in a few milliseconds), unless turned off
-/// (`RUNE_CPU_FIRST=0`).
+/// Whether a window opens on the CPU: an opaque window without its own GPU, following
+/// [`Host::effective_cpu_first`] (`RUNE_CPU_FIRST` overrides `App::cpu_first` /
+/// `WindowSpec::cpu_first`).
 pub(in crate::window) fn opens_on_cpu(host: &Host) -> bool {
-    !host.options.transparent && host.gpu.is_none()
-        && host.gpu_pool.borrow().upgrade().is_none_or(|gpu| gpu.is_lost())
-        && std::env::var_os("RUNE_CPU_FIRST").is_none_or(|v| v != "0")
+    let live_pool_gpu = host.gpu_pool.borrow().upgrade().is_some_and(|gpu| !gpu.is_lost());
+    host.effective_cpu_first().opens_on_cpu(host.options.transparent, host.gpu.is_some(), live_pool_gpu)
 }
 
 impl Host {
@@ -156,9 +155,10 @@ impl Host {
             cloak.hold(&window, crate::time::now() + win::READY_FALLBACK, focus);
             window.set_visible(true);
             chrome::open_as(&window, open_as);
+            crate::platform::win32::apply_window_styles(&window, &self.windows_window);
         }
         let phys = window.inner_size();
-        let size = (phys.width.max(1), phys.height.max(1));
+        let size = drawable_size(None, (phys.width, phys.height), max_surface_dim(None));
         let display = window.current_monitor().map_or((0, 0), |m| (m.size().width, m.size().height));
         let Some((prefault, capacity, painter)) = self.cpu_side(size, display) else { return Err("no memory for the window's frame buffer".into()) };
         let half = HalfRounding::of_vendor(crate::gpu::pick::display_vendor().unwrap_or(0));
@@ -222,7 +222,7 @@ impl Host {
             let rt = self.app.rt_mut();
             if size.width > 0 && size.height > 0 {
                 w.resize_surface(None, size);
-                rt.set_viewport((size.width as f32 / scale, size.height as f32 / scale), scale);
+                rt.set_viewport((w.config.width as f32 / scale, w.config.height as f32 / scale), scale);
             }
             sync_chrome_core(rt, w, self.chrome, self.titlebar);
             sync_screen_origin_core(rt, &w.window);
@@ -355,7 +355,7 @@ impl FrameHost for CpuWindowFrame<'_> {
         info.update_ms = now.elapsed().as_secs_f64() * 1000.0;
         let Some(l) = self.host.win.as_mut() else { return };
         let rt = self.host.app.rt_mut();
-        sync_platform_core(l, rt, &mut self.host.secure_input, &mut self.host.ime_allowed, &self.host.clipboard);
+        sync_platform_core(l, rt, &mut self.host.secure_input, &mut self.host.ime, self.host.ime_waits, &self.host.clipboard);
         let mut quiet_now = false;
         if let SurfaceMode::Cpu { job: GpuJob::Building { latest, animating: moving, ready, .. }, .. } = &mut l.native.mode {
             *latest.lock().unwrap_or_else(|e| e.into_inner()) = warm_instances(&rt.instances);
@@ -474,13 +474,14 @@ impl FrameHost for CpuWindowFrame<'_> {
         self.host.app.inspect_frame();
         let Some(l) = self.host.win.as_mut() else { return };
         let next_tick = l.next_tick(now).filter(|_| !self.hidden);
+        let surfaces_pending = self.host.gpu.as_ref().is_some_and(|(_, r)| r.surfaces_pending());
         self.host.idle = Presented::settle_core(
             &mut l.presented,
             self.host.app.rt(),
             &l.config,
             info.animating || FrameMove::moving(&self.host.frame_move),
             next_tick,
-            !self.hidden,
+            !self.hidden && !surfaces_pending,
             false,
         );
         // Motion's next frame comes at the display's next refresh: a CPU frame presents at once,

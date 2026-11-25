@@ -54,7 +54,7 @@ pub(super) struct Layers {
     /// kept for the next layer of their size: opening a menu or a popover again makes no texture.
     spare: Vec<Target>,
     stack: Vec<usize>,
-    pipelines: Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
+    pub(super) pipelines: Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
     pub additive: Option<(wgpu::RenderPipeline, wgpu::RenderPipeline)>,
     pub blur: Option<layer_blur::Pipeline>,
     viewport: (u32, u32),
@@ -112,6 +112,21 @@ impl Layers {
             let oldest = self.spare.iter().enumerate().min_by_key(|(_, t)| t.last_used).unwrap().0;
             bytes -= Renderer::target_bytes(&self.spare.swap_remove(oldest));
         }
+    }
+
+    #[cfg_attr(not(any(test, not(any(target_os = "macos", target_arch = "wasm32")))), allow(dead_code))]
+    pub(super) fn clear_images(&mut self) {
+        for t in self.targets.iter_mut().flatten().chain(&mut self.retained).chain(&mut self.spare) {
+            t.images.clear();
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_arch = "wasm32")))]
+    pub(super) fn clear_all(&mut self) {
+        self.plan.clear();
+        self.targets.clear();
+        self.retained.clear();
+        self.spare.clear();
     }
 
     /// Test-only: notes the peak of the bytes this frame holds live, targets and blur scratches
@@ -300,6 +315,9 @@ impl Renderer {
             self.backdrops.clear();
             if let Some(blur) = &mut self.backdrop_blur { blur.give_back(); }
         }
+        if !all {
+            self.uploads.trim_oversized();
+        }
         #[cfg(all(feature = "alloc-sites", not(target_arch = "wasm32")))]
         self.report_pools();
     }
@@ -308,6 +326,17 @@ impl Renderer {
     /// frame's uploads would make new ones).
     pub(crate) fn trim_uploads(&self) {
         self.uploads.trim();
+    }
+
+    /// Whether any recyclable oversized (> 4 MiB) upload chunks are in flight on the GPU.
+    pub(crate) fn has_oversized_uploads_in_flight(&self) -> bool {
+        self.uploads.has_oversized_in_flight()
+    }
+
+    /// Test-only: number of spare layer targets currently parked for reuse.
+    #[cfg(test)]
+    pub(crate) fn spare_layers(&self) -> usize {
+        self.layers.spare.len()
     }
 
     pub(super) fn sync_resident_caches(&self, out: &mut std::collections::HashMap<u64, u64>) {
@@ -671,9 +700,23 @@ impl Renderer {
     }
 
     pub(super) fn add_layer_format(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat) {
-        if !self.layers.pipelines.iter().any(|(f, _)| *f == format) {
-            self.layers.pipelines.push((format, Self::pipeline(device, &self.layout, &self.shader, format, "vs", Blend::SourceOver)));
-        }
+        if self.layers.pipelines.iter().any(|(f, _)| *f == format) { return; }
+        // With the standard `"vs"` vertex entry, the layer composite pipeline for `format` is
+        // identical to the renderer's own main or `extra` uber pipeline; clone instead of
+        // compiling a duplicate.
+        let pipeline = if self.vertex_entry == "vs" {
+            if format == self.format {
+                Some(self.pipeline.clone())
+            } else {
+                self.extra.iter().find(|(f, _)| *f == format).map(|(_, p)| p.clone())
+            }
+        } else {
+            None
+        };
+        let pipeline = pipeline.unwrap_or_else(|| {
+            Self::pipeline(device, &self.layout, &self.shader, format, "vs", Blend::SourceOver)
+        });
+        self.layers.pipelines.push((format, pipeline));
     }
 
     fn layer_target(&self, mut layer: Option<usize>) -> Option<usize> {

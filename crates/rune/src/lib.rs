@@ -1,7 +1,6 @@
-//! Rune, first slice: keyed element tree from plain view functions, Taffy layout, analytic
-//! spring tracks, an instanced wgpu uber-quad renderer with Parley text, pointer and keyboard
-//! input, scroll viewports, growth stacks, streaming reveals, themes as data, and headless agent
-//! tooling.
+//! Rune: GPU-rendered Rust UI framework with keyed element trees, Taffy layout, analytic springs,
+//! Parley/Windfoil text, native Metal and wgpu backends, overlays, AccessKit accessibility, media,
+//! and headless tooling.
 
 #[cfg(all(target_arch = "wasm32", any(feature = "hot", feature = "native-file-dialog")))]
 compile_error!("web does not support Rune's hot or native-file-dialog features; disable them for wasm32");
@@ -12,6 +11,7 @@ mod flight;
 mod frame;
 mod input;
 mod native_menu;
+mod open_path;
 mod open_url;
 mod overlay;
 mod platform;
@@ -52,11 +52,12 @@ pub(crate) use rune_media::video;
 pub(crate) use tooling::virtual_desktop as desktop;
 pub(crate) use window::titlebar;
 
-/// AccessKit's types, for [`Runtime::accessibility_tree`] and [`Runtime::accessibility_action`].
+/// AccessKit's types, for [`El::on_a11y_action`], [`Runtime::accessibility_tree`] and [`Runtime::accessibility_action`].
 pub use a11y::AccessibilityLink;
 pub use accesskit;
 pub use app::App;
 pub use app::AppHandle;
+pub use app::CloseResponse;
 pub use clipboard::ClipboardContent;
 pub use clipboard::ClipboardImage;
 pub use clipboard::ClipboardWrite;
@@ -80,6 +81,7 @@ pub use edit::KeySide;
 pub use edit::MAX_LIST_LEVEL;
 pub use edit::Mark;
 pub use edit::MarkRange;
+pub use edit::MediaKey;
 pub use edit::Modifier;
 pub use edit::Mods;
 pub use edit::ParagraphInfo;
@@ -87,6 +89,7 @@ pub use edit::RichStyle;
 pub use edit::TextEdit;
 pub use el::Align;
 pub use el::Anchor;
+pub use el::AutoComplete;
 pub use el::Cursor;
 pub use el::CursorImage;
 pub use el::Cycle;
@@ -95,9 +98,15 @@ pub use el::Drag;
 pub use el::El;
 pub use el::GridRow;
 pub use el::GrowthSpec;
+pub use el::HasPopup;
 pub use el::{InlineIcon, InlineImage};
+pub use el::LineFill;
 pub use el::LiveRegion;
+pub use el::OptionAsAlt;
+pub use el::Orientation;
 pub use el::Outline;
+#[doc(hidden)]
+pub use el::PathBind;
 pub use el::Phase;
 pub use el::PillStyle;
 pub use el::PointerEvent;
@@ -111,6 +120,7 @@ pub use el::Shell;
 pub use el::Side;
 pub use el::Tx;
 pub use el::anchor_rect;
+pub use el::anchor_rect_in;
 pub use el::auto_grow;
 pub use el::canvas;
 pub use el::col;
@@ -121,6 +131,7 @@ pub use el::grid;
 pub use el::hairline;
 pub use el::icon;
 pub use el::layout_watch::ScrollPos;
+pub use el::layout_watch::ScrollSource;
 pub use el::motion::MotionIntent;
 pub use el::rich;
 pub use el::row;
@@ -129,6 +140,7 @@ pub use el::spacer;
 pub use el::text;
 pub use el::text_input;
 pub use file_dialog::FileDialogError;
+pub use file_dialog::FileDialogFilesResult;
 pub use file_dialog::FileDialogKind;
 pub use file_dialog::FileDialogOptions;
 pub use file_dialog::FileDialogResult;
@@ -136,6 +148,7 @@ pub use file_dialog::FileDialogs;
 pub use file_dialog::ScriptedFileDialog;
 pub use frame::encoded::FrameEncoded;
 pub use frame::encoded::FrameOutcome;
+pub use frame::presented::FramePresented;
 #[cfg(feature = "frame-profile")]
 #[doc(hidden)]
 pub use frame::profile::PHASES;
@@ -151,6 +164,7 @@ pub use frame::surface_stats::SurfaceCounts;
 pub use frame::surface_stats::SurfaceStats;
 pub use gpu::backend::GpuBackend;
 pub use gpu::backend::describe as describe_gpu;
+pub use gpu::memory::GpuMemoryPolicy;
 #[cfg(all(target_vendor = "apple", feature = "metal-backend"))]
 #[doc(hidden)]
 pub use gpu::metal::bench::dispatch_overhead as __metal_dispatch_overhead;
@@ -161,7 +175,9 @@ pub use growth::edge;
 pub use image::Image;
 pub use image::ImageCache;
 pub use image::ImageError;
+pub use image::ImageFilter;
 pub use image::ImageId;
+pub use image::PixelsWrap;
 pub use input::canvas_input::GesturePhase;
 pub use input::canvas_input::MagnifyEvent;
 pub use input::canvas_input::PointerButton;
@@ -191,7 +207,11 @@ pub use native_menu::MenuError;
 pub use native_menu::MenuItem;
 pub use native_surface::NativeSurface;
 pub use native_surface::SurfaceFit;
+pub use open_path::OpenPathError;
+pub use open_path::PathAction;
+pub use open_path::PathRequest;
 pub use open_url::OpenUrlError;
+pub use platform::preferences::{Appearance, last_appearance};
 pub use open_url::instance::release_instance;
 pub use open_url::instance::single_instance;
 pub use overlay::Availability;
@@ -242,7 +262,9 @@ pub use playground::Playground;
 pub use playground::Stage;
 pub use playground::Step;
 pub use playground::Story;
+pub use popup_menu::FieldMenuRequest;
 pub use popup_menu::PopupAnchor;
+pub use popup_menu::PopupEntry;
 pub use popup_menu::PopupItem;
 pub use popup_menu::PopupMenu;
 pub use popup_menu::PopupMenuError;
@@ -260,11 +282,14 @@ pub use recorder::Recorder;
 pub use recorder::RecorderState;
 pub use recorder::Recording;
 pub use render::MAX_BACKDROP_BLURS;
+pub use render::PrewarmEffects;
 pub use render::gpu_events::GpuEvent;
 pub use render::gpu_events::on_gpu;
 pub use render::prewarm_gpu;
 pub use render::prewarm_gpu_on;
+pub use render::set_gpu_memory_policy;
 pub use render::warm_gpu;
+pub use render::warm_gpu_cache;
 pub use render::warm_gpu_with;
 pub use rune_core::color;
 pub use rune_core::dirs;
@@ -298,6 +323,7 @@ pub use rune_motion::Effect;
 pub use rune_motion::LayoutAnim;
 pub use rune_motion::LoopKind;
 pub use rune_motion::LoopSpec;
+pub use rune_motion::ManualClock;
 pub use rune_motion::NodeId;
 pub use rune_motion::Phase as PresencePhase;
 pub use rune_motion::Presented;
@@ -317,10 +343,13 @@ pub use runtime::Cx;
 pub use runtime::ElementInfo;
 pub use runtime::Env;
 pub use runtime::HelpLook;
+pub use runtime::LayoutSeed;
+pub use runtime::MatchedHandover;
 pub use runtime::MotionElement;
 pub use runtime::Pick;
 pub use runtime::Picked;
 pub use runtime::Pose;
+pub use runtime::ResolvedTextStyle;
 pub use runtime::Runtime;
 pub use runtime::SelectedText;
 pub use runtime::SelectionChange;
@@ -329,9 +358,14 @@ pub use runtime::TextSelection;
 pub use runtime::TitlebarAction;
 pub use runtime::TouchPhase;
 pub use runtime::Waker;
+#[doc(hidden)]
+pub use runtime::child_path;
 pub use runtime::commit_generation;
 #[doc(hidden)]
+pub use runtime::path_segment;
+#[doc(hidden)]
 pub use runtime::scroll_watch_state;
+pub use shape::FillRule;
 pub use shape::LineCap;
 pub use shape::Path;
 pub use shape::Shape;
@@ -350,6 +384,7 @@ pub use text::Link;
 pub use text::LinkPaint;
 pub use text::SmoothingSupport;
 pub use text::Span;
+pub use text::SpanBox;
 pub use text::TextCase;
 pub use text::TextHighlight;
 pub use theme::Theme;
@@ -361,8 +396,11 @@ pub use tok::OpticalSize;
 pub use tok::TextStyle;
 pub use tooling::AppSpec;
 pub use tooling::Chrome;
+pub use tooling::RELAUNCH_DROPS;
 pub use tooling::extra_args;
 pub use tooling::is_headless;
+#[cfg(not(target_arch = "wasm32"))]
+pub use tooling::process_age;
 pub use tooling::run;
 pub use tooling::run_windows;
 pub use tooling::run_windows_with;
@@ -371,6 +409,7 @@ pub use tooling::run_with;
 pub use tooling::set_app_id;
 pub use tooling::try_run_windows_with;
 pub use tooling::try_run_windows_with_args;
+pub use tooling::without_relaunch_drops;
 pub use tracked::Reads;
 pub use tracked::Tracked;
 pub use tracked::tracked_reads;
@@ -385,16 +424,21 @@ pub use video::MediaSource;
 pub use video::Player;
 pub use video::PlayerState;
 pub use video::Video;
+pub use window::ColorScheme;
+pub use window::CpuFirst;
 pub use window::WindowHandle;
 pub use window::spec as windows;
 pub use windows::AnyWindowSpec;
 pub use windows::ConfiguredWindowOptions;
 pub use windows::Display;
+pub use windows::MacColorSpace;
 pub use windows::MacWindowOptions;
+pub use windows::ResizeEdge;
 pub use windows::RunOptions;
 pub use windows::WindowOptions;
 pub use windows::WindowPlacement;
 pub use windows::WindowSpec;
+pub use windows::WindowsWindowOptions;
 pub use windows::open_window;
 pub use winit::raw_window_handle;
 

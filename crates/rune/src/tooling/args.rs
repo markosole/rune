@@ -61,6 +61,10 @@ pub struct Args {
     pub(crate) crop_key: Option<String>,
     /// `--whole-window`: `--snap` with `--playground` takes the whole window, not just the stage.
     pub(crate) whole_window: bool,
+    /// `--settle`: run up to 3 zero-dt passes at the `--snap`/`--tree` capture frame so layout
+    /// callbacks (`on_layout`, `on_layout_tx`, `on_screen_layout`, `on_drawn_layout`,
+    /// `drawn_rect_into`, `on_visible`) deliver and re-commit before capture.
+    pub(crate) settle: bool,
     /// `--html OUT.html`: write the scene as a static page (`tooling::html`).
     pub(crate) html: Option<PathBuf>,
     /// `--html-widths 360,640,1000`: the widths `--html` lays the page out at, each the
@@ -73,6 +77,11 @@ pub struct Args {
     /// harness's actions keep pace with its script. It stands in for a window, so `App::on_ready`
     /// runs after its first frame.
     pub(crate) realtime: bool,
+    /// `--window-script FILE`: a real window replays the script's input on the wall clock from
+    /// its first drawn frame, through the same `script_input` a headless run uses, and drops the
+    /// system's pointer events while it does (`window::host::window_script`). Tooling, like
+    /// `--script`: only a command-line argument turns it on.
+    pub(crate) window_script: Option<PathBuf>,
     /// `--cpu-boot DIR`: also paint the `--snap` frame on the CPU (`render::cpu_boot`), on
     /// `--cpu-boot-threads N` threads (6 by default).
     pub(crate) cpu_boot: Option<PathBuf>,
@@ -91,12 +100,38 @@ pub(crate) fn mark_time(v: &str) -> Option<String> {
     v.strip_prefix("mark:").map(str::to_owned)
 }
 
+/// Whether this build reads Rune's developer flags from the process command line and starts
+/// interaction timing from an ambient `OTEL_EXPORTER_OTLP_ENDPOINT`. Always on in debug builds,
+/// and in release builds compiled with Rune's `tooling` (or `hot`) feature.
+#[inline]
+pub(crate) const fn dev_tooling_enabled() -> bool {
+    cfg!(any(feature = "tooling", feature = "hot", debug_assertions))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn process_argv() -> Vec<String> {
+    decode_argv(std::env::args_os().skip(1))
+}
+
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) fn decode_argv(args: impl IntoIterator<Item = std::ffi::OsString>) -> Vec<String> {
+    args.into_iter().map(|a| a.to_string_lossy().into_owned()).collect()
+}
+
 impl Args {
+    /// Default tooling arguments, with no flags active.
+    pub(crate) fn defaults() -> Args {
+        Args { fps: 60.0, every: 1, cols: 10, cpu_boot_threads: 6, ..Default::default() }
+    }
+
     pub fn parse() -> Args {
         #[cfg(target_arch = "wasm32")]
-        return Args::parse_from(Vec::new());
+        let argv = Vec::new();
         #[cfg(not(target_arch = "wasm32"))]
-        Args::parse_from(std::env::args().skip(1).collect())
+        let argv = process_argv();
+        let (args, extra) = Args::parse_process_argv(argv, dev_tooling_enabled());
+        EXTRA.set(extra).ok();
+        args
     }
 
     /// Parses `argv` (without the program name); unrecognised arguments become `extra_args`.
@@ -110,15 +145,27 @@ impl Args {
     /// set it.
     fn parse_process() -> Args {
         #[cfg(target_arch = "wasm32")]
-        return Args::parse_split(Vec::new()).0;
+        let argv = Vec::new();
         #[cfg(not(target_arch = "wasm32"))]
-        Args::parse_split(std::env::args().skip(1).collect()).0
+        let argv = process_argv();
+        Args::parse_process_argv(argv, dev_tooling_enabled()).0
+    }
+
+    /// Splits a process command line into Rune's flags and app arguments. When `dev_tooling` is
+    /// false (a release build without Rune's `tooling` or `hot` feature), Rune parses no process
+    /// flags and leaves every argument untouched for the app (`extra_args`).
+    pub(crate) fn parse_process_argv(argv: Vec<String>, dev_tooling: bool) -> (Args, Vec<String>) {
+        if dev_tooling {
+            Args::parse_split(argv)
+        } else {
+            (Args::defaults(), argv)
+        }
     }
 
     fn parse_split(argv: Vec<String>) -> (Args, Vec<String>) {
         #[cfg(feature = "hot")]
         crate::hot::enable_from_env();
-        let mut a = Args { fps: 60.0, every: 1, cols: 10, cpu_boot_threads: 6, ..Default::default() };
+        let mut a = Args::defaults();
         let mut extra = Vec::new();
         let mut i = 0;
         let val = |i: &mut usize| -> String {
@@ -140,6 +187,7 @@ impl Args {
                 "--playground" => a.playground = Some(crate::playground::arg(&argv, &mut i)),
                 "--variant" => a.variant = Some(val(&mut i)),
                 "--whole-window" => a.whole_window = true,
+                "--settle" => a.settle = true,
                 "--at" => {
                     let v = val(&mut i);
                     a.at_mark = mark_time(&v);
@@ -184,6 +232,7 @@ impl Args {
                 "--trace" => a.trace = Some(val(&mut i).into()),
                 "--native" => a.native = true,
                 "--realtime" => a.realtime = true,
+                "--window-script" => a.window_script = Some(val(&mut i).into()),
                 "--trace-all" => a.trace_all = true,
                 "--strip" => a.strip = Some(val(&mut i).into()),
                 "--crop" => {
@@ -211,11 +260,20 @@ impl Args {
             }
             i += 1;
         }
-        if a.variant.is_some() && a.playground.is_none() { die("--variant needs --playground"); }
-        if a.crop_key.is_some() && a.snap.is_none() { die("--crop KEY needs --snap"); }
-        if a.whole_window && (a.playground.is_none() || a.snap.is_none()) { die("--whole-window needs --playground and --snap"); }
-        if a.cpu_boot.is_some() && a.snap.is_none() { die("--cpu-boot needs --snap"); }
+        a.validate().unwrap_or_else(|e| die(e));
+        // Parsed here, before any window opens: an unreadable or malformed file ends the run now.
+        if a.window_script.is_some() { super::read_window_script(&a); }
         (a, extra)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        if self.variant.is_some() && self.playground.is_none() { return Err("--variant needs --playground"); }
+        if self.crop_key.is_some() && self.snap.is_none() { return Err("--crop KEY needs --snap"); }
+        if self.whole_window && (self.playground.is_none() || self.snap.is_none()) { return Err("--whole-window needs --playground and --snap"); }
+        if self.settle && self.snap.is_none() && self.tree.is_none() { return Err("--settle needs --snap or --tree"); }
+        if self.cpu_boot.is_some() && self.snap.is_none() { return Err("--cpu-boot needs --snap"); }
+        if self.window_script.is_some() && self.headless() { return Err("--window-script replays in a real window: it does not combine with a headless run (--script, --snap, --tree, ...)"); }
+        Ok(())
     }
 
     pub fn headless(&self) -> bool {
@@ -235,11 +293,34 @@ impl Args {
     }
 }
 
+/// The flags an app started again never carries over, each with its value (the next argument, or
+/// after `=`): they drive input or act for the person, so a relaunch (`Tx::relaunch`, an updater's
+/// restart) takes the real pointer and keys instead of repeating them. Flags that isolate a run
+/// (`--harness-writes`, `--dirs-root`) or trace it stay. A program that restarts the app itself
+/// strips them with [`without_relaunch_drops`] rather than keeping its own list.
+pub const RELAUNCH_DROPS: &[&str] = &["--window-script"];
+
+/// `args` without each [`RELAUNCH_DROPS`] flag and its value, given as `--flag VALUE` or
+/// `--flag=VALUE`, wherever it stands (a bare `--` ends nothing, as Rune's parser reads it). Every
+/// other argument stays, byte for byte and in order.
+pub fn without_relaunch_drops(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        if RELAUNCH_DROPS.iter().any(|f| a == *f) { it.next(); continue; }
+        if a.to_str().is_some_and(|a| RELAUNCH_DROPS.iter().any(|f| a.strip_prefix(f).is_some_and(|rest| rest.starts_with('=')))) { continue; }
+        out.push(a);
+    }
+    out
+}
+
 /// Whether this process runs headless: its arguments ask for an offscreen render, a scripted
 /// run, a trace or a listing rather than a window, as `Args::headless` decides. Parsed from the
 /// process's arguments once, so it answers before `run` (to skip a tray, global shortcuts or
 /// network work in a scripted run, say), with `--help` and a malformed flag handled as `run`
-/// handles them. An app that passes `App::args` asks `Args::parse_from(..).headless()` instead.
+/// handles them. In a release build without Rune's `tooling` feature, process arguments are not
+/// parsed and this returns `false`. An app that passes `App::args` asks
+/// `Args::parse_from(..).headless()` instead.
 pub fn is_headless() -> bool {
     static HEADLESS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *HEADLESS.get_or_init(|| Args::parse_process().headless())
@@ -257,6 +338,7 @@ const HELP: &str = "usage: <app> [window]
                         one on the stage, or anywhere in the window with --whole-window)
   --at SECONDS          virtual time of the snapshot/tree (default: end of frames or script);
                         mark:NAME or mark:NAME+0.5 for a script mark's time (also --start)
+  --settle              run up to 3 zero-dt layout-callback passes before --snap/--tree capture
   --size WxH            viewport in points      --scale N   device scale (default 2)
   --theme dark|light    system appearance
   --scroll-bars MODE    scroll bars: when-scrolling (headless default), always, automatic
@@ -295,6 +377,17 @@ const HELP: &str = "usage: <app> [window]
   --realtime            headless: hold each frame until the wall clock reaches its time, and
                         print \"rune-mark NAME T\" as the script passes each mark,
                         and run on_ready after the first frame, as a window does
+  --window-script FILE.json   a real window replays the script's input on the wall clock from its
+                        first drawn frame (the same events --script takes) and ignores the
+                        system's pointer while it does: the --window KEY window, else the first;
+                        prints \"rune-script-window KEY\", \"rune-mark NAME T ELAPSED\", then
+                        \"rune-script-done T ELAPSED\", or \"rune-script-error T ELAPSED WHY\" and
+                        stops replaying (also when no frame is drawn within 10 s); a relaunch
+                        drops it. It cannot show: the system's pointer messages (WM_MOUSEMOVE,
+                        WM_MOUSEWHEEL) and their DPI and delta scaling, the system cursor and the
+                        system's own hover tracking, the custom caption buttons, overlay windows,
+                        the low-level mouse hook and press_point, or an engine's native windows
+                        (its dialogs, DevTools)
   --first-pixels        report when the first GPU-complete offscreen pixels are readable
   --window KEY         select a window for headless tools (run_windows, App::window)
   --list-windows       list window keys using a deterministic virtual display

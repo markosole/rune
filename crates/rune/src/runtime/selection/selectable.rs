@@ -105,11 +105,21 @@ pub(crate) fn unit_at(text: &str, i: usize, unit: Unit) -> (usize, usize) {
 
 /// Where each of `text`'s words ends, in order, the last at `text.len()`: ICU4X's dictionaries
 /// natively, the browser's (`Intl.Segmenter`) in a page and Windows' own (`icu.dll`) on Windows,
-/// which link none.
+/// which link none, with Chromium's tailoring (`foo.bar` is three words).
 fn word_ends(text: &str) -> impl Iterator<Item = usize> {
-    rune_text::segmenter::words(text).into_iter()
+    rune_text::segmenter::word_ends(text).into_iter()
 }
 
+/// A double-click's word on Windows takes the spaces after it along, as Chromium's does there
+/// (`select_trailing_whitespace_enabled`, measured on official OpenCode Desktop 2.4.0: `aaa bbb`
+/// selects `aaa `, `trail  ` selects `trail  `); a line break stays out, and a drag from it
+/// extends by plain words. Elsewhere the word as it is.
+pub(crate) fn with_trailing_space(text: &str, (a, b): (usize, usize)) -> (usize, usize) {
+    if !cfg!(target_os = "windows") || b > text.len() || text[a..b].trim().is_empty() {
+        return (a, b);
+    }
+    (a, text.len() - text[b..].trim_start_matches([' ', '\t']).len())
+}
 /// The selection a drag from unit range `origin` to unit range `at` makes: (anchor, focus).
 pub(crate) fn extend(origin: (usize, usize), at: (usize, usize)) -> (usize, usize) {
     if at.0 < origin.0 { (origin.1, at.0) } else { (origin.0, at.1.max(origin.1)) }
@@ -204,13 +214,19 @@ fn dist_x(r: [f32; 4], x: f32) -> f32 { (r[0] - x).max(x - r[2]).max(0.0) }
 /// key, so a keyed text keeps its selection when a sibling shifts an unkeyed ancestor's index.
 pub(in crate::runtime) fn same_keyed_path(a: &str, b: &str) -> bool {
     fn split(p: &str) -> Option<(&str, &str)> {
-        let last_key = p.rmatch_indices('/').find(|&(i, _)| !p[i + 1..].starts_with('#'))
-            .map_or_else(|| (!p.starts_with('#')).then_some(0), |(i, _)| Some(i + 1))?;
-        let end = last_key + p[last_key..].find('/').unwrap_or(p.len() - last_key);
+        let seg_end = |start: usize| start + p[start..].find('/').unwrap_or(p.len() - start);
+        let end = p.rmatch_indices('/').find_map(|(i, _)| {
+            let end = seg_end(i + 1);
+            (!element_path::is_unkeyed_segment(&p[i + 1..end])).then_some(end)
+        }).or_else(|| {
+            let end = seg_end(0);
+            (!element_path::is_unkeyed_segment(&p[..end])).then_some(end)
+        })?;
         Some((&p[..end], &p[end..]))
     }
     let (Some((ka, ta)), Some((kb, tb))) = (split(a), split(b)) else { return false };
-    ta == tb && ka.split('/').filter(|s| !s.starts_with('#')).eq(kb.split('/').filter(|s| !s.starts_with('#')))
+    ta == tb && ka.split('/').filter(|s| !element_path::is_unkeyed_segment(s))
+        .eq(kb.split('/').filter(|s| !element_path::is_unkeyed_segment(s)))
 }
 
 impl caret::TextInputState {
@@ -385,7 +401,7 @@ impl RuntimeCore {
         let ranges = self.selection_ranges();
         if ranges.is_empty() { return None; }
         let texts = ranges.iter().map(|&(i, a, b)| self.selected_piece(i, a..b, None)).collect();
-        Some(TextSelection { texts, text: self.joined(&ranges), backward: self.selection_backward() })
+        Some(TextSelection { texts, text: self.joined(&ranges), backward: self.selection_backward(), truncated: false })
     }
 
     /// [`Runtime::selection`] for a handler's `Tx`, kept until a commit or the selection changes.
@@ -444,6 +460,7 @@ impl RuntimeCore {
                     Rc::ptr_eq(a, b)
                         || (a.text == b.text
                             && a.backward == b.backward
+                            && a.truncated == b.truncated
                             && a.texts.len() == b.texts.len()
                             && a.texts.iter().zip(&b.texts).all(|(x, y)| {
                                 x.key == y.key
@@ -503,7 +520,7 @@ impl RuntimeCore {
                 .filter(|&j| match g { Some(g) => self.group_of(j) == Some(g), None => j == first })
                 .map(|j| self.selected_piece(j, range_in(&ranges, j).map_or(0..0, |(a, b)| a..b), Some(p)))
                 .collect();
-            if let Some(text) = f(&TextSelection { texts, text: drawn.clone(), backward: self.selection_backward() }) { return Some(text); }
+            if let Some(text) = f(&TextSelection { texts, text: drawn.clone(), backward: self.selection_backward(), truncated: false }) { return Some(text); }
         }
         (!drawn.is_empty()).then_some(drawn)
     }
@@ -562,7 +579,7 @@ impl RuntimeCore {
     }
 
     /// Byte offset of node `i`'s text under window point (x, y), where it was drawn this frame.
-    fn text_index_at(&self, i: usize, x: f32, y: f32) -> Option<usize> {
+    pub(in crate::runtime) fn text_index_at(&self, i: usize, x: f32, y: f32) -> Option<usize> {
         let n = &self.tree.nodes[i];
         let (spec, flow) = (n.text.as_ref()?, n.text_layout.as_ref()?.view());
         let s = self.env.scale;
@@ -647,9 +664,17 @@ impl RuntimeCore {
             _ => {
                 let unit = match clicks { 1 => Unit::Char, 2 => Unit::Word, _ => Unit::Paragraph };
                 let origin = self.unit_in(i, at, unit);
+                let origin = if unit == Unit::Word { with_trailing_space(&content, origin) } else { origin };
                 self.select_step(phase::Event::Press { path, content, unit, origin });
             }
         }
+    }
+
+    /// Snapshot of an in-progress text selection drag's endpoints, used to detect whether a
+    /// pointer move changed the painted selection.
+    pub(in crate::runtime) fn selection_drag_snapshot(&self) -> Option<(usize, usize, Option<String>)> {
+        let phase::Phase::Dragging { selection, .. } = &self.edit.selectable.phase else { return None };
+        Some((selection.anchor, selection.focus, selection.far.as_ref().map(|f| f.path.clone())))
     }
 
     /// The held press moved: extend the selection it started to the pointer, by its unit, into
@@ -768,6 +793,28 @@ mod tests {
         assert_eq!(unit_at(s, 5, Unit::Paragraph), (0, 21), "a paragraph takes its line break");
         assert_eq!(unit_at(s, 23, Unit::Paragraph), (21, s.len()));
         assert_eq!(unit_at("", 0, Unit::Word), (0, 0));
+    }
+
+    #[test]
+    fn words_break_as_chromium_breaks_them() {
+        // A full stop or colon between letters ends a word; between digits, and an apostrophe, don't.
+        let s = "foo.bar_baz qux";
+        assert_eq!(unit_at(s, 1, Unit::Word), (0, 3));
+        assert_eq!(unit_at(s, 3, Unit::Word), (3, 4));
+        assert_eq!(unit_at(s, 6, Unit::Word), (4, 11));
+        assert_eq!(unit_at("a:b c", 0, Unit::Word), (0, 1));
+        assert_eq!(unit_at("1,000.50 x", 2, Unit::Word), (0, 8));
+        assert_eq!(unit_at("can't stop", 1, Unit::Word), (0, 5));
+        assert_eq!(unit_at("user@example.com", 7, Unit::Word), (5, 12));
+    }
+
+    #[test]
+    fn a_double_click_word_takes_its_trailing_spaces_on_windows() {
+        let win = cfg!(target_os = "windows");
+        assert_eq!(super::with_trailing_space("aaa bbb", (0, 3)), if win { (0, 4) } else { (0, 3) });
+        assert_eq!(super::with_trailing_space("trail  ", (0, 5)), if win { (0, 7) } else { (0, 5) });
+        assert_eq!(super::with_trailing_space("end\nnext", (0, 3)), (0, 3), "a line break stays out");
+        assert_eq!(super::with_trailing_space("a  b", (1, 3)), (1, 3), "a run of spaces takes nothing more");
     }
 
     #[test]

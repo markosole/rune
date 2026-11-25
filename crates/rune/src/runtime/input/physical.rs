@@ -90,7 +90,7 @@ impl RuntimeCore {
         self.physical_then(app, event, Some(key), base, None);
     }
     /// Return whether the native host needs to request a frame for this event.
-    #[cfg_attr(any(target_os = "windows", target_os = "ios", target_os = "android"), allow(dead_code))]
+    #[cfg_attr(any(target_os = "windows", target_os = "ios", target_os = "android", target_arch = "wasm32"), allow(dead_code))]
     pub(crate) fn physical_with_fallback(&mut self, app: &mut dyn AppDriver, event: PhysicalInput, key: Option<KeyEvent>) -> bool {
         self.physical_then(app, event, key, None, None)
     }
@@ -127,7 +127,7 @@ impl RuntimeCore {
         merge(&mut self.frame.pending, tx);
         if consumed && live_only {
             self.frame.live_only_skips += 1;
-            self.frame.live.set();
+            if self.frame.has_live_subscriptions() { self.frame.live.set(); }
         } else {
             self.commit.dirty |= consumed;
         }
@@ -175,28 +175,21 @@ impl RuntimeCore {
                 ran
             }
             Some(Fallback { key, base, unhandled }) => {
-                if key.edit_command() == Some('v') && self.accepts_paste() {
-                    // Capture the target in event order, before another queued click can
-                    // change focus. An empty/image clipboard still consumes the command.
-                    self.edit.paste_request = Some(self.paste_target());
-                    false
-                } else {
-                    let mut one = Tx { physical_key: code, key_base: base, ..self.transaction(app) };
-                    let ran = self.route_key(app, &key, repeat, &mut one);
-                    // A held key repeats a menu item, as AppKit's own equivalents do, but closes once.
-                    let unhandled = unhandled.filter(|u| !ran && (!repeat || matches!(u, Unhandled::Menu(_))));
-                    let fell = unhandled.is_some();
-                    match unhandled {
-                        Some(Unhandled::Close) => one.close_window(),
-                        Some(Unhandled::Minimize) => one.minimize(),
-                        Some(Unhandled::Menu(run)) => run(),
-                        Some(Unhandled::WindowMenu) => self.request_window_menu(),
-                        None => {}
-                    }
-                    fold_live(&mut live, ran || fell, &one);
-                    merge(tx, one);
-                    ran || fell
+                let mut one = Tx { physical_key: code, key_base: base, ..self.transaction(app) };
+                let ran = self.route_key(app, &key, repeat, &mut one);
+                // A held key repeats a menu item, as AppKit's own equivalents do, but closes once.
+                let unhandled = unhandled.filter(|u| !ran && (!repeat || matches!(u, Unhandled::Menu(_))));
+                let fell = unhandled.is_some();
+                match unhandled {
+                    Some(Unhandled::Close) => one.request_user_close(),
+                    Some(Unhandled::Minimize) => one.minimize(),
+                    Some(Unhandled::Menu(run)) => run(),
+                    Some(Unhandled::WindowMenu) => self.request_window_menu(),
+                    None => {}
                 }
+                fold_live(&mut live, ran || fell, &one);
+                merge(tx, one);
+                ran || fell
             }
             None => false,
         };
@@ -227,6 +220,7 @@ impl RuntimeCore {
     /// Focus moving off an element inside the window: its handler hears `FocusLost`, and
     /// modifier keys stay held.
     pub(in crate::runtime) fn physical_focus_lost(&mut self, app: &mut dyn AppDriver) -> bool {
+        self.kbd.disarm_direction_chord();
         let mut tx = Tx::default();
         let changed = self.offer_physical(app, &PhysicalInput::FocusLost, &mut tx, &mut None);
         self.latch_requests(app, &mut tx);

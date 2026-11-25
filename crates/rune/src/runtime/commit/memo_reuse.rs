@@ -136,6 +136,9 @@ pub(in crate::runtime) struct MemoFlattenCtx<'a> {
     pub(in crate::runtime) next_id: &'a mut u64,
     /// What text, icons and text fields without their own colour draw in (`Cx::foreground`).
     pub(in crate::runtime) foreground: Option<Color>,
+    /// Set when flattening falls through on an unexpanded `HAS_VIRTUAL` memo placeholder whose
+    /// virtual lists `keeps_windows` skipped populating.
+    pub(in crate::runtime) missed_virtual_memo: bool,
 }
 
 fn opt_rc_eq<T: ?Sized>(a: &Option<Rc<T>>, b: &Option<Rc<T>>) -> bool {
@@ -157,11 +160,11 @@ fn opt_box_eq<T: PartialEq>(a: &Option<Box<T>>, b: &Option<Box<T>>) -> bool {
 fn same_visual_cold(a: &crate::el::VisualCold, b: &crate::el::VisualCold) -> bool {
     let crate::el::VisualCold {
         surface, surface_place, border_bottom, border_sides, border_layout, border_dash, border_dash_phase, shadows, blur_motion,
-        clip, clip_radius, clip_corners, cutout, icon, icon_inked, icon_one_color, gradient, radial, outline, shape,
-        grid, pixels, pixels_fit, effect, backdrop_blur, hover_motion, hover_within,
+        clip, clip_radius, clip_corners, cutouts, icon, icon_inked, icon_one_color, gradient, radial, outline, shape,
+        grid, pixels, pixels_fit, pixels_wrap, pixels_tint, image_filter, effect, backdrop_blur, hover_motion, hover_within, press_motion,
         group_opacity, group_color, hover_alone, hover_share, icon_turn, cache_key, offset_motion, scale_motion,
-        origin, rotate_motion, child_exit, enter_delay, motion_intent, instant_motion, clip_to_content, flight_crop,
-        hold_landing, row_face, press_color, paint_contain, motion_snaps, hairline, offset, paint_alpha, layer_opacity, blur, rotate, mark, mirror_rtl, paint_order,
+        origin, rotate_motion, child_exit, enter_delay, motion_intent, instant_motion, clip_to_content, flight_crop, flight_in_place,
+        hold_landing, row_face, press_color, hover_fill, press_fill, hover_border, press_border, paint_contain, motion_snaps, hairline, offset, paint_alpha, layer_opacity, blur, rotate, mark, mirror_rtl, paint_order,
     } = b;
     (match (&a.surface, surface) {
         (None, None) => true,
@@ -170,7 +173,7 @@ fn same_visual_cold(a: &crate::el::VisualCold, b: &crate::el::VisualCold) -> boo
     }) && a.surface_place == *surface_place && a.border_bottom == *border_bottom && a.border_sides == *border_sides && a.border_layout == *border_layout && a.border_dash == *border_dash
         && a.border_dash_phase == *border_dash_phase && a.shadows == *shadows
         && opt_box_eq(&a.blur_motion, blur_motion) && a.clip == *clip
-        && a.clip_radius == *clip_radius && a.clip_corners == *clip_corners && a.cutout == *cutout
+        && a.clip_radius == *clip_radius && a.clip_corners == *clip_corners && a.cutouts == *cutouts
         && match (&a.icon, icon) {
             (None, None) => true,
             (Some((ia, ca)), Some((ib, cb))) => std::ptr::eq(*ia, *ib) && ca == cb,
@@ -190,8 +193,13 @@ fn same_visual_cold(a: &crate::el::VisualCold, b: &crate::el::VisualCold) -> boo
             (Some(pa), Some(pb)) => Arc::ptr_eq(&pa.source, &pb.source),
             _ => false,
         }
-        && a.pixels_fit == *pixels_fit && a.effect == *effect && a.backdrop_blur == *backdrop_blur
+        && a.pixels_fit == *pixels_fit && a.pixels_wrap == *pixels_wrap && a.pixels_tint == *pixels_tint && a.image_filter == *image_filter && a.effect == *effect && a.backdrop_blur == *backdrop_blur
         && opt_rc_eq(&a.hover_motion, hover_motion) && opt_rc_eq(&a.hover_within, hover_within)
+        && match (&a.press_motion, press_motion) {
+            (None, None) => true,
+            (Some(x), Some(y)) => Rc::ptr_eq(x, y) || **x == **y,
+            _ => false,
+        }
         && a.group_opacity == *group_opacity && a.group_color == *group_color && a.hover_alone == *hover_alone && a.hover_share == *hover_share
         && a.icon_turn == *icon_turn && a.cache_key == *cache_key
         && opt_box_eq(&a.offset_motion, offset_motion) && opt_box_eq(&a.scale_motion, scale_motion)
@@ -200,7 +208,10 @@ fn same_visual_cold(a: &crate::el::VisualCold, b: &crate::el::VisualCold) -> boo
         && a.motion_intent == *motion_intent && a.instant_motion == *instant_motion
         && a.clip_to_content == *clip_to_content
         && a.flight_crop == *flight_crop
-        && a.row_face == *row_face && a.hold_landing == *hold_landing && a.press_color == *press_color && a.paint_contain == *paint_contain && a.motion_snaps == *motion_snaps && a.hairline == *hairline
+        && a.flight_in_place == *flight_in_place
+        && a.row_face == *row_face && a.hold_landing == *hold_landing && a.press_color == *press_color
+        && a.hover_fill == *hover_fill && a.press_fill == *press_fill && a.hover_border == *hover_border && a.press_border == *press_border
+        && a.paint_contain == *paint_contain && a.motion_snaps == *motion_snaps && a.hairline == *hairline
         && a.offset == *offset && a.paint_alpha == *paint_alpha && a.layer_opacity == *layer_opacity
         && a.blur == *blur && a.rotate == *rotate && a.mark == *mark && a.mirror_rtl == *mirror_rtl && a.paint_order == *paint_order
 }
@@ -214,17 +225,20 @@ pub(in crate::runtime) fn same_visual(a: &Visual, b: &Visual) -> bool {
 
 fn same_el_cold(a: &crate::el::ElCold, b: &crate::el::ElCold) -> bool {
     let crate::el::ElCold {
-        focus, looping, trace_name, trace_namespace, role, label, live, above, motion, opacity_motion, lead,
-        animated_changes, option_as_alt, transition, matched, scroll, scroll_axes, sticky, scroll_edges, growth, virtual_estimate, virtual_rows,
-        virtual_rows_version, glide, input, time_scale, help, help_cut, help_side, help_open, material, aspect_fit, list_disc, a11y, wheel_scrolls,
+        focus, looping, loop_times, trace_name, trace_namespace, role, label, live, above, above_boundary, motion, frame_motion, opacity_motion, lead,
+        animated_changes, option_as_alt, window_resize, transition, transition_motion, enter_in_instant, matched, matched_motion, scroll, scroll_axes, sticky, scroll_edges, growth, virtual_estimate, virtual_rows,
+        virtual_rows_version, virtual_rows_append_only, virtual_overscan, glide, input, time_scale, help, help_cut, help_side, help_open, material, aspect_fit, list_disc, a11y, wheel_scrolls, on_path,
         expanded_memo: _,
         #[cfg(debug_assertions)]
         scroll_source: _,
         #[cfg(debug_assertions)]
         virtual_source: _,
+        #[cfg(debug_assertions)]
+        virtual_append_source: _,
     } = b;
     crate::cold::Cold::ptr_eq(&a.focus, focus)
         && opt_box_eq(&a.looping, looping)
+        && a.loop_times == *loop_times
         && a.trace_name == *trace_name
         && a.trace_namespace == *trace_namespace
         && a.role == *role
@@ -232,13 +246,19 @@ fn same_el_cold(a: &crate::el::ElCold, b: &crate::el::ElCold) -> bool {
         && a.live.is_empty()
         && live.is_empty()
         && a.above == *above
+        && a.above_boundary == *above_boundary
         && a.motion == *motion
+        && opt_box_eq(&a.frame_motion, frame_motion)
         && opt_box_eq(&a.opacity_motion, opacity_motion)
         && a.lead == *lead
         && a.animated_changes == *animated_changes
         && a.option_as_alt == *option_as_alt
+        && a.window_resize == *window_resize
         && opt_box_eq(&a.transition, transition)
+        && opt_box_eq(&a.transition_motion, transition_motion)
+        && a.enter_in_instant == *enter_in_instant
         && a.matched == *matched
+        && opt_box_eq(&a.matched_motion, matched_motion)
         && a.scroll == *scroll
         && a.scroll_axes == *scroll_axes
         && opt_box_eq(&a.sticky, sticky)
@@ -247,6 +267,8 @@ fn same_el_cold(a: &crate::el::ElCold, b: &crate::el::ElCold) -> bool {
         && a.virtual_estimate == *virtual_estimate
         && opt_rc_eq(&a.virtual_rows, virtual_rows)
         && a.virtual_rows_version == *virtual_rows_version
+        && a.virtual_rows_append_only == *virtual_rows_append_only
+        && a.virtual_overscan == *virtual_overscan
         && a.glide == *glide
         && a.input.is_none()
         && input.is_none()
@@ -260,6 +282,7 @@ fn same_el_cold(a: &crate::el::ElCold, b: &crate::el::ElCold) -> bool {
         && a.aspect_fit == *aspect_fit
         && a.a11y == *a11y
         && a.wheel_scrolls == *wheel_scrolls
+        && opt_rc_eq(&a.on_path, on_path)
 }
 
 fn same_gestures(
@@ -269,11 +292,9 @@ fn same_gestures(
     match (a, b) {
         (None, None) => true,
         (Some(x), Some(y)) => {
-            x.buttons == y.buttons
-                && opt_rc_eq(&x.wheel, &y.wheel)
-                && opt_rc_eq(&x.magnify, &y.magnify)
-                && opt_rc_eq(&x.rotate, &y.rotate)
-                && opt_rc_eq(&x.smart_magnify, &y.smart_magnify)
+            let crate::input::canvas_input::CanvasInput { wheel, magnify, rotate, smart_magnify, button, buttons } = &**y;
+            x.buttons == *buttons && opt_rc_eq(&x.wheel, wheel) && opt_rc_eq(&x.magnify, magnify)
+                && opt_rc_eq(&x.rotate, rotate) && opt_rc_eq(&x.smart_magnify, smart_magnify) && opt_rc_eq(&x.button, button)
         }
         _ => false,
     }
@@ -305,6 +326,7 @@ fn same_handlers(
         return true;
     }
     let crate::el::Handlers {
+        on_a11y_action,
         on_paste,
         on_window_focus,
         on_spellcheck,
@@ -314,9 +336,13 @@ fn same_handlers(
         on_double_press,
         on_secondary_press,
         on_middle_press,
+        on_any_press,
         on_hover,
         on_hover_change,
+        on_focus_change,
+        on_focus_within_change,
         hover_delay,
+        hover_tracks_bounds,
         on_pointer_move,
         gestures,
         on_drag,
@@ -334,17 +360,20 @@ fn same_handlers(
         on_screen_layout,
         on_drawn_layout,
         on_visible,
+        on_mount,
         drawn_rect,
         on_scroll_offset,
         selection_copy,
         on_selection_change,
         cursor,
         press_scale,
+        press_offset,
         #[cfg(debug_assertions)]
         sites: _,
     } = &**b;
     a.modal.is_none()
         && modal.is_none()
+        && opt_rc_eq(&a.on_a11y_action, on_a11y_action)
         && match (&a.on_paste, on_paste) {
             (None, None) => true,
             (Some(pa), Some(pb)) => pa.rich == pb.rich && Rc::ptr_eq(&pa.call, &pb.call),
@@ -361,9 +390,13 @@ fn same_handlers(
         && opt_rc_eq(&a.on_double_press, on_double_press)
         && opt_rc_eq(&a.on_secondary_press, on_secondary_press)
         && opt_rc_eq(&a.on_middle_press, on_middle_press)
+        && opt_rc_eq(&a.on_any_press, on_any_press)
         && opt_rc_eq(&a.on_hover, on_hover)
         && opt_rc_eq(&a.on_hover_change, on_hover_change)
+        && opt_rc_eq(&a.on_focus_change, on_focus_change)
+        && opt_rc_eq(&a.on_focus_within_change, on_focus_within_change)
         && a.hover_delay == *hover_delay
+        && a.hover_tracks_bounds == *hover_tracks_bounds
         && opt_rc_eq(&a.on_pointer_move, on_pointer_move)
         && same_gestures(&a.gestures, gestures)
         && opt_rc_eq(&a.on_drag, on_drag)
@@ -385,6 +418,7 @@ fn same_handlers(
         && opt_rc_eq(&a.on_screen_layout, on_screen_layout)
         && opt_rc_eq(&a.on_drawn_layout, on_drawn_layout)
         && opt_rc_eq(&a.on_visible, on_visible)
+        && opt_rc_eq(&a.on_mount, on_mount)
         && match (&a.drawn_rect, drawn_rect) {
             (None, None) => true,
             (Some(la), Some(lb)) => std::sync::Arc::ptr_eq(&la.source, &lb.source),
@@ -395,6 +429,7 @@ fn same_handlers(
         && opt_rc_eq(&a.on_selection_change, on_selection_change)
         && a.cursor == *cursor
         && a.press_scale == *press_scale
+        && a.press_offset == *press_offset
 }
 
 /// Exhaustively checks that `el` has not been mutated by builders after `Built::placeholder`
@@ -483,7 +518,7 @@ fn path_matches(old_path: &str, parent_path: &str, key: Option<&str>, index: usi
         rest
     };
     match key {
-        Some(k) => tail == k,
+        Some(k) => !tail.contains('/') && super::path::segment_matches_key(tail, k),
         None => tail.strip_prefix('#').is_some_and(|n| !n.contains('/') && n.parse::<usize>().ok() == Some(index)),
     }
 }
@@ -533,6 +568,9 @@ pub(in crate::runtime) fn try_reuse_memo(
 
     let old_root_path = old_slice[0].path.as_str();
     let same_path = path_matches(old_root_path, parent_path, el.key.as_deref(), index);
+    if !same_path && built.has_path_bind {
+        return None;
+    }
     let new_start = nodes.len();
     let moved = same_path && ctx.committing;
     let root_taffy = old_slice[0].taffy;

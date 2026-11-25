@@ -5,6 +5,16 @@ use crate::runtime::scroll_mode::{self, Event as ModeEvent};
 /// Scroll momentum decay (iOS normal: 0.998 per ms).
 pub(in crate::runtime) const SCROLL_DECAY: f32 = 2.002;
 
+/// One `El::matched` handover recorded during a frame, before the frame's paint pass computes
+/// `to_id`'s drawn rect.
+pub(in crate::runtime) struct RecordedHandover {
+    pub(in crate::runtime) from_path: String,
+    pub(in crate::runtime) to_path: String,
+    pub(in crate::runtime) to_id: NodeId,
+    pub(in crate::runtime) from_rect: [f32; 4],
+    pub(in crate::runtime) start_rect: [f32; 4],
+}
+
 /// Retained render-side motion state: growth stacks, streaming word reveals, matched/launch/text
 /// flights, loops and rewind capture. Ordered hot-first under `#[repr(C)]` so `flying`, `flights`,
 /// frame flags and `loops` read during the paint walk sit together and first.
@@ -43,6 +53,8 @@ pub(crate) struct MotionState {
     reveal_chain: RevealChain,
     /// The last commit's `El::matched` ids, one present element each (the last in tree order).
     pub(super) matched: Vec<(Rc<str>, NodeId)>,
+    /// `El::matched` handovers completed during the current frame, cleared when the next frame begins.
+    handovers: Vec<RecordedHandover>,
     pub(super) loop_clock: loop_clock::LoopClock,
     /// `motion_elements`' per-node scratch, kept so a frame doesn't allocate.
     pub(in crate::runtime) motion_scratch: std::cell::RefCell<Vec<(u32, u16, bool)>>,
@@ -50,6 +62,9 @@ pub(crate) struct MotionState {
     pub(super) rewind: Option<crate::rewind::Rewind>,
     #[cfg(debug_assertions)]
     pub(super) matched_warned: HashSet<Rc<str>>,
+    /// Candidate nodes inspected by `end_unseen_exits`, for tests.
+    #[cfg(test)]
+    pub(in crate::runtime) unseen_exit_checks: u64,
 }
 
 impl MotionState {
@@ -77,11 +92,14 @@ impl MotionState {
             reveals_kept: Vec::new(),
             reveal_chain: RevealChain::default(),
             matched: Vec::new(),
+            handovers: Vec::new(),
             loop_clock: Default::default(),
             motion_scratch: Default::default(),
             rewind: None,
             #[cfg(debug_assertions)]
             matched_warned: HashSet::default(),
+            #[cfg(test)]
+            unseen_exit_checks: 0,
         }
     }
 
@@ -273,6 +291,32 @@ impl MotionState {
     }
 
     #[inline]
+    pub(in crate::runtime) fn clear_handovers(&mut self) {
+        self.handovers.clear();
+    }
+
+    #[inline]
+    pub(in crate::runtime) fn handovers(&self) -> &[RecordedHandover] {
+        &self.handovers
+    }
+
+    /// Records a matched handover for the current frame, collapsing chained commits (`A -> B -> C`
+    /// into `A -> C`, or dropping `A -> B -> A`) within the same frame.
+    pub(in crate::runtime) fn record_handover(&mut self, h: RecordedHandover) {
+        if let Some(pos) = self.handovers.iter().position(|prev| prev.to_path == h.from_path) {
+            if self.handovers[pos].from_path == h.to_path {
+                self.handovers.remove(pos);
+            } else {
+                self.handovers[pos].to_path = h.to_path;
+                self.handovers[pos].to_id = h.to_id;
+                self.handovers[pos].start_rect = h.start_rect;
+            }
+            return;
+        }
+        self.handovers.push(h);
+    }
+
+    #[inline]
     pub(in crate::runtime) fn set_rewind(&mut self, rewind: Option<crate::rewind::Rewind>) {
         self.rewind = rewind;
     }
@@ -378,9 +422,13 @@ impl MotionState {
             for n in nodes {
                 let t = if time_scaled { scene.store().node_time(n.id) } else { t };
                 if let Some(&spec) = n.looping.as_deref() {
+                    let times = n.cold.get().and_then(|c| c.loop_times);
                     let start = self.loop_start(scene, n.id, t);
-                    let track = self.loops.entry(n.id).and_modify(|l| { l.retime(spec, t); l.enabled(true, t); })
-                        .or_insert_with(|| rune_motion::LoopTrack::new(spec, start));
+                    let track = self.loops.entry(n.id).and_modify(|l| { l.retime_with_times(spec, times, t); l.enabled(true, t); })
+                        .or_insert_with(|| match times {
+                            Some(count) => rune_motion::LoopTrack::with_times(spec, count, start),
+                            None => rune_motion::LoopTrack::new(spec, start),
+                        });
                     if land_loops { track.finish(); }
                 } else if let Some(l) = self.loops.get_mut(&n.id) {
                     l.enabled(false, t);
@@ -670,21 +718,30 @@ impl RuntimeCore {
             st.max = overflow.max(0.0);
             match st.mode {
                 ScrollMode::Pinned(_) if sp.stick_bottom => {
+                    let before = st.offset;
                     // A reader stuck on a shrinking stack's end doesn't rise with its rows' last fraction.
                     st.offset = laid.filter(|&end| st.offset <= end + 1e-6).map_or(st.max, |end| st.max.min(end));
+                    if (st.offset - before).abs() > 1e-6 { st.note_source(crate::ScrollSource::Programmatic); }
                 }
-                ScrollMode::Glide { .. } => moving |= scroll_bottom::glide(st, dt),
+                ScrollMode::Glide { .. } => {
+                    let before = st.offset;
+                    moving |= scroll_bottom::glide(st, dt);
+                    if (st.offset - before).abs() > 1e-6 { st.note_source(crate::ScrollSource::Programmatic); }
+                }
                 ScrollMode::Momentum { v, .. } if v.abs() > 1.0 => {
+                    let before = st.offset;
                     // Exact for exponential decay, so a long frame carries the same distance as
                     // the short frames it stands for.
                     let decay = (-SCROLL_DECAY * dt).exp();
                     st.offset += f64::from(v * (1.0 - decay) / SCROLL_DECAY);
                     let edge = st.offset <= 0.0 || st.offset >= st.max;
                     st.mode = if edge { st.mode.to_rest() } else { st.mode.to_momentum(v * decay) };
+                    if (st.offset - before).abs() > 1e-6 { st.note_source(crate::ScrollSource::Momentum); }
                     moving = true;
                 }
                 ScrollMode::Momentum { .. } => st.mode = st.mode.to_rest(),
                 ScrollMode::Wheel { mut curve, .. } => {
+                    let before = st.offset;
                     curve.follow(st.offset);
                     // An end that shrank under the ease takes its target with it; one that grew does
                     // too when the wheel was sent to the end of a viewport that follows its bottom
@@ -698,6 +755,7 @@ impl RuntimeCore {
                     curve.applied(st.offset);
                     // The hand moved it: the app hears a wheel's ease as the wheel.
                     st.moved();
+                    if (st.offset - before).abs() > 1e-6 { st.note_source(crate::ScrollSource::Direct); }
                     // An ease sent to a following viewport's end pins the frame it gets there, though
                     // the end growing under it restarts its segment every frame a reply grows.
                     let pins = sp.stick_bottom && curve.to_end() && st.offset == st.max;
@@ -705,7 +763,11 @@ impl RuntimeCore {
                 }
                 ScrollMode::Pinned(_) | ScrollMode::Rest(_) => {}
             }
-            st.offset = st.offset.clamp(0.0, st.max);
+            let clamped = st.offset.clamp(0.0, st.max);
+            if (clamped - st.offset).abs() > 1e-6 {
+                st.offset = clamped;
+                st.note_source(crate::ScrollSource::Programmatic);
+            }
             // Landed on a shrinking stack's new end: stick once its rows are within half a point
             // of it, not while they're still short of it. A glide that reaches the end hands it
             // to the pin.

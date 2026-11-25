@@ -10,6 +10,8 @@ pub(crate) struct HostState {
     pub(in crate::runtime) zoom: zoom::Zoom,
     pub(in crate::runtime) titlebar: titlebar::Titlebar,
     pub(in crate::runtime) titlebar_inset: f32,
+    pub(in crate::runtime) maximized: bool,
+    pub(in crate::runtime) full_screen: bool,
     pub(in crate::runtime) system_reduced_motion: bool,
     /// The OS text-only scale, independent of display DPI and [`Cx::zoom`](crate::Cx::zoom).
     pub(in crate::runtime) system_text_scale: f32,
@@ -19,6 +21,10 @@ pub(crate) struct HostState {
     /// What [`Cx::system_increased_contrast`] reports.
     pub(in crate::runtime) system_increased_contrast: bool,
     pub(in crate::runtime) scroll_bars: system_settings::ScrollBarHost,
+    /// Preferred languages set via `Runtime::set_languages` or browser `languagechange` (`None`: lazy OS query).
+    pub(in crate::runtime) system_languages: Option<Rc<[String]>>,
+    /// Incremented whenever `system_languages` changes, so memos rebuild without querying the OS.
+    pub(in crate::runtime) languages_gen: u64,
     pub(crate) native_overlay: bool,
     /// The window or overlay surface's frame counts, published by its host.
     pub(crate) surface_stats: Option<std::sync::Arc<std::sync::Mutex<crate::SurfaceStats>>>,
@@ -35,20 +41,40 @@ pub(crate) struct HostState {
     pub(crate) window_frame: Option<crate::window::frame::FrameRequest>,
     /// The window's title (`Tx::set_title`), from `AppSpec`'s.
     pub(crate) window_title: Title,
+    /// Per-window native color scheme requested via `Tx::set_color_scheme`, taken by the host.
+    pub(crate) window_color_scheme: Option<crate::ColorScheme>,
+    /// macOS document path (`MacWindowOptions::represented_file`, `Tx::set_represented_file`).
+    pub(crate) represented_file: Latched<Option<std::path::PathBuf>>,
+    /// macOS document edited dot (`MacWindowOptions::document_edited`, `Tx::set_document_edited`).
+    pub(crate) document_edited: Latched<bool>,
     /// The window's height follows the root's natural height (`App::fit_content_height`).
     pub(crate) fit_height: bool,
     /// The height a window that fits its content last asked for, and the frame its move
     /// starts with. The host takes the hold as it starts the move.
     pub(crate) fit: FitWindow,
+    /// A user-initiated close request (`Tx::request_user_close`) waiting for the host's
+    /// `close_requested` gate.
+    pub(crate) user_close_request: bool,
     /// A handler or `update` asked to minimize the window (`Tx::minimize`); the shell takes it,
     /// after a show the same turn asked for (`window::Minimize`).
     pub(crate) minimize: crate::window::Minimize,
     /// Links handlers asked to open that this runtime left unopened (`Runtime::take_url_requests`).
     url_requests: Vec<String>,
+    /// Local paths handlers asked to open or reveal that this runtime left unopened (`Runtime::take_path_requests`).
+    path_requests: Vec<crate::open_path::PathRequest>,
     /// True when attached to a live window, overlay or web canvas, not a headless or scripted run.
     pub(crate) open_urls_natively: bool,
     /// Pop-up menus asked for (`Tx::popup_menu`) and not yet answered, oldest first.
     pub(in crate::runtime) popups: popup_dispatch::Popups,
+    /// Pending text-field menu delivered to `App::on_field_menu`, awaiting `Tx::resolve_field_menu`.
+    pub(in crate::runtime) field_menu_fallback: Option<Box<crate::runtime::field_menu::PendingFieldMenu>>,
+    /// Monotonic token tagging each opened fallback field menu so a deferred pick never matches a newer menu.
+    pub(in crate::runtime) field_menu_seq: u64,
+    /// `Tx::resolve_field_menu(Some(id))` deferred until after the frame's commit unmounts a closing modal.
+    pub(in crate::runtime) deferred_field_menu_pick: Option<(u64, String)>,
+    /// Test-only seam forcing `App::on_field_menu` even where `popup_menu_supported()` is true.
+    #[cfg(test)]
+    pub(in crate::runtime) force_field_menu_fallback: bool,
     /// The file dialog asked for (`Tx::open_file`, `Tx::save_file`) and not yet answered.
     pub(in crate::runtime) file_dialog: crate::file_dialog::DialogState,
     /// File dialog callbacks, by id, until their answer runs.
@@ -71,12 +97,16 @@ impl HostState {
             zoom: zoom::Zoom { k: 1.0, window: viewport, window_scale: env.scale },
             titlebar: Default::default(),
             titlebar_inset: 0.0,
+            maximized: false,
+            full_screen: false,
             system_reduced_motion: false,
             system_text_scale: 1.0,
             system_accent: crate::SystemAccent::DEFAULT,
             system_contrast: None,
             system_increased_contrast: false,
             scroll_bars: Default::default(),
+            system_languages: None,
+            languages_gen: 0,
             native_overlay: false,
             surface_stats: None,
             app_stats: None,
@@ -86,12 +116,22 @@ impl HostState {
             window_resting: false,
             window_frame: None,
             window_title: Default::default(),
+            window_color_scheme: None,
+            represented_file: Default::default(),
+            document_edited: Default::default(),
             fit_height: false,
             fit: Default::default(),
+            user_close_request: false,
             minimize: Default::default(),
             url_requests: Vec::new(),
+            path_requests: Vec::new(),
             open_urls_natively: false,
             popups: Default::default(),
+            field_menu_fallback: None,
+            field_menu_seq: 0,
+            deferred_field_menu_pick: None,
+            #[cfg(test)]
+            force_field_menu_fallback: false,
             file_dialog: Default::default(),
             file_dialog_answers: Vec::new(),
             next_file_dialog: 0,
@@ -124,6 +164,18 @@ impl HostState {
     #[inline]
     pub(crate) fn push_url_request(&mut self, url: String) {
         self.url_requests.push(url);
+    }
+
+    /// Takes the local path requests handlers asked to open or reveal that this runtime didn't
+    /// execute natively: all of them in a headless run or test, none in a window.
+    #[inline]
+    pub(crate) fn take_path_requests(&mut self) -> Vec<crate::open_path::PathRequest> {
+        std::mem::take(&mut self.path_requests)
+    }
+
+    #[inline]
+    pub(crate) fn push_path_request(&mut self, request: crate::open_path::PathRequest) {
+        self.path_requests.push(request);
     }
 
     #[inline]
@@ -183,6 +235,7 @@ impl HostState {
         let request = crate::window::frame::FrameRequest {
             size: Some((viewport.0, height)), animate: !jump,
             spring: (!jump).then(|| tx.motion.map_or(crate::tok::motion::DEFAULT, MotionSource::spring)), center: false,
+            resize_drag: None,
         };
         self.window_frame = Some(self.window_frame.unwrap_or_default().merge(request));
     }
@@ -263,6 +316,83 @@ impl Title {
             (_, TitleEvent::Set(title)) => (Title::Pending(title), false),
             (Title::Pending(title), TitleEvent::Shown) => (Title::Shown(title), true),
             (title, TitleEvent::Shown) => (title, false),
+        }
+    }
+}
+
+/// A latched host-window property seeded from creation options and updated by `Tx`.
+/// Deduplicates repeated sets to the currently applied value, cancels a pending change if a
+/// later `Tx` reverts back to the applied value before the host takes it, and retains the
+/// latest value across native window recreation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Latched<T> {
+    #[default]
+    Unset,
+    /// Value already applied to the native window (or seeded at creation).
+    Applied(T),
+    /// Value updated via `Tx` that differs from `applied` and awaits `Host::shell`.
+    Pending { applied: Option<T>, next: T },
+}
+
+enum LatchedEvent<T> {
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    Seed(T),
+    Set(T),
+    TakeChange,
+    MarkApplied,
+}
+
+impl<T: PartialEq> Latched<T> {
+    /// Seeds the initial creation-time value before any `Tx` update runs.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn seed(&mut self, value: T) {
+        *self = std::mem::take(self).step(LatchedEvent::Seed(value)).0;
+    }
+
+    /// Latches a new requested value from `Tx`.
+    pub(crate) fn set(&mut self, value: T) {
+        *self = std::mem::take(self).step(LatchedEvent::Set(value)).0;
+    }
+
+    /// Returns the latest value (applied or pending) for native creation/recreation.
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+    pub(crate) fn current(&self) -> Option<&T> {
+        match self {
+            Latched::Unset => None,
+            Latched::Applied(v) | Latched::Pending { next: v, .. } => Some(v),
+        }
+    }
+
+    /// Marks the current value as already applied to a freshly created native window.
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+    pub(crate) fn mark_applied(&mut self) {
+        *self = std::mem::take(self).step(LatchedEvent::MarkApplied).0;
+    }
+
+    /// Takes a pending change for the host to apply, transitioning it to `Applied`.
+    pub(crate) fn take_change(&mut self) -> Option<&T> {
+        let (next, changed) = std::mem::take(self).step(LatchedEvent::TakeChange);
+        *self = next;
+        if !changed { return None; }
+        match &*self {
+            Latched::Applied(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    fn step(self, event: LatchedEvent<T>) -> (Self, bool) {
+        match (self, event) {
+            (Latched::Unset, LatchedEvent::Seed(v)) => (Latched::Applied(v), false),
+            (state, LatchedEvent::Seed(_)) => (state, false),
+            (Latched::Unset, LatchedEvent::Set(v)) => (Latched::Pending { applied: None, next: v }, false),
+            (Latched::Applied(a), LatchedEvent::Set(v)) if a == v => (Latched::Applied(a), false),
+            (Latched::Applied(a), LatchedEvent::Set(v)) => (Latched::Pending { applied: Some(a), next: v }, false),
+            (Latched::Pending { applied: Some(a), .. }, LatchedEvent::Set(v)) if a == v => (Latched::Applied(a), false),
+            (Latched::Pending { applied, .. }, LatchedEvent::Set(v)) => (Latched::Pending { applied, next: v }, false),
+            (Latched::Pending { next, .. }, LatchedEvent::TakeChange) => (Latched::Applied(next), true),
+            (state, LatchedEvent::TakeChange) => (state, false),
+            (Latched::Pending { next, .. }, LatchedEvent::MarkApplied) => (Latched::Applied(next), false),
+            (state, LatchedEvent::MarkApplied) => (state, false),
         }
     }
 }
@@ -349,6 +479,18 @@ impl RuntimeCore {
     #[inline]
     pub(super) fn fit_frame_holds(&mut self) -> bool {
         self.host.fit_frame_holds()
+    }
+
+    /// Takes a pending user-initiated close request (`Tx::request_user_close`).
+    #[inline]
+    pub(crate) fn take_user_close_request(&mut self) -> bool {
+        std::mem::take(&mut self.host.user_close_request)
+    }
+
+    /// Whether a user-initiated close request is pending for the host.
+    #[inline]
+    pub(crate) fn has_user_close_request(&self) -> bool {
+        self.host.user_close_request
     }
 }
 

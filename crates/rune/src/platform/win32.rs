@@ -29,15 +29,39 @@ mod pointer;
 pub(crate) use rune_text::segmenter;
 pub(crate) mod session_lock;
 pub(crate) mod taskbar;
+mod window_options;
 
 pub(crate) use cloak::Cloak;
 pub(crate) use dpi_drag::follow_suggested_rect;
 pub(crate) use dpi_drag::in_size_move;
 pub(crate) use frame::CustomFrame;
+pub(crate) use frame::DragHitSync;
+pub(crate) use frame::DragRegions;
 pub(crate) use frame::has_window_menu;
 pub(crate) use frame::request_inner_size;
 pub(crate) use frame::window_menu;
 pub(crate) use placement::restore_frame;
+pub(crate) use window_options::{
+    apply_hwnd_styles, apply_window_styles, configure_window, set_exclude_from_capture,
+    set_hwnd_exclude_from_capture,
+};
+
+/// Whether this process is running under Wine or Proton (`ntdll.dll` exports `wine_get_version`).
+/// Called only on DirectComposition error paths to add a hint — never at launch.
+#[allow(unsafe_code)]
+pub(crate) fn running_under_wine() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    const NTDLL: [u16; 10] = [
+        b'n' as u16, b't' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
+        b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16, 0,
+    ];
+    // SAFETY: `ntdll.dll` is already loaded in every Windows/Wine process; `GetModuleHandleW`
+    // does not load any DLL and `GetProcAddress` only inspects its export table.
+    unsafe {
+        let ntdll = GetModuleHandleW(NTDLL.as_ptr());
+        !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+    }
+}
 
 /// Loads a Windows system DLL from System32 only, never from the application directory or CWD.
 /// Rejects names containing path separators or drive prefixes.
@@ -83,6 +107,41 @@ pub(crate) fn next_vblank(now: std::time::Instant) -> std::time::Instant {
         let next = last + ((qpc - last) / period + 1) * period;
         now + std::time::Duration::from_nanos(((next - qpc).max(0) as i128 * 1_000_000_000 / freq as i128) as u64)
     }
+}
+
+/// The window's display vblank grid from `DwmGetCompositionTimingInfo` and `monitor_mhz`,
+/// following Chromium's `VSyncProviderWin` validation and mixed-rate monitor rules.
+#[allow(unsafe_code)]
+pub(crate) fn vsync_grid(
+    now: std::time::Instant,
+    monitor_mhz: Option<u32>,
+    previous: Option<crate::window::poll_pace::VSyncGrid>,
+) -> Option<crate::window::poll_pace::VSyncGrid> {
+    use windows_sys::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
+    use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+    // SAFETY: plain out-parameters.
+    let dwm = unsafe {
+        let mut t: DWM_TIMING_INFO = std::mem::zeroed();
+        t.cbSize = size_of::<DWM_TIMING_INFO>() as u32;
+        let (mut qpc, mut freq) = (0i64, 0i64);
+        if DwmGetCompositionTimingInfo(std::ptr::null_mut(), &mut t) >= 0
+            && QueryPerformanceCounter(&mut qpc) != 0
+            && QueryPerformanceFrequency(&mut freq) != 0
+        {
+            crate::window::poll_pace::dwm_grid_from_raw(
+                now,
+                qpc,
+                freq,
+                t.qpcVBlank,
+                t.qpcRefreshPeriod,
+                t.rateRefresh.uiNumerator,
+                t.rateRefresh.uiDenominator,
+            )
+        } else {
+            None
+        }
+    };
+    crate::window::poll_pace::resolve_grid(dwm, monitor_mhz, previous, now)
 }
 
 /// Whether a screen reader is running (`SPI_GETSCREENREADER`).
@@ -315,8 +374,7 @@ impl OverlayWindow {
         let mode = options.input.resolved(interactive);
         overlay_styles(hwnd, mode, options.keys)?;
         let exclusion = if options.exclude_from_capture {
-            // SAFETY: `hwnd` is a live window owned by this thread; `WDA_EXCLUDEFROMCAPTURE` is a valid display affinity flag.
-            if unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } != 0 { OverlaySupport::Requested } else { OverlaySupport::Failed }
+            if set_hwnd_exclude_from_capture(hwnd, true) { OverlaySupport::Requested } else { OverlaySupport::Failed }
         } else { OverlaySupport::Unknown };
         let input = Rc::new(Input { hwnd, regions: RefCell::default(), scale: Cell::new(window.scale_factor() as f32), clicks: RefCell::default(), captured: Cell::new(false), visible: Cell::new(false), input: Cell::new(mode), follow: Cell::new(options.follow_pointer), level: options.level, fading: Cell::new(false) });
         let data = Rc::into_raw(input.clone());
@@ -330,11 +388,8 @@ impl OverlayWindow {
         Ok(Self { input, observing: false, exclusion, watch: None, wake, keys: options.keys })
     }
     pub fn capture_exclusion(&self) -> OverlaySupport { self.exclusion }
-    #[allow(unsafe_code)]
     pub fn set_capture_exclusion(&mut self, exclude: bool) -> OverlaySupport {
-        let affinity = if exclude { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
-        // SAFETY: `self.input.hwnd` is a live window owned by this thread and `affinity` is a valid `WDA_*` constant.
-        let applied = unsafe { SetWindowDisplayAffinity(self.input.hwnd, affinity) } != 0;
+        let applied = set_hwnd_exclude_from_capture(self.input.hwnd, exclude);
         self.exclusion = match (exclude, applied) { (true, true) => OverlaySupport::Requested, (true, false) => OverlaySupport::Failed, (false, _) => OverlaySupport::Unknown };
         self.exclusion
     }
@@ -350,10 +405,19 @@ impl OverlayWindow {
     pub fn set_input(&mut self, input: OverlayInput) {
         self.input.input.set(input);
         self.refresh_watch();
-        if let Some((x, y)) = pointer_position() { self.input.observe(POINT { x, y }); }
+        self.observe_current();
     }
     pub fn set_follow_pointer(&mut self, follow: bool) { self.input.follow.set(follow); self.refresh_watch(); }
 
+    fn current_pointer(&self) -> Option<(i32, i32)> {
+        match &self.watch {
+            Some(watch) => watch.current_point(),
+            None => pointer_position(),
+        }
+    }
+    fn observe_current(&self) {
+        if let Some((x, y)) = self.current_pointer() { self.input.observe(POINT { x, y }); }
+    }
     fn refresh_watch(&mut self) {
         if self.input.visible.get() && self.input.track() {
             if self.watch.is_none() { self.watch = Some(crate::platform::win32::pointer::MouseWatch::new(self.wake.clone())); }
@@ -363,11 +427,21 @@ impl OverlayWindow {
     pub fn take_click(&self, down: bool) -> Option<(f32, f32)> {
         self.input.clicks.borrow_mut().pop_front().filter(|(pressed, _)| *pressed == down).map(|(_, point)| point)
     }
+    /// Clears native pointer capture when an OS drag takes over mouse-up.
+    pub fn pointer_released(&self) {
+        self.input.captured.set(false);
+        self.observe_current();
+    }
+    /// Refreshes the mouse hook's cached window rect and click-through state after a move or resize.
+    pub fn update_geometry(&self) {
+        if let Some(watch) = &self.watch { watch.geometry(self.input.hwnd, self.input.follow.get()); }
+        self.observe_current();
+    }
     pub fn set_regions(&self, regions: &[[f32; 4]], scale: f32) {
         self.input.scale.set(scale);
         if self.input.regions.borrow().as_slice() != regions { *self.input.regions.borrow_mut() = regions.to_vec(); }
         if let Some(watch) = &self.watch { watch.geometry(self.input.hwnd, self.input.follow.get()); }
-        if let Some((x, y)) = pointer_position() {
+        if let Some((x, y)) = self.current_pointer() {
             self.input.observe(POINT { x, y });
             if let Some(watch) = &self.watch { watch.observe((x, y)); }
         }
@@ -396,11 +470,12 @@ impl OverlayWindow {
         if read >= 0 && cloaked != 0 { return Err(format!("Windows cloaked the overlay window (DWMWA_CLOAKED {cloaked:#x})")); }
         self.input.visible.set(true);
         raise_levels();
-        if self.observing { return Ok(()); }
-        INPUTS.with(|inputs| inputs.borrow_mut().push(self.input.clone()));
-        self.refresh_watch();
-        self.observing = true;
-        if let Some((x, y)) = pointer_position() { self.input.observe(POINT { x, y }); }
+        if !self.observing {
+            INPUTS.with(|inputs| inputs.borrow_mut().push(self.input.clone()));
+            self.refresh_watch();
+            self.observing = true;
+        }
+        self.observe_current();
         Ok(())
     }
     /// Gives the shown window the foreground and the keys, for `request_keys`, when Windows lets
@@ -413,9 +488,7 @@ impl OverlayWindow {
     /// Keeps the shown window up at `alpha` (255 opaque) while it fades out, taking no clicks.
     #[allow(unsafe_code)]
     pub fn fade(&self, alpha: u8) {
-        if !self.input.fading.replace(true) && let Some((x, y)) = pointer_position() {
-            self.input.observe(POINT { x, y });
-        }
+        if !self.input.fading.replace(true) { self.observe_current(); }
         // SAFETY: a Win32 call on a live layered window owned by this thread.
         unsafe { SetLayeredWindowAttributes(self.input.hwnd, 0, alpha, LWA_ALPHA); }
     }
@@ -494,17 +567,26 @@ fn raise_levels() {
     }
 }
 
-/// `monitor`'s work area (without its taskbar and app bars) as top and bottom, in physical
-/// desktop pixels.
+/// Converts a Win32 `RECT` (`left`, `top`, `right`, `bottom`) into `(origin, size)` in
+/// physical desktop pixels, clamping negative spans to zero without `i32` overflow.
+pub(crate) fn rect_to_work_area(left: i32, top: i32, right: i32, bottom: i32) -> ((i32, i32), (u32, u32)) {
+    let width = (i64::from(right) - i64::from(left)).max(0) as u32;
+    let height = (i64::from(bottom) - i64::from(top)).max(0) as u32;
+    ((left, top), (width, height))
+}
+
+/// `monitor`'s work area (excluding its taskbar and docked app bars) as `(origin, size)` in
+/// physical desktop pixels, matching `Display::position` and `Display::size`.
 #[allow(unsafe_code)]
-pub(crate) fn work_area(monitor: &winit::monitor::MonitorHandle) -> Option<(i32, i32)> {
+pub(crate) fn work_area(monitor: &winit::monitor::MonitorHandle) -> Option<((i32, i32), (u32, u32))> {
     use winit::platform::windows::MonitorHandleExtWindows;
     use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
     // SAFETY: MONITORINFO is plain data; all zeros is valid before cbSize is set.
     let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
     info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
     // SAFETY: GetMonitorInfoW fills `info`, whose cbSize says which struct it is.
-    (unsafe { GetMonitorInfoW(monitor.hmonitor() as _, &mut info) } != 0).then_some((info.rcWork.top, info.rcWork.bottom))
+    (unsafe { GetMonitorInfoW(monitor.hmonitor() as _, &mut info) } != 0)
+        .then(|| rect_to_work_area(info.rcWork.left, info.rcWork.top, info.rcWork.right, info.rcWork.bottom))
 }
 
 /// Destroys this thread's windows at once, for a fast exit: each gets the default window procedure

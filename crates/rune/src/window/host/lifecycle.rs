@@ -8,7 +8,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::ModifiersState;
 use winit::window::WindowLevel;
 
-use super::Host;
+use super::{Host, WindowApp};
 use crate::app::{Activation, WindowRequest};
 use crate::el::Shell;
 use crate::window::chrome::{self, sync_chrome_core};
@@ -24,6 +24,77 @@ use crate::window::surface::{BackoffEvent, Win};
 #[cfg(target_os = "windows")]
 use crate::window::win32::covered_draw::CoveredDrawEvent;
 
+/// What `Host::shell` does with the pending shell, user-close, and minimize requests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::window) enum ShellCloseAction {
+    Quit(crate::quit::After),
+    ProgrammaticClose,
+    UserCloseRequest,
+    Minimize,
+    None,
+}
+
+/// Resolves the next shell action with precedence: `Quit`/`Relaunch` > programmatic
+/// `Shell::Close` > user-initiated close request (`Tx::request_user_close`) > `Minimize`.
+pub(in crate::window) fn take_shell_action(rt: &mut crate::runtime::RuntimeCore) -> ShellCloseAction {
+    let minimize = shell_take_core(rt);
+    let user_close = rt.take_user_close_request();
+    match rt.shell_request.take() {
+        Some(shell @ (Shell::Quit | Shell::Relaunch)) => {
+            ShellCloseAction::Quit(shell.after().unwrap_or(crate::quit::After::Exit))
+        }
+        Some(Shell::Close) => ShellCloseAction::ProgrammaticClose,
+        None if user_close => ShellCloseAction::UserCloseRequest,
+        None if minimize => ShellCloseAction::Minimize,
+        None => ShellCloseAction::None,
+    }
+}
+
+/// What a host does after consulting [`crate::App::on_close_request`] for a native
+/// `WindowEvent::CloseRequested`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::window) enum CloseDecision {
+    /// Proceed to `Host::close` (no hook registered, hook returned `CloseResponse::Close`, the
+    /// event loop is already exiting, or the window cannot close).
+    Close,
+    /// Keep the window open: clipboard has been flushed; apply `Host::shell` and request a
+    /// redraw (or run a covered frame / schedule pending wakes) if the window stays open.
+    Defer,
+}
+
+/// Evaluates [`crate::App::on_close_request`] for a native `WindowEvent::CloseRequested` without
+/// hiding the window or changing `Life` or `FirstFrame`.
+///
+/// Bypasses the hook when the event loop is already exiting or the window would not close
+/// (`!closes`), and clears `ends_app` on deferral so a later non-final close never mistakes
+/// itself for a fast-exiting last window.
+pub(in crate::window) fn close_request_core(
+    app: &mut dyn WindowApp,
+    clipboard: &mut crate::clipboard::Client,
+    closes: bool,
+    exiting: bool,
+    ends_app: &mut bool,
+) -> CloseDecision {
+    if exiting || !closes {
+        return CloseDecision::Close;
+    }
+    match app.run_on_close_request() {
+        None | Some(crate::CloseResponse::Close) => CloseDecision::Close,
+        Some(crate::CloseResponse::Defer) => {
+            *ends_app = false;
+            clipboard.flush_core(app.rt_mut());
+            CloseDecision::Defer
+        }
+    }
+}
+
+/// Whether a window creation reveal should request foreground activation.
+/// `App::open_inactive` suppresses activation on the first open only;
+/// `WindowsWindowOptions::no_activate` suppresses activation on every reveal.
+pub(in crate::window) const fn reveal_focus(reveal: Reveal, open_inactive: bool, shown: bool, no_activate: bool) -> bool {
+    matches!(reveal, Reveal::Open) && !(open_inactive && !shown) && !no_activate
+}
+
 impl Host {
     pub(in crate::window) fn window_request(&mut self, event_loop: &ActiveEventLoop, request: WindowRequest) {
         match request {
@@ -37,10 +108,19 @@ impl Host {
     pub(in crate::window) fn set_position(&mut self, event_loop: &ActiveEventLoop, position: (i32, i32)) {
         self.placement = None;
         self.options.position = Some(position);
+        self.reopen.clear_position();
         if !is_wayland(event_loop) && let Some(w) = &self.win {
             w.window.set_outer_position(PhysicalPosition::new(position.0, position.1));
         }
         self.sync_origin();
+    }
+
+    /// Whether this window must never take foreground activation on reveal.
+    pub(in crate::window) fn no_activate(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        return self.windows_window.no_activate;
+        #[cfg(not(target_os = "windows"))]
+        false
     }
 
     pub(in crate::window) fn set_always_on_top(&mut self, event_loop: &ActiveEventLoop, on: bool) {
@@ -48,6 +128,57 @@ impl Host {
         self.macos_window.level = None;
         if !is_wayland(event_loop) && let Some(w) = &self.win {
             w.window.set_window_level(if on { WindowLevel::AlwaysOnTop } else { WindowLevel::Normal });
+            #[cfg(target_os = "windows")]
+            crate::platform::win32::apply_window_styles(&w.window, &self.windows_window);
+        }
+    }
+
+    pub(in crate::window) fn set_exclude_from_capture(&mut self, exclude: bool) {
+        self.exclude_from_capture = Some(exclude);
+        let Some(w) = &self.win else { return };
+        #[cfg(target_os = "windows")]
+        let _ = crate::platform::win32::set_exclude_from_capture(&w.window, exclude);
+        #[cfg(target_os = "macos")]
+        match &w.native.panel {
+            Some(panel) => { let _ = panel.set_capture_exclusion(exclude); }
+            None => crate::platform::macos::set_exclude_from_capture(&w.window, exclude),
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let _ = w;
+    }
+
+    pub(in crate::window) fn set_color_scheme(&mut self, scheme: crate::ColorScheme) {
+        self.color_scheme = scheme;
+        self.apply_window_color_scheme();
+    }
+
+    pub(in crate::window) fn apply_window_color_scheme(&mut self) {
+        let target = crate::window::window_theme_for_platform(
+            self.color_scheme,
+            crate::window::app_color_scheme(),
+            cfg!(target_os = "macos"),
+        );
+        let Some(w) = &self.win else { return };
+        let color_scheme = self.color_scheme;
+        crate::window::sync_window_theme(&mut self.applied_theme, target, |theme| {
+            w.window.set_theme(theme);
+            #[cfg(target_os = "macos")]
+            if let Some(panel) = &w.native.panel {
+                panel.set_color_scheme(color_scheme);
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = color_scheme;
+        });
+    }
+
+    pub(in crate::window) fn set_app_color_scheme(&mut self, scheme: crate::ColorScheme) {
+        crate::window::set_app_color_scheme_state(scheme);
+        #[cfg(target_os = "macos")]
+        crate::platform::macos::appearance::set_app_appearance(scheme);
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.apply_window_color_scheme();
+            self.native_handle.send(|_| crate::window::WakeEvent::AppColorScheme);
         }
     }
 
@@ -69,7 +200,7 @@ impl Host {
     /// The window as a reveal finds it.
     fn found(&self) -> Found {
         let Some(w) = &self.win else { return Found::Missing };
-        let minimized = w.window.is_minimized() == Some(true);
+        let minimized = w.is_minimized_native();
         match self.life {
             Life::Shown { sight } => Found::Shown { covered: sight.covered(), minimized },
             _ => Found::Hidden { minimized },
@@ -86,20 +217,29 @@ impl Host {
                     let rt = self.app.rt_mut();
                     rt.set_system_accent(crate::system_accent());
                     rt.set_system_scroll_bars_state(crate::platform::scroll_bars::current().with_override(self.args.scroll_bars));
+                    #[cfg(target_os = "linux")]
+                    {
+                        rt.set_system_reduced_motion(crate::platform::preferences::reduced_motion());
+                        rt.double_click_interval = crate::platform::preferences::double_click_interval();
+                    }
                 }
                 RevealEffect::Build => built = self.build_for_show(),
+                RevealEffect::ApplyFrame => {
+                    if self.take_frame_request(self.frame_secs(crate::time::now()), false) {
+                        self.idle = false;
+                    }
+                }
                 RevealEffect::Place => self.apply_placement(event_loop),
                 RevealEffect::Create => {
-                    // `App::open_inactive`: the first open leaves focus where it is.
-                    let focus = reveal == Reveal::Open && !(self.open_inactive && !self.shown);
+                    let focus = reveal_focus(reveal, self.open_inactive, self.shown, self.no_activate());
                     self.create(event_loop, token.take(), focus);
                     // On macOS a new window becomes key without activating the app, so activate
                     // it like a reopen does. The launch open leaves activation to the platform.
                     #[cfg(target_os = "macos")]
                     if focus && self.started && let Some(w) = self.shown_win() { w.focus(); }
                 }
-                RevealEffect::OrderIn { focus } => if let Some(w) = &self.win { w.show(focus) },
-                RevealEffect::Unminimize => if let Some(w) = &self.win { w.window.set_minimized(false) },
+                RevealEffect::OrderIn { focus } => { let focus = focus && !self.no_activate(); if let Some(w) = &mut self.win { w.show(focus); } }
+                RevealEffect::Unminimize => if let Some(w) = &self.win && !w.is_panel() { w.window.set_minimized(false) },
                 RevealEffect::Settle => {
                     if !built { self.app.rt_mut().settle_all(); }
                     self.idle = true;
@@ -112,7 +252,7 @@ impl Host {
                 RevealEffect::Number => if let Some(w) = &self.win {
                     self.native_handle.native.number.store(native_window_number(&w.window).unwrap_or(0), Ordering::Release);
                 },
-                RevealEffect::Focus => self.activate(event_loop, token.take()),
+                RevealEffect::Focus => if !self.no_activate() { self.activate(event_loop, token.take()); },
                 RevealEffect::Redraw => if let Some(w) = &self.win { w.request_redraw() },
                 // No settle, frame, surface configure or acquisition on a cached reveal, unless
                 // the refreshed frame left motion running.
@@ -135,7 +275,7 @@ impl Host {
         None
     }
 
-    /// Focuses a shown window; Wayland's compositor wants the open's token for that.
+    /// Focuses a shown window; Wayland and X11 use the open's startup token for that.
     fn activate(&mut self, event_loop: &ActiveEventLoop, token: Option<String>) {
         let Some(w) = self.win.as_mut() else { return };
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
@@ -153,6 +293,10 @@ impl Host {
                 None => w.window.request_user_attention(Some(winit::window::UserAttentionType::Informational)),
             }
             return;
+        } else if let Some(token) = token.as_deref()
+            && crate::platform::x11::activation::activate(&w.window, token)
+        {
+            return;
         }
         let _ = (event_loop, token);
         w.focus();
@@ -164,22 +308,14 @@ impl Host {
     pub(in crate::window) fn build_for_show(&mut self) -> bool {
         if !self.app.build_for_show() { return false; }
         self.clipboard.flush_core(self.app.rt_mut());
+        // macOS sets the frame and resizes the surface at once; elsewhere `Resized` brings it.
         self.take_frame_request(0.0, false);
-        // macOS sets the frame at once: the first drawable and layout take the new size.
-        // Elsewhere the window's `Resized` brings it.
-        #[cfg(target_os = "macos")]
-        if let (Some(w), Some((gpu, ..))) = (self.win.as_mut(), self.gpu.as_ref()) {
-            let size = w.window.inner_size();
-            w.resize_surface(Some(&**gpu), size);
-            let scale = w.window.scale_factor() as f32;
-            self.app.rt_mut().set_viewport((size.width as f32 / scale, size.height as f32 / scale), scale);
-        }
         true
     }
 
     pub(in crate::window) fn focus(&self, event_loop: &ActiveEventLoop) {
         let Some(w) = self.shown_win() else { return };
-        if w.window.is_minimized() == Some(true) { w.window.set_minimized(false); }
+        if w.is_minimized_native() { w.window.set_minimized(false); }
         if is_wayland(event_loop) {
             w.window.request_user_attention(Some(winit::window::UserAttentionType::Informational));
             return;
@@ -216,6 +352,9 @@ impl Host {
         #[cfg(target_os = "macos")]
         if let Some(visible) = requests.dock {
             crate::platform::macos::set_dock_icon(visible);
+        }
+        if let Some(scheme) = requests.color_scheme {
+            self.set_app_color_scheme(scheme);
         }
         let shows = matches!(requests.window, Some(WindowRequest::Show | WindowRequest::Open(_)));
         let polled = wake && !quiet && self.poll_hidden(event_loop, shows);
@@ -303,12 +442,21 @@ impl Host {
     /// Carries out what a handler or update asked with `Tx::close_window` / `Tx::quit`, then
     /// opens the pop-up menu it asked for, if the window is still there to open it over.
     pub(in crate::window) fn shell(&mut self, event_loop: &ActiveEventLoop) {
+        self.apply_tx_macos_document();
         self.show_title();
+        self.apply_tx_color_scheme();
         if self.app.rt_mut().take_toggle_maximized() && let Some(w) = self.shown_win() {
-            chrome::toggle_maximized(&w.window);
+            w.toggle_maximized();
+            #[cfg(target_os = "windows")]
+            crate::platform::win32::apply_window_styles(&w.window, &self.windows_window);
         }
-        if self.app.rt_mut().take_toggle_full_screen() && let Some(w) = self.shown_win() {
-            chrome::toggle_full_screen(&w.window);
+        if let Some(req) = self.app.rt_mut().take_full_screen_request() && let Some(w) = self.shown_win() {
+            match req {
+                crate::el::FullScreenRequest::Toggle => w.toggle_full_screen(),
+                crate::el::FullScreenRequest::Set(on) => w.set_full_screen(on),
+            }
+            #[cfg(target_os = "windows")]
+            crate::platform::win32::apply_window_styles(&w.window, &self.windows_window);
         }
         if let Some(menu) = self.app.rt_mut().take_window_menu() && let Some(w) = self.shown_win() {
             chrome::window_menu(&w.window, menu, None);
@@ -320,18 +468,17 @@ impl Host {
             if self.app.rt().stale() { w.request_redraw(); }
         }
         for _ in 0..8 {
-            let minimize = shell_take_core(self.app.rt_mut());
-            match self.app.rt_mut().shell_request.take() {
-                Some(shell @ (Shell::Quit | Shell::Relaunch)) => {
-                    let after = shell.after().unwrap_or(crate::quit::After::Exit);
+            match take_shell_action(self.app.rt_mut()) {
+                ShellCloseAction::Quit(after) => {
                     let _ = crate::quit::send(crate::quit::Event::Start { ending: false, after });
                     self.app.popup_cancel(&mut self.popup);
                     self.app.file_dialog_cancel(&mut self.file_dialog);
                     event_loop.exit();
                 }
-                Some(Shell::Close) => self.close(event_loop),
-                None if minimize => self.minimize(),
-                None => {}
+                ShellCloseAction::ProgrammaticClose => self.close(event_loop),
+                ShellCloseAction::UserCloseRequest => self.close_requested(event_loop),
+                ShellCloseAction::Minimize => self.minimize(),
+                ShellCloseAction::None => {}
             }
             if self.life.finished() || event_loop.exiting() {
                 self.app.popup_cancel(&mut self.popup);
@@ -341,7 +488,13 @@ impl Host {
             let paints = self.shown_win().is_some_and(|w| !self.life.covered() && !w.minimized());
             // A painting macOS window moves its frame over its next frames (`redraw`).
             if self.app.rt().host.window_frame.is_some() && !(paints && cfg!(target_os = "macos")) {
-                self.take_frame_request(self.frame_secs(crate::time::now()), false);
+                let resized = self.take_frame_request(self.frame_secs(crate::time::now()), false);
+                if resized && !self.life.shown() && self.launcher() && let Some(w) = &mut self.win {
+                    // The hidden surface resized, invalidating its old-size cached pixels; draw at
+                    // the new height before any pending reveal orders it in.
+                    w.first_frame.missed();
+                    w.request_redraw();
+                }
             }
             let shown = self.win.as_ref().filter(|_| self.life.shown());
             let window = shown.map(|w| &w.window);
@@ -349,7 +502,46 @@ impl Host {
             if self.file_dialog.open_core(self.app.rt_mut(), window.map(|w| &**w)) && let Some(w) = shown { w.request_redraw(); }
             // A callback that ran (a menu that couldn't open) may have asked to close, quit or
             // minimize.
-            if self.app.rt().shell_request.is_none() && !self.app.rt().host.minimize.field() { return; }
+            if self.app.rt().shell_request.is_none()
+                && !self.app.rt().has_user_close_request()
+                && !self.app.rt().host.minimize.field()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Handles a native `WindowEvent::CloseRequested`. Runs [`App::on_close_request`] inside a
+    /// normal update transaction before hiding the window or changing `Life`/`FirstFrame`;
+    /// `CloseResponse::Defer` keeps the window open, applies any `Tx` requests made in the hook,
+    /// and schedules a redraw (or covered frame / pending wakes).
+    pub(in crate::window) fn close_requested(&mut self, event_loop: &ActiveEventLoop) {
+        let closes = self.closes();
+        let decision = close_request_core(
+            &mut *self.app,
+            &mut self.clipboard,
+            closes,
+            event_loop.exiting(),
+            &mut self.ends_app,
+        );
+        match decision {
+            CloseDecision::Close => self.close(event_loop),
+            CloseDecision::Defer => {
+                self.shell(event_loop);
+                if self.life.finished() || event_loop.exiting() {
+                    return;
+                }
+                if let Some(w) = self.shown_win() {
+                    if !self.life.covered() && !w.minimized() {
+                        w.request_redraw();
+                    } else {
+                        self.covered_frame();
+                        self.shell(event_loop);
+                    }
+                } else {
+                    self.app.rt_mut().schedule_pending_wakes();
+                }
+            }
         }
     }
 
@@ -367,23 +559,33 @@ impl Host {
         // then the window destroyed at once, with no hide before it. The quit runs after it and
         // the process ends without dropping the window.
         let ends = std::mem::take(&mut self.ends_app) && !self.keep_running && cfg!(target_os = "windows");
+        // Snapshot live state before hiding so X11 unmapping or Win32 SW_HIDE cannot clear
+        // maximized/full-screen state before `hide` destroys the window.
+        if self.keep_running {
+            self.record_live_window_state();
+        }
         // Off the screen first: the close looks done at once and `on_close` runs unseen.
         if !ends && let Some(w) = self.shown_win() { w.hide(); }
         crate::marks::mark("window.close.hidden");
         self.close_hook();
         crate::marks::mark("window.close.hooked");
         #[cfg(target_os = "windows")]
-        if ends && let Some(w) = &self.win {
+        if ends && let Some(w) = &mut self.win {
+            w.native.drop_target = None;
             crate::platform::win32::destroy_window_now(&w.window);
             crate::marks::mark("window.destroyed");
         }
         self.app.set_live_visible(false);
         // While the window still shows its last frames.
         if let Some(trace) = &mut self.trace { trace.settle_presents(crate::frame::present_time::SETTLE); }
+        #[cfg(target_os = "macos")]
+        if self.keep_running {
+            self.frame_presented.drain();
+        } else {
+            self.frame_presented.reset();
+        }
         if let Some(after) = self.app.rt_mut().shell_request.take().and_then(Shell::after) {
-            if after == crate::quit::After::Relaunch {
-                let _ = crate::quit::send(crate::quit::Event::Start { ending: false, after });
-            }
+            let _ = crate::quit::send(crate::quit::Event::Start { ending: false, after });
             self.app.popup_cancel(&mut self.popup);
             self.app.file_dialog_cancel(&mut self.file_dialog);
             event_loop.exit();
@@ -394,12 +596,14 @@ impl Host {
             self.app.file_dialog_cancel(&mut self.file_dialog);
             self.app.rt_mut().cancel_pointer();
             self.files = FileDrop::default();
+            #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+            self.wayland_drop_closed();
             if !ends && let Some(w) = &mut self.win { w.apply_cursor_core(self.app.rt(), false); w.hide(); }
             crate::marks::mark("window.hidden");
             self.life.finish();
             return;
         }
-        self.hide(event_loop);
+        self.hide_window(event_loop, true);
     }
 
     /// Whether a close runs `on_close` (`Life::closes`).
@@ -412,6 +616,13 @@ impl Host {
     }
 
     pub(in crate::window) fn hide(&mut self, event_loop: &ActiveEventLoop) {
+        self.hide_window(event_loop, false);
+    }
+
+    fn hide_window(&mut self, event_loop: &ActiveEventLoop, already_hidden: bool) {
+        if !already_hidden {
+            self.record_live_window_state();
+        }
         self.rest_step(RestEvent::Unseen);
         self.stop_showing();
         self.wind_down();
@@ -425,6 +636,8 @@ impl Host {
             self.native_handle.native.number.store(0, Ordering::Release);
         } else if let Some(w) = self.win.as_mut() {
             w.stop_pacing();
+            #[cfg(target_os = "windows")]
+            let _ = w.native.poll_pace.step(crate::window::poll_pace::PollPaceEvent::Reset);
             w.backoff_step(BackoffEvent::Lapsed);
             w.presented = None;
             // Its hidden frame delivers the focus loss.
@@ -444,7 +657,10 @@ impl Host {
         // Before the window can go: a hide need not report a blur. `about_to_wait` delivers it,
         // after any Fn change the monitor saw first.
         #[cfg(target_os = "macos")]
-        self.fn_key();
+        {
+            self.fn_key();
+            self.media_keys();
+        }
     }
 
     /// What a window stops doing when it hides: keys released, secure input and IME off, popups
@@ -458,8 +674,10 @@ impl Host {
             #[cfg(target_os = "macos")]
             { w.native.prime.stop(); }
         }
+        #[cfg(target_os = "windows")]
+        self.look_stale();
         self.secure_input.set(false);
-        self.ime_allowed = false;
+        self.ime.clear();
         if let Some(w) = &self.win { w.window.set_ime_allowed(false); }
         self.app.set_live_visible(false);
         self.app.rt_mut().cancel_timer_frame();
@@ -477,22 +695,39 @@ impl Host {
     /// (an app that sees `AppHandle::window_error` and the window gone can ask for one).
     pub(in crate::window) fn release(&mut self) {
         self.win = None;
+        #[cfg(target_os = "macos")]
+        self.frame_presented.reset();
         self.native_handle.native.ready.store(false, Ordering::Release);
         self.native_handle.native.number.store(0, Ordering::Release);
         self.gpu = None;
+        self.app.release_compositor_gpu();
         let rt = self.app.rt_mut();
         rt.text.atlas.invalidate();
         rt.images.invalidate();
     }
 
-    /// Creates the window, or records why it can't be and leaves the app windowless; a later
-    /// open tries again.
+    /// Creates the window. When the first window can't be created and the app didn't ask to stay
+    /// alive without one (`keep_running` / `windowless`), finishes this host with the error so
+    /// `run` / `try_run` ends with it; otherwise logs it and leaves the app windowless so a later
+    /// open can retry.
     pub(in crate::window) fn create(&mut self, event_loop: &ActiveEventLoop, token: Option<String>, focus: bool) {
         let result = self.try_create(event_loop, token, focus);
-        if let Err(error) = &result {
-            eprintln!("rune: could not create the window {}: {error}", self.native_handle.key());
+        self.finish_create(result);
+    }
+
+    pub(crate) fn finish_create(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => self.shared.set_window_error(None),
+            Err(error) => {
+                let key = self.native_handle.key();
+                self.shared.set_window_error(Some(error.clone()));
+                if self.life.fail_create(self.keep_running, self.shown) {
+                    self.startup_error = Some(format!("could not create the window {key}: {error}"));
+                } else {
+                    eprintln!("rune: could not create the window {key}: {error}");
+                }
+            }
         }
-        self.shared.set_window_error(result.err());
     }
 
     /// `cover` starts or stops covering the window. Covered, it stops pacing and rests, and is
@@ -509,6 +744,8 @@ impl Host {
         if self.life.covered() {
             self.secure_input.set(false);
             l.stop_pacing();
+            #[cfg(target_os = "windows")]
+            let _ = l.native.poll_pace.step(crate::window::poll_pace::PollPaceEvent::Reset);
             self.idle = true;
             self.app.set_live_visible(live);
             self.app.rt_mut().cancel_timer_frame();
@@ -550,10 +787,15 @@ impl Host {
         }
         self.app.run_on_rest();
         if let Some((gpu, renderer)) = &mut self.gpu {
+            // Poll once (non-blocking) at idle rest only if recyclable oversized chunks are in
+            // flight so their completed buffers return before `give_back(false)` trims them;
+            // ordinary windows skip polling to avoid the 4-9 ms Iris Xe post-poll penalty.
+            if !all && renderer.has_oversized_uploads_in_flight() {
+                rune_gpu::health::poll(&gpu.device, wgpu::PollType::Poll).ok();
+            }
             renderer.give_back(all, &mut self.app.rt_mut().text.atlas.resident_caches);
             // Out of sight, what the last frame used goes too, and the staging chunks: an empty
-            // submission and a wait land those frees now. At an idle rest the device isn't
-            // polled: a poll costs the next two frames' submits 4-9 ms each on an Iris Xe.
+            // submission and a wait land those frees now.
             if all {
                 gpu.queue.submit(std::iter::empty());
                 rune_gpu::health::poll(&gpu.device, wgpu::PollType::wait_indefinitely()).ok();

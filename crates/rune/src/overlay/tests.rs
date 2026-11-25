@@ -766,6 +766,7 @@ fn missed_frame_in_turn_prevents_second_step_in_same_turn() {
     let decided = frame::turn(Gate {
         prewarm: false,
         occluded: false,
+        awaiting_frame: false,
         dirty: true,
         idle: false,
         retry: None,
@@ -778,6 +779,7 @@ fn missed_frame_in_turn_prevents_second_step_in_same_turn() {
     let next = frame::turn(Gate {
         prewarm: false,
         occluded: false,
+        awaiting_frame: false,
         dirty: true,
         idle: false,
         retry: None,
@@ -813,7 +815,7 @@ fn overlay_idle_after_stays_awake_when_stale_or_live_pending() {
 
 #[test]
 fn overlay_render_registers_frame_wake_on_renderer() {
-    let Ok(gpu) = crate::render::Gpu::try_new(crate::render::Gpu::instance(), None) else { return };
+    let Some(gpu) = crate::render::Gpu::test_headless_or_noop() else { return };
     let mut overlay = width_overlay("frame-wake");
     overlay.rt.frame(0.0);
     let renderer = crate::render::Renderer::new(&gpu.device, crate::render::OFFSCREEN_FORMAT);
@@ -873,8 +875,8 @@ fn clipboard_receive_marks_shown_overlay_dirty_without_advancing_and_advances_fr
         State::default(),
         &app_spec,
     );
-    let Overlay { mut core, rt, compositor, setup, shared } = overlay;
-    let mut app = app::TypedOverlayApp { rt, compositor, setup, shared };
+    let Overlay { mut core, rt, compositor, setup, on_availability, shared } = overlay;
+    let mut app = app::TypedOverlayApp { rt, compositor, setup, on_availability, shared };
     let clipboard = crate::clipboard::memory();
     app.rt.use_clipboard(&clipboard);
     app.rt.wall_start = None;
@@ -948,5 +950,12 @@ fn clipboard_receive_marks_shown_overlay_dirty_without_advancing_and_advances_fr
     assert_eq!(app.rt.state.pasted, ["shown", "fading", "hidden", "occluded"]);
 }
 
+
+#[test]
+fn overlay_rescale_clamps_to_max_texture_dimension() {
+    assert_eq!(surface::overlay_rescale_size((400.0, 300.0), 2.0, 2048), (800, 600));
+    assert_eq!(surface::overlay_rescale_size((2000.0, 3000.0), 2.0, 2048), (2048, 2048));
+    assert_eq!(surface::overlay_rescale_size((0.0, -5.0), 2.0, 2048), (1, 1));
+}
 
 include!("more_tests.rs");

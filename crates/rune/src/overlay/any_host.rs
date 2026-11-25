@@ -13,23 +13,57 @@ impl OverlayCore {
         false
     }
 
+    #[cfg(target_os = "windows")]
+    fn poll_pace_active(&self) -> bool {
+        self.presence.shown() && !self.frameless() && !self.waits_for_slot()
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(super) fn sync_poll_pace(&mut self, rt: &RuntimeCore, now: Instant) {
+        let active = self.poll_pace_active();
+        let Some(live) = self.surface.live_mut() else { return };
+        let window = live.backing.window().cloned();
+        live.poll_pace.sync_with(rt, now, active, |previous| {
+            let mhz = window.as_ref().and_then(|w| w.current_monitor()).and_then(|m| m.refresh_rate_millihertz());
+            crate::platform::win32::vsync_grid(now, mhz, previous)
+        });
+    }
+
+    pub(super) fn poll_deadline(&self, rt: &RuntimeCore) -> Option<Instant> {
+        #[cfg(target_os = "windows")]
+        if let Some(live) = self.surface.live() {
+            return live.poll_pace.deadline_for(rt, self.poll_pace_active());
+        }
+        frame::timer_deadline(rt, self.awaiting_layer_frame())
+    }
+
     pub(super) fn wake_deadline(&self, rt: &RuntimeCore) -> Option<Instant> {
         // A running display link consumes due runtime timers. Keep the independent
         // pointer deadline, but do not spin on an overdue animation timer. Without one (hidden,
         // covered, faded out or unpaced), a timer due sooner than a frame waits a frame.
-        let deadline = crate::window::timer_deadline_core(rt);
+        let deadline = self.poll_deadline(rt);
         // A frame waiting for room in the swap chain comes when there is (`slot`): its timers
         // would turn the loop at once until then.
         let deadline = deadline.filter(|_| !self.waits_for_slot());
         #[cfg(target_os = "macos")]
-        let deadline = deadline.filter(|_| !self.surface.live().and_then(|l| l.pacing.as_ref()).is_some_and(|p| p.running()));
+        let deadline = deadline.filter(|_| !self.surface.live().and_then(|l| l.pacing.as_ref()).is_some_and(|p| p.paced()));
         #[cfg(target_os = "macos")]
         let deadline = deadline.into_iter().chain(self.panel.as_ref().and_then(|p| p.pointer_deadline(self.presence.occluded()))).min();
         // A Windows fade-out steps its alpha once a frame.
         #[cfg(target_os = "windows")]
         let deadline = deadline.into_iter().chain(self.presence.fading().then(|| crate::time::now() + crate::window::TIMER_FRAME)).min();
+        // Wayland layer-shell overlays schedule held-key repeats on the overlay wake timer.
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        let deadline = deadline.into_iter().chain(self.presence.drawing().then(|| {
+            match self.surface.live().map(|l| &l.backing) {
+                Some(Backing::Layer(layer)) => layer.repeat_deadline(),
+                _ => None,
+            }
+        }).flatten()).min();
         deadline.into_iter().chain(self.backoff.deadline().filter(|_| self.presence.drawing())).chain(self.presence.deadline())
-            .chain(self.hidden_pace.deadline().filter(|_| !self.presence.drawing())).min()
+            .chain(self.hidden_pace.deadline().filter(|_| !self.presence.drawing()))
+            .chain(self.rest.deadline())
+            .chain(self.retire.deadline()).min()
     }
 
     /// Answers what assistive clients asked of the overlay and sends its tree's changes. An
@@ -95,11 +129,23 @@ impl AnyHost for OverlayHost {
         self.core.wake_deadline(self.app.rt())
     }
 
+    #[cfg(target_os = "windows")]
+    fn turn_ends(&mut self, _event_loop: &ActiveEventLoop, now: Instant) {
+        self.core.sync_poll_pace(self.app.rt(), now);
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         self.core.sync(&mut *self.app, event_loop);
     }
 
     fn vanish(&mut self) { self.core.hide(&mut *self.app); }
+
+    #[cfg(target_os = "macos")]
+    fn stop_pacing(&mut self) {
+        if let Some(pacing) = self.core.surface.live_mut().and_then(|l| l.pacing.as_mut()) {
+            pacing.stop();
+        }
+    }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WakeEvent) {
         self.core.meter.waited();
@@ -113,9 +159,12 @@ impl AnyHost for OverlayHost {
             }
         }
         #[cfg(target_os = "macos")]
-        if matches!(event, WakeEvent::DisplayTick(_))
-            && self.core.surface.live().and_then(|l| l.pacing.as_ref()).is_some_and(|p| p.running()) {
-            self.core.draw(&mut *self.app);
+        if matches!(event, WakeEvent::DisplayTick(_)) {
+            if self.core.surface.live().and_then(|l| l.pacing.as_ref()).is_some_and(|p| p.paced()) {
+                self.core.draw(&mut *self.app);
+            } else if let Some(pacing) = self.core.surface.live_mut().and_then(|l| l.pacing.as_mut()) {
+                pacing.stop_expired();
+            }
         }
         if let WakeEvent::App(_) = event {
             self.core.sync(&mut *self.app, event_loop);
@@ -134,6 +183,12 @@ impl AnyHost for OverlayHost {
         let core = &mut self.core;
         let app = &mut *self.app;
         if !matches!(event, WindowEvent::RedrawRequested) { core.meter.waited(); }
+        #[cfg(target_os = "windows")]
+        if matches!(event, WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. })
+            && let Some(live) = core.surface.live_mut()
+        {
+            let _ = live.poll_pace.step(crate::window::poll_pace::PollPaceEvent::DisplayChanged);
+        }
         #[cfg(target_os = "macos")]
         if matches!(event, WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. } | WindowEvent::Occluded(_))
             && let Some(live) = core.surface.live_mut() && let Some(pacing) = &mut live.pacing {
@@ -144,6 +199,7 @@ impl AnyHost for OverlayHost {
         #[cfg(target_os = "macos")]
         if let WindowEvent::Occluded(occluded) = event {
             let occluded = core.panel.as_ref().map_or(occluded, |p| p.occluded());
+            let occluded = core.occlusion_reading(occluded);
             core.occluded(app, occluded);
             return;
         }
@@ -158,15 +214,15 @@ impl AnyHost for OverlayHost {
                 {
                     crate::platform::ime::cancel(window);
                     window.set_ime_allowed(false);
-                    core.ime_allowed = false;
+                    core.ime.clear();
                 }
             }
             app.rt_mut().ignore_minimize("an overlay");
             match app.rt_mut().shell_request.take() {
                 Some(crate::el::Shell::Close) => core.hide(app),
-                Some(crate::el::Shell::Quit) => event_loop.exit(),
-                Some(crate::el::Shell::Relaunch) => {
-                    let _ = crate::quit::send(crate::quit::Event::Start { ending: false, after: crate::quit::After::Relaunch });
+                Some(shell @ (crate::el::Shell::Quit | crate::el::Shell::Relaunch)) => {
+                    let after = shell.after().unwrap_or(crate::quit::After::Exit);
+                    let _ = crate::quit::send(crate::quit::Event::Start { ending: false, after });
                     event_loop.exit();
                 }
                 None => {}
@@ -184,6 +240,9 @@ impl AnyHost for OverlayHost {
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
         if matches!(event, WindowEvent::Moved(_) | WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. })
             && let Some(x11) = &core.x11 { x11.update_geometry(); }
+        #[cfg(target_os = "windows")]
+        if matches!(event, WindowEvent::Moved(_) | WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. })
+            && let Some(native) = &core.native { native.update_geometry(); }
         // A click gives an overlay that may take keys the focus, as it does the macOS panel; the
         // window manager gives an override-redirect window none.
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
@@ -194,6 +253,7 @@ impl AnyHost for OverlayHost {
         let input_enabled = core.options.input.resolved(core.interactive) != OverlayInput::None;
         match event {
             WindowEvent::Moved(_) => {
+                core.position_owner.step(input::PositionEvent::WindowMoved);
                 if let Some(live) = core.surface.live() && let Some(w) = live.backing.window() {
                     let scale = crate::window::backing_scale(w);
                     if (scale - live.scale).abs() > f32::EPSILON && let Some(gpu) = core.gpu.clone() {
@@ -207,9 +267,15 @@ impl AnyHost for OverlayHost {
                 }
             }
             WindowEvent::RedrawRequested | WindowEvent::Resized(_) => {
-                // A new accent or scroller style asks every window to redraw (`accent::watch`, `scroll_bars::watch`).
+                // A new accent, scroller style or Linux portal preference asks every window to redraw.
                 core.accent_changed(app.rt_mut(), crate::system_accent());
                 core.scroll_bars_changed(app.rt_mut(), crate::platform::scroll_bars::current());
+                #[cfg(target_os = "linux")]
+                {
+                    let rt = app.rt_mut();
+                    rt.set_system_reduced_motion(crate::platform::preferences::reduced_motion());
+                    rt.double_click_interval = crate::platform::preferences::double_click_interval();
+                }
                 core.dirty = true;
             }
             WindowEvent::CursorMoved { position, .. } if input_enabled => {
@@ -239,6 +305,10 @@ impl AnyHost for OverlayHost {
             }
             WindowEvent::Touch(touch) if input_enabled => {
                 app.touch(&touch);
+                core.take_titlebar_action(app);
+                if matches!(touch.phase, winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled) {
+                    core.position_owner.step(input::PositionEvent::LeftReleased);
+                }
                 core.dirty = true;
             }
             WindowEvent::ModifiersChanged(m) => {
@@ -249,11 +319,19 @@ impl AnyHost for OverlayHost {
                 core.dirty = true;
             }
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } if core.options.keys == KeyPolicy::OnDemand => {
-                core.dirty |= app.keyboard(&core.clipboard, &event, core.mods);
+                if event.state == winit::event::ElementState::Pressed
+                    && let Some(window) = core.surface.live().and_then(|l| l.backing.window())
+                    && let Some(text) = crate::platform::ime::take_direct_commit(window)
+                {
+                    host_events::ime(app.rt_mut(), window, &mut core.ime, winit::event::Ime::Commit(text));
+                    core.dirty = true;
+                } else {
+                    core.dirty |= app.keyboard(&event, core.mods);
+                }
             }
             WindowEvent::Ime(ime) if core.options.keys == KeyPolicy::OnDemand => {
                 if let Some(window) = core.surface.live().and_then(|l| l.backing.window()) {
-                    host_events::ime(app.rt_mut(), window, ime);
+                    host_events::ime(app.rt_mut(), window, &mut core.ime, ime);
                     core.dirty = true;
                 }
             }
@@ -312,7 +390,10 @@ impl AnyHost for OverlayHost {
         let core = &mut self.core;
         let app = &mut *self.app;
         #[cfg(target_os = "macos")]
-        core.fn_key(app);
+        {
+            core.fn_key(app);
+            core.media_keys(app);
+        }
         // A window switched the font families (`Tx::set_font_families`).
         core.dirty |= app.rt_mut().follow_font_families();
         // A fading-out overlay takes no input; it only draws its exit.
@@ -341,7 +422,7 @@ impl AnyHost for OverlayHost {
             let pointer = panel.pointer_state();
             if let Some((x, y)) = core.turn_position(app, &pointer) && app.rt().pointer() != Some((x, y)) {
                 core.observe_pointer(app, x, y);
-                if core.options.follow_pointer && core.options.display == DisplayTarget::UnderPointer {
+                if core.position_owner.is_managed() && core.options.follow_pointer && core.options.display == DisplayTarget::UnderPointer {
                     let size = core.at.size;
                     core.resolve_size(_event_loop);
                     if size != core.at.size { core.resized(app, _event_loop); }
@@ -355,6 +436,20 @@ impl AnyHost for OverlayHost {
         core.a11y_turn(app.rt_mut()) || more
     }
 
+    fn has_live_wayland_layer(&self) -> bool {
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        return matches!(self.core.surface.live().map(|l| &l.backing), Some(Backing::Layer(layer)) if layer.is_live());
+        #[cfg(not(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
+        false
+    }
+
+    fn has_pending_platform_events(&self) -> bool {
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        return matches!(self.core.surface.live().map(|l| &l.backing), Some(Backing::Layer(layer)) if layer.has_pending_events());
+        #[cfg(not(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
+        false
+    }
+
     fn keeps_loop(&self) -> bool {
         false
     }
@@ -365,5 +460,15 @@ impl AnyHost for OverlayHost {
 impl PendingOverlay for OverlayHost {
     fn connect(&mut self, wake: Waker, frame_wake: Waker, slot_wake: Waker, gpu: Rc<RefCell<Weak<Gpu>>>) {
         self.core.connect(&mut *self.app, wake, frame_wake, slot_wake, gpu);
+    }
+    fn inherit_font_smoothing(&mut self, mode: crate::FontSmoothing) {
+        OverlayHost::inherit_font_smoothing(self, mode);
+    }
+    fn set_prewarm_effects(&mut self, effects: crate::PrewarmEffects) {
+        OverlayHost::set_prewarm_effects(self, effects);
+    }
+    #[cfg(test)]
+    fn font_smoothing(&self) -> crate::FontSmoothing {
+        self.app.rt().font_smoothing()
     }
 }

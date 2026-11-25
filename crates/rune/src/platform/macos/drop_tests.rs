@@ -1,55 +1,12 @@
 #![allow(unsafe_code)]
 
 use super::*;
+use crate::platform::macos::test_pasteboard::{self, Board};
 use objc2_foundation::NSData;
-
-/// Whether this session has a pasteboard server. A headless or SSH-only session (no window
-/// server) has none, and `pasteboardWithUniqueName` returns nil there, so the round-trip
-/// tests skip with a note instead of panicking.
-fn pasteboard_available() -> bool {
-    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        let probe = std::panic::catch_unwind(|| {
-            // SAFETY: probes whether the session's pasteboard server accepts a temporary unique
-            // pasteboard and releases it before returning.
-            unsafe {
-                let pb: Option<Retained<NSPasteboard>> = msg_send![class!(NSPasteboard), pasteboardWithUniqueName];
-                let Some(pb) = pb else { return false };
-                pb.clearContents();
-                let item = NSPasteboardItem::new();
-                let kind = NSString::from_str("public.utf8-plain-text");
-                let ok = item.setString_forType(&NSString::from_str("probe"), &kind)
-                    && pb.writeObjects(&NSArray::from_retained_slice(&[objc2::runtime::ProtocolObject::from_retained(item)]))
-                    && pb.stringForType(&kind).is_some_and(|s| s.to_string() == "probe");
-                let () = msg_send![&*pb, releaseGlobally];
-                ok
-            }
-        });
-        let ok = probe.unwrap_or(false);
-        if !ok { eprintln!("macos_drop: no pasteboard in this session (headless?); skipping pasteboard round-trip tests"); }
-        ok
-    })
-}
-
-/// A private pasteboard, released when dropped.
-struct Board(Retained<NSPasteboard>);
-
-impl Drop for Board {
-    fn drop(&mut self) {
-        // SAFETY: `self.0` is a private pasteboard created via `pasteboardWithUniqueName` and released once on drop.
-        unsafe { msg_send![&*self.0, releaseGlobally] }
-    }
-}
-
-impl std::ops::Deref for Board {
-    type Target = NSPasteboard;
-    fn deref(&self) -> &NSPasteboard { &self.0 }
-}
 
 /// A private pasteboard holding `items`, or None without a pasteboard.
 fn board(items: &[&[(&str, &[u8])]]) -> Option<Board> {
-    if !pasteboard_available() { return None; }
-    let pb = Board(NSPasteboard::pasteboardWithUniqueName());
+    let pb = test_pasteboard::unique()?;
     pb.clearContents();
     let items: Vec<Retained<NSPasteboardItem>> = items.iter().map(|types| {
         let item = NSPasteboardItem::new();
@@ -137,6 +94,29 @@ fn text_alone_gives_nothing() {
 }
 
 #[test]
+fn parallel_boards_do_not_collide() {
+    if !test_pasteboard::available() { return; }
+    const THREADS: usize = 8;
+    const ROUNDS: usize = 20;
+    for round in 0..ROUNDS {
+        let start = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        std::thread::scope(|scope| {
+            for slot in 0..THREADS {
+                let start = start.clone();
+                scope.spawn(move || {
+                    let path = format!("/tmp/drop-test-{round}-{slot}.txt");
+                    let url = format!("file://{path}");
+                    start.wait();
+                    let pb = board(&[&[(FILE_URL, url.as_bytes())]]).expect("pasteboard available");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    assert_eq!(found(&pb), [Item::File(PathBuf::from(path))]);
+                });
+            }
+        });
+    }
+}
+
+#[test]
 fn images_are_written_named_for_their_url() {
     let Some(pb) = board(&[&[("public.png", &png())], &[("public.png", &png())], &[("public.url", b"https://e.com/img/kitten.jpg?w=2"), ("public.png", &png())]]) else { return };
     let dir = drop_dir().unwrap();
@@ -174,16 +154,83 @@ fn the_operation_follows_the_source() {
 #[test]
 fn moves_coalesce_and_steps_track_the_drag() {
     let key = 0xd0d0;
+    let _guard = register(key);
     push(key, FileStep::Enter(vec!["a".into()], Some((1.0, 1.0))));
     push(key, FileStep::Move((2.0, 2.0)));
     push(key, FileStep::Move((3.0, 3.0)));
     assert!(over(key));
     push(key, FileStep::Drop(vec!["a".into()], Some((3.0, 3.0))));
     assert!(!over(key));
-    let steps = DESTS.with(|d| std::mem::take(&mut d.borrow_mut().get_mut(&key).unwrap().steps));
+    let steps = take_key(key);
     assert_eq!(steps, [
         FileStep::Enter(vec!["a".into()], Some((1.0, 1.0))),
         FileStep::Move((3.0, 3.0)),
         FileStep::Drop(vec!["a".into()], Some((3.0, 3.0))),
     ]);
+}
+
+#[test]
+fn dropping_guard_prunes_view_and_rejects_stale_promises_on_recycled_address() {
+    let key = 0xd0d1;
+    let first = register(key);
+    let stale_token = first.token;
+    push(key, FileStep::Enter(vec!["stale".into()], Some((1.0, 1.0))));
+    assert!(over(key));
+
+    drop(first);
+    assert!(DESTS.with(|d| !d.borrow().contains_key(&key)), "dropping the guard must prune DESTS");
+    assert!(!over(key));
+
+    // A late promise arriving after the window closed must not re-insert into DESTS.
+    push_for(key, stale_token, FileStep::Drop(vec!["late".into()], Some((2.0, 2.0))));
+    assert!(DESTS.with(|d| !d.borrow().contains_key(&key)));
+
+    // A new window allocated at the same content view address starts clean and ignores the
+    // closed window's late promise.
+    let second = register(key);
+    assert_ne!(second.token, stale_token);
+    assert!(!over(key));
+    assert!(take_key(key).is_empty());
+
+    push_for(key, stale_token, FileStep::Drop(vec!["late".into()], Some((2.0, 2.0))));
+    assert!(take_key(key).is_empty());
+
+    push_for(key, second.token, FileStep::Drop(vec!["fresh".into()], Some((4.0, 5.0))));
+    assert_eq!(take_key(key), [FileStep::Drop(vec!["fresh".into()], Some((4.0, 5.0)))]);
+
+    drop(second);
+    assert!(DESTS.with(|d| !d.borrow().contains_key(&key)));
+}
+
+#[test]
+fn kvo_observed_drop_subclass_in_both_orders() {
+    use objc2_foundation::NSObject;
+    let key = NSString::from_str("probe");
+    let observer = NSObject::new();
+
+    // Order 1: Rune subclasses first, then KVO observes and removes the observer.
+    let below = NSObject::new();
+    // SAFETY: `below` and `observer` are live `NSObject` instances; KVO selectors match Foundation.
+    unsafe {
+        assert!(subclass_view(&below));
+        assert!(has_subclass(&below, b"RuneDrops_"));
+        let _: () = msg_send![&*below, addObserver: &*observer, forKeyPath: &*key, options: 0usize, context: std::ptr::null_mut::<std::ffi::c_void>()];
+        let kvo_class = below.class();
+        assert!(kvo_class.name().to_bytes().starts_with(b"NSKVONotifying_"));
+        assert!(subclass_view(&below), "already-subclassed view stays valid beneath KVO");
+        assert!(std::ptr::eq(below.class(), kvo_class), "KVO's class must stay on top");
+        let _: () = msg_send![&*below, removeObserver: &*observer, forKeyPath: &*key];
+    }
+
+    // Order 2: KVO observes first, then Rune runs, then KVO removes the observer.
+    let above = NSObject::new();
+    // SAFETY: `above` and `observer` are live `NSObject` instances; KVO selectors match Foundation.
+    unsafe {
+        let _: () = msg_send![&*above, addObserver: &*observer, forKeyPath: &*key, options: 0usize, context: std::ptr::null_mut::<std::ffi::c_void>()];
+        let kvo_class = above.class();
+        assert!(kvo_class.name().to_bytes().starts_with(b"NSKVONotifying_"));
+        assert!(!subclass_view(&above), "skip already KVO-observed view");
+        assert!(std::ptr::eq(above.class(), kvo_class), "KVO's class must stay on top");
+        let _: () = msg_send![&*above, removeObserver: &*observer, forKeyPath: &*key];
+    }
 }

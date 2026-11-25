@@ -9,6 +9,7 @@ use super::*;
 
 pub(crate) struct Trace {
     out: std::io::BufWriter<std::fs::File>,
+    next_id: u32,
     ids: HashMap<String, u32>,
     described: HashMap<u32, (String, &'static str, &'static str)>,
     states: HashMap<u32, ([i64; 6], u32, [i64; 4])>,
@@ -24,6 +25,8 @@ pub(crate) struct Trace {
     presents: Option<crate::frame::present_time::Presents>,
     /// The native surface's frame counts and `App::dev_stats`, printed when the trace closes.
     surface: Option<(std::sync::Arc<std::sync::Mutex<crate::SurfaceStats>>, Option<fn() -> String>)>,
+    /// Last refresh rate written to the header or a frame line, rounded to 0.01 Hz.
+    hz: f64,
 }
 
 /// A native frame's timing beyond its submission time.
@@ -35,10 +38,16 @@ pub(crate) struct FrameTiming {
     pub drawable: Option<u64>,
     /// The previous frame asked for this one right away (it wasn't idle).
     pub continuous: bool,
+    /// The display's current refresh rate, when known.
+    pub hz: Option<f64>,
 }
 
 pub(super) fn r2(v: f32) -> f64 {
-    (f64::from(v) * 100.0).round() / 100.0
+    r2_f64(f64::from(v))
+}
+
+fn r2_f64(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
 }
 
 impl Trace {
@@ -58,8 +67,8 @@ impl Trace {
         });
         if clock == "wall" { header["timestamp"] = "cpu-submit".into(); }
         writeln!(out, "{header}").ok();
-        Trace { out, ids: HashMap::new(), described: HashMap::new(), states: HashMap::new(), scrolled: HashMap::new(), effects: HashMap::new(),
-            goals: HashMap::new(), channels: Default::default(), path: path.clone(), all: false, presents: None, surface: None }
+        Trace { out, next_id: 1, ids: HashMap::new(), described: HashMap::new(), states: HashMap::new(), scrolled: HashMap::new(), effects: HashMap::new(),
+            goals: HashMap::new(), channels: Default::default(), path: path.clone(), all: false, presents: None, surface: None, hz: r2_f64(fps) }
     }
 
     /// Holds each frame's line until its present time arrives from `source`, then writes
@@ -90,8 +99,13 @@ impl Trace {
     }
 
     fn id(&mut self, key: &str) -> u32 {
-        let next = self.ids.len() as u32 + 1;
-        *self.ids.entry(key.to_owned()).or_insert(next)
+        if let Some(&id) = self.ids.get(key) {
+            return id;
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.checked_add(1).expect("trace element id overflow");
+        self.ids.insert(key.to_owned(), id);
+        id
     }
 
     #[cfg(test)]
@@ -201,6 +215,7 @@ impl Trace {
         // A settle unmounts what it replaces at once: a cut (transition | opacity) at its last place.
         let mut cuts = Vec::new();
         for id in &gone {
+            self.described.remove(id);
             self.scrolled.remove(id);
             if let Some(names) = self.effects.remove(id) {
                 for name in names { self.channels.remove(&name); }
@@ -211,6 +226,23 @@ impl Trace {
                 let [x, y, w, h] = [q[0], q[1], q[2], q[3]].map(|v| v as f64 / 100.0);
                 cuts.push(json!([id, x, y, w, h, rune_motion::Intent::TRANSITION | rune_motion::Intent::OPACITY, 0]));
             }
+        }
+        let mut handovers = Vec::new();
+        for h in rt.matched_handovers() {
+            let from_id = self.ids.get(&h.from).copied();
+            let to_id = self.ids.get(&h.to).copied();
+            if from_id.is_none() && to_id.is_none() {
+                continue;
+            }
+            handovers.push(json!({
+                "from": from_id,
+                "to": to_id,
+                "from_rect": h.from_rect.map(r2),
+                "to_rect": h.to_rect.map(r2),
+            }));
+        }
+        if !gone.is_empty() {
+            self.ids.retain(|_, id| seen.contains(id));
         }
 
         let mut line = json!({ "t": (t_ms * 1000.0).round() / 1000.0, "n": 1 });
@@ -263,6 +295,9 @@ impl Trace {
         if !gone.is_empty() {
             line["g"] = gone.into();
         }
+        if !handovers.is_empty() {
+            line["handover"] = handovers.into();
+        }
         // How far scrolling carries each element, when that changed: [id, x, y] in points.
         if !scrolled.is_empty() {
             line["sc"] = scrolled.into();
@@ -278,6 +313,10 @@ impl Trace {
         self.channels.write_json(&mut line);
         if let Some(target) = timing.target_ms {
             line.push_str(&format!(r#","target_ms":{target}"#));
+        }
+        if let Some(hz) = timing.hz.filter(|hz| hz.is_finite() && *hz > 0.0).map(r2_f64).filter(|&hz| hz > 0.0 && hz != self.hz) {
+            self.hz = hz;
+            line.push_str(&format!(r#","hz":{hz}"#));
         }
         if let Some(presents) = self.presents.as_mut() {
             presents.push(line, timing.drawable, timing.continuous, &mut self.out);
@@ -322,6 +361,7 @@ pub(crate) fn tree_json_core(rt: &crate::runtime::RuntimeCore, real_t: f64) -> V
                 "opacity": (e.opacity * 1000.0).round() / 1000.0,
                 "scale": (e.scale * 10000.0).round() / 10000.0,
                 "blur": r2(e.blur),
+                "radius": r2(e.radius),
                 "focusable": e.focusable, "focused": e.focused,
                 "focusVisible": e.focus_visible, "inert": e.inert,
                 "loopPhase": e.loop_phase,
@@ -336,11 +376,30 @@ pub(crate) fn tree_json_core(rt: &crate::runtime::RuntimeCore, real_t: f64) -> V
             if let Some(t) = &e.text {
                 v["text"] = t.clone().into();
             }
+            if let Some(c) = e.border_color {
+                v["borderColor"] = c.hex().into();
+            }
             if let Some(c) = e.text_color {
                 v["color"] = c.hex().into();
             }
+            if let Some(ts) = &e.text_style {
+                let mut style = json!({
+                    "size": r2(ts.size),
+                    "weight": r2(ts.weight),
+                    "lineHeight": r2(ts.line_height),
+                    "tracking": r2(ts.tracking),
+                    "italic": ts.italic,
+                });
+                if let Some(family) = &ts.family {
+                    style["family"] = family.clone().into();
+                }
+                v["textStyle"] = style;
+            }
             if let Some(h) = &e.help {
                 v["help"] = h.clone().into();
+            }
+            if let Some(d) = &e.description {
+                v["description"] = d.clone().into();
             }
             if let Some(s) = &e.selected {
                 v["selected"] = s.clone().into();
@@ -354,7 +413,8 @@ pub(crate) fn tree_json_core(rt: &crate::runtime::RuntimeCore, real_t: f64) -> V
             if e.item_selected {
                 v["itemSelected"] = true.into();
             }
-            if rt.tree.element_is_secure(&e.path) {
+            let secure = rt.tree.element_is_secure(&e.path);
+            if secure {
                 v["secure"] = true.into();
             }
             if e.rect.iter().zip(e.target.iter()).any(|(a, b)| (a - b).abs() > 0.01) {
@@ -375,7 +435,10 @@ pub(crate) fn tree_json_core(rt: &crate::runtime::RuntimeCore, real_t: f64) -> V
             if e.drag_out {
                 v["dragOut"] = true.into();
             }
-            if let Some(c) = e.caret {
+            if e.material_fallback {
+                v["materialFallback"] = true.into();
+            }
+            if let Some(c) = e.caret && !secure {
                 v["caret"] = c.map(r2).to_vec().into();
             }
             if let Some(r) = e.edit_range {
@@ -436,3 +499,7 @@ fn video_json(v: &crate::video::Snapshot) -> Value {
     if let Some(e) = error { out["error"] = e.into(); }
     out
 }
+
+#[cfg(test)]
+#[path = "trace_tests.rs"]
+mod tests;

@@ -11,10 +11,9 @@ pub(crate) struct PaintState {
     pub(in crate::runtime) inh_scratch: Vec<Inh>,
     /// Drawn rect per node (points, root space), for tools and hit tests.
     pub(crate) drawn: Vec<[f32; 4]>,
-    pub(super) quads_frame: u64,
     /// Opt-in gamma-space (sRGB) blending for translucent fills, shadows and blurs.
     pub(in crate::runtime) srgb_blend: bool,
-    /// The shell shows native views for the first `MAX_NATIVE_MATERIALS` of `materials`; their
+    /// The shell shows native views for the first `max_native_materials` of `materials`; their
     /// elements skip their fill and cut their shadows out of their interior.
     pub(super) native_materials: bool,
     /// A drawn video is playing or seeking: keep drawing frames.
@@ -27,6 +26,8 @@ pub(crate) struct PaintState {
     /// Current node painted a live animated icon (moving or waiting): prevents `PaintKeep` from
     /// freezing its quad across frames while active, without blocking sibling subtrees.
     pub(super) node_animated_icon: bool,
+    /// Last `step_motion` wrote a changed rect to a bound `El::drawn_rect_into` live value.
+    pub(in crate::runtime) drawn_rect_wrote: bool,
     /// Earliest runtime timestamp when a flat-hold animated icon resumes moving (`wake_for_motion`).
     pub(super) icon_anim_wake: Option<f64>,
     /// Mount time (runtime `t`) per `(NodeId, icon_ptr)` for finite-duration animated icons.
@@ -63,7 +64,7 @@ pub(crate) struct PaintState {
     pub(super) lifted_anchors: Vec<usize>,
     /// Last resolved `(target_rect, zoom)` per anchored overlay node id, so an exiting overlay
     /// holds its position if its anchor unmounts mid-exit instead of snapping to `(0, 0)`.
-    pub(in crate::runtime) last_anchor_targets: HashMap<NodeId, ([f32; 4], f32)>,
+    pub(in crate::runtime) last_anchor_targets: HashMap<NodeId, ([f32; 4], f32, [f32; 4])>,
     /// Deduplicated `(overlay_path, anchor_key)` pairs logged when an anchored overlay could not
     /// resolve its anchor and was suppressed.
     pub(in crate::runtime) unresolved_anchor_warnings: HashSet<(String, String)>,
@@ -78,11 +79,18 @@ pub(crate) struct PaintState {
     pub(in crate::runtime) node_caches: HashMap<NodeId, NodeCache>,
     /// The device rows of each field with waiting paragraphs its last paint showed (`text_fill`).
     pub(in crate::runtime) text_rows: HashMap<NodeId, (f32, f32)>,
-    /// Each still text's quads as it drew them, by node and layout id, and the paint they were
-    /// last used in (`paint_content`): a frame that draws it the same copies them.
-    pub(super) text_quads: HashMap<(NodeId, crate::text::LayoutId), (crate::el::grid::DrawnRow, u64)>,
+    /// Each still text piece's quads as it last drew them (`paint_content`), replaced in place
+    /// when a node's layout changes and bounded in entries and bytes.
+    pub(in crate::runtime) text_quads: quads::TextQuads,
     /// `El::system_material` elements built this frame, in paint order.
     pub(super) materials: Vec<crate::system_material::MaterialDraw>,
+    /// Per-window cap on native `El::system_material` views (default `MAX_NATIVE_MATERIALS`,
+    /// clamped to `MAX_NATIVE_MATERIALS_CAP`).
+    pub(super) max_native_materials: usize,
+    /// Visible `El::system_material` nodes that exceeded `max_native_materials` this frame.
+    pub(super) material_fallbacks: Vec<NodeId>,
+    /// Whether this window already emitted its one-time stderr notice for native material fallback.
+    pub(super) material_fallback_warned: bool,
     /// Each node's place in the paint order, kept by the frame build while `Some` (the motion
     /// gate's `z-order`).
     pub(super) paint_rank: Option<Vec<u32>>,
@@ -102,13 +110,13 @@ impl PaintState {
         Self {
             inh_scratch: Vec::new(),
             drawn: Vec::new(),
-            quads_frame: 0,
             srgb_blend: false,
             native_materials: false,
             videos_active: false,
             animated_icons: false,
             animated_icons_shown: false,
             node_animated_icon: false,
+            drawn_rect_wrote: false,
             icon_anim_wake: None,
             icon_anim_mounts: HashMap::default(),
             scale_frame: None,
@@ -138,8 +146,11 @@ impl PaintState {
             cache_inside_scratch: Vec::new(),
             node_caches: HashMap::default(),
             text_rows: HashMap::default(),
-            text_quads: HashMap::default(),
+            text_quads: quads::TextQuads::new(),
             materials: Vec::new(),
+            max_native_materials: crate::MAX_NATIVE_MATERIALS,
+            material_fallbacks: Vec::new(),
+            material_fallback_warned: false,
             paint_rank: None,
             icon_aprons: Vec::new(),
             #[cfg(test)]
@@ -231,6 +242,11 @@ impl PaintState {
         }
     }
 
+    #[inline]
+    pub(in crate::runtime) fn record_static_scale_target(&mut self, id: NodeId, target: f32) {
+        self.static_scales.insert(id, ScaleSettle::Still(target));
+    }
+
     #[cfg(test)]
     #[inline]
     pub(in crate::runtime) fn tracks_static_scale(&self, id: NodeId) -> bool {
@@ -260,6 +276,7 @@ impl PaintState {
     #[inline]
     pub(in crate::runtime) fn begin_frame(&mut self) {
         self.keep.frame += 1;
+        self.drawn_rect_wrote = false;
     }
 
     #[inline]
@@ -308,14 +325,21 @@ impl PaintState {
         self.lifted_anchors.binary_search(&i).is_ok()
     }
 
-    /// Subtree (preorder) paint order, then each flying or raised element's subtree on top.
-    /// A sticky element paints after its normal siblings (and before overlay siblings), so it
-    /// covers the rows it's stuck over.
+    #[inline]
+    pub(in crate::runtime) fn has_lifted_anchors(&self) -> bool {
+        !self.lifted_anchors.is_empty()
+    }
+
+    /// Subtree (preorder) paint order, then each flying, raised, or lifted-anchor element's
+    /// subtree on top. A sticky element paints after its normal siblings (and before overlay
+    /// siblings), so it covers the rows it's stuck over.
     pub(in crate::runtime) fn update_layer_paint_order(
         &mut self,
         tree: &types::TreeState,
         flying: &[(NodeId, MRect)],
+        is_launched: impl Fn(NodeId) -> bool,
         sticky_of: impl Fn(usize) -> bool,
+        exiting: impl Fn(usize) -> bool,
     ) {
         let n = tree.nodes.len();
         let mut first = vec![n; n + 1];
@@ -343,50 +367,88 @@ impl PaintState {
                 next[i] = first[parent]; first[parent] = i;
             }
         }
-        let mut lifted: Vec<usize> = flying.iter().filter_map(|(id, _)| tree.node_index.get(id).copied()).collect();
+        let mut lifted: Vec<usize> = flying
+            .iter()
+            .filter_map(|(id, _)| tree.node_index.get(id).copied())
+            .filter(|&i| !tree.nodes[i].vis.flight_in_place || is_launched(tree.nodes[i].id))
+            .collect();
         if tree.has_raise { lifted.extend((0..n).filter(|&i| tree.nodes[i].vis_flags.raise())); }
         lifted.sort_unstable();
         lifted.dedup();
         self.lifted_anchors.clear();
-        if !lifted.is_empty() {
-            // An anchored overlay whose anchor lives inside a lifted (`.raise()` or flying) subtree
-            // must paint after that subtree so `drawn[anchor]` is populated and the overlay draws
-            // above its anchor (e.g. a hover card or menu over a peeked sidebar or raised modal).
-            let mut lifted_mask = vec![false; n];
-            for &r in &lifted { lifted_mask[r] = true; }
-            let lifted_root = |mut k: usize, mask: &[bool]| -> Option<usize> {
+        let mut lifted_pos = if !lifted.is_empty() || tree.has_above { vec![0u32; n] } else { Vec::new() };
+        let mut next_pass = 1u32;
+        for &r in &lifted {
+            lifted_pos[r] = next_pass;
+            next_pass += 1;
+        }
+        if tree.has_above {
+            // An anchored overlay whose anchor paints after it (either mounted later in tree order,
+            // such as a select portal built before its dialog, or inside a `.raise()`/flying
+            // subtree) must paint after its anchor so `drawn[anchor]` is populated and the overlay
+            // draws and hit-tests above it.
+            let mut base_rank = vec![0usize; n];
+            let mut rank_pos = 0usize;
+            let mut cur = first[0];
+            while cur < n {
+                base_rank[cur] = rank_pos;
+                rank_pos += 1;
+                if first[cur + 1] < n { cur = first[cur + 1]; continue; }
                 loop {
-                    if mask[k] { return Some(k); }
-                    k = tree.nodes[k].parent?;
+                    if next[cur] < n { cur = next[cur]; break; }
+                    match tree.nodes[cur].parent { Some(parent) => cur = parent, None => { cur = n; break; } }
+                }
+            }
+            let above_nodes: Vec<usize> = (0..n).filter(|&i| tree.nodes[i].above.is_some()).collect();
+            let pass_of = |mut k: usize, pos: &[u32]| -> u32 {
+                loop {
+                    if pos[k] != 0 { return pos[k]; }
+                    let Some(p) = tree.nodes[k].parent else { return 0 };
+                    k = p;
                 }
             };
-            let mut changed = true;
-            while changed {
-                changed = false;
-                for i in 0..n {
-                    if lifted_mask[i] { continue; }
+            let max_rounds = above_nodes.len() + lifted.len() + 2;
+            for _ in 0..max_rounds {
+                let mut changed = false;
+                for &i in &above_nodes {
                     let Some(a) = &tree.nodes[i].above else { continue };
-                    let Some(j) = super::anchor_index(&tree.nodes, i, a) else { continue };
-                    let Some(ar) = lifted_root(j, &lifted_mask) else { continue };
-                    if lifted_root(i, &lifted_mask) != Some(ar) {
-                        lifted_mask[i] = true;
-                        lifted.push(i);
-                        self.lifted_anchors.push(i);
+                    let Some(j) = super::anchor_index_live(&tree.nodes, i, a, &exiting) else { continue };
+                    if (pass_of(j, &lifted_pos), base_rank[j]) > (pass_of(i, &lifted_pos), base_rank[i]) {
+                        if lifted_pos[i] == 0 {
+                            self.lifted_anchors.push(i);
+                        }
+                        lifted_pos[i] = next_pass;
+                        next_pass += 1;
                         changed = true;
                     }
                 }
+                // Keep any lifted node after every lifted ancestor so `inh_scratch[parent]` is
+                // populated before the lifted child paints.
+                for u in 0..n {
+                    if lifted_pos[u] == 0 { continue; }
+                    let Some(p) = tree.nodes[u].parent else { continue };
+                    if pass_of(p, &lifted_pos) > lifted_pos[u] {
+                        lifted_pos[u] = next_pass;
+                        next_pass += 1;
+                        changed = true;
+                    }
+                }
+                if !changed { break; }
             }
-            if !self.lifted_anchors.is_empty() {
-                lifted.sort_unstable();
+            if !self.lifted_anchors.is_empty() || !lifted.is_empty() {
+                lifted.clear();
+                lifted.extend((0..n).filter(|&i| lifted_pos[i] != 0));
+                lifted.sort_unstable_by_key(|&i| lifted_pos[i]);
                 self.lifted_anchors.sort_unstable();
+                self.lifted_anchors.dedup();
             }
         }
         self.layer_paint_order.clear();
         for top in std::iter::once(None).chain(lifted.iter().map(|&r| Some(r))) {
             let mut i = top.unwrap_or(first[0]);
             while i < n {
-                // A flying subtree paints in its own pass, not where the tree reaches it.
-                if top == Some(i) || lifted.binary_search(&i).is_err() {
+                // A flying, raised or lifted-anchor subtree paints in its own pass, not where the tree reaches it.
+                if top == Some(i) || lifted_pos.get(i).copied().unwrap_or(0) == 0 {
                     self.layer_paint_order.push(i);
                     if first[i + 1] < n { i = first[i + 1]; continue; }
                 }
@@ -412,6 +474,33 @@ impl PaintState {
     #[inline]
     pub(crate) fn materials(&self) -> &[crate::system_material::MaterialDraw] {
         &self.materials
+    }
+
+    #[inline]
+    pub(in crate::runtime) fn max_native_materials(&self) -> usize {
+        self.max_native_materials
+    }
+
+    #[inline]
+    pub(in crate::runtime) fn set_max_native_materials(&mut self, max: usize) -> bool {
+        let clamped = crate::system_material::clamp_max_native_materials(max);
+        let changed = self.max_native_materials != clamped;
+        if changed {
+            self.max_native_materials = clamped;
+            self.material_fallback_warned = false;
+        }
+        changed
+    }
+
+    #[inline]
+    pub(in crate::runtime) fn material_fallback(&self, id: NodeId) -> bool {
+        self.material_fallbacks.contains(&id)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn material_fallback_warned(&self) -> bool {
+        self.material_fallback_warned
     }
 
     #[inline]

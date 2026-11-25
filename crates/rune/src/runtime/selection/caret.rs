@@ -3,6 +3,39 @@
 //! is re-measured in the same commit when an edit moves it.
 use super::*;
 
+/// Snapshot of a focused field's text and caret before an `El::on_input_key` handler runs.
+pub(in crate::runtime) struct CaretFollowCheck {
+    path: String,
+    text: crate::edit::Wiped,
+    anchor: usize,
+    focus: usize,
+    affinity: parley::Affinity,
+}
+
+impl CaretFollowCheck {
+    pub(in crate::runtime) fn new(path: String, edit: &crate::TextEdit) -> Self {
+        let (a, b) = edit.range();
+        let (anchor, focus) = if edit.anchor <= edit.focus { (a, b) } else { (b, a) };
+        Self {
+            path,
+            text: crate::edit::Wiped(edit.text.clone()),
+            anchor,
+            focus,
+            affinity: edit.affinity,
+        }
+    }
+
+    pub(in crate::runtime) fn changed(&self, path: &str, edit: &crate::TextEdit) -> bool {
+        if self.path != path { return false; }
+        let (a, b) = edit.range();
+        let (anchor, focus) = if edit.anchor <= edit.focus { (a, b) } else { (b, a) };
+        self.anchor != anchor
+            || self.focus != focus
+            || self.affinity != edit.affinity
+            || self.text.as_str() != edit.text.as_str()
+    }
+}
+
 /// Text selection, links, field click/scroll, caret, IME, spellcheck and clipboard state owned by
 /// [`RuntimeCore`].
 pub(crate) struct TextInputState {
@@ -23,16 +56,20 @@ pub(crate) struct TextInputState {
     pub(in crate::runtime) caret_watch: bool,
     /// An edit ran this frame: keep the caret in its scroll viewport after the commit.
     pub(in crate::runtime) caret_follow: bool,
+    /// Snapshot of the focused field before an `El::on_input_key` handler consumed a key; resolved
+    /// against the committed tree so edits and caret moves follow the caret without calling
+    /// `access` after a handler that may have removed the field.
+    pub(in crate::runtime) caret_follow_check: Option<CaretFollowCheck>,
     /// The composition `App::on_ime` currently has open.
     app_ime_comp: app_ime::AppComposition,
-    /// The `El::ime_cursor` that has the input method asks for Option as Alt (`El::ime_option_as_alt`).
-    pub(crate) ime_option_as_alt: bool,
+    /// The `El::ime_cursor` that has the input method asks for Option as Alt (`El::ime_option_as_alt` / `El::ime_option_as_alt_mode`).
+    pub(crate) ime_option_as_alt: crate::OptionAsAlt,
     /// The shell cancels native composition before enabling the new text focus.
     pub(crate) ime_reset: bool,
     /// The focused spellchecked field's word at the caret (`spell::pause`).
     pub(in crate::runtime) spell_watch: Option<crate::spell::pause::Watch>,
     /// Linux's primary selection (`runtime/input/primary_selection.rs`).
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) primary: primary_selection::PrimarySelection,
     // Outer None: no read; inner None: app-level paste rather than a focused editor.
     pub(crate) paste_request: Option<Option<String>>,
@@ -64,11 +101,12 @@ impl TextInputState {
             caret: None,
             caret_watch: false,
             caret_follow: false,
+            caret_follow_check: None,
             app_ime_comp: Default::default(),
-            ime_option_as_alt: false,
+            ime_option_as_alt: crate::OptionAsAlt::None,
             ime_reset: false,
             spell_watch: None,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", test))]
             primary: Default::default(),
             paste_request: None,
             read_requests: Vec::new(),
@@ -86,8 +124,8 @@ impl TextInputState {
     }
 
     #[inline]
-    pub(in crate::runtime) fn step_app_ime(&mut self, ev: &Ime) {
-        self.app_ime_comp.step(ev);
+    pub(in crate::runtime) fn step_app_ime(&mut self, ev: &Ime) -> crate::machine::Effects<app_ime::AppImeEffect> {
+        self.app_ime_comp.step(ev)
     }
 
     #[inline]
@@ -177,61 +215,108 @@ impl RuntimeCore {
         dy
     }
 
-    /// Node `i`'s caret line `[x, y, w, h]` in window points at its laid-out place, after
-    /// scrolling and sticky shifts, if it is a focused text field.
-    pub(in crate::runtime) fn caret_rect(&self, nodes: &[Node], i: usize) -> Option<[f32; 4]> {
+    /// Text origin `[x, y]` in window points for focused text field `i` at its laid-out place,
+    /// after scrolling, sticky shifts, growth stack deltas and single-line horizontal scroll.
+    pub(in crate::runtime) fn field_text_origin(
+        &self,
+        nodes: &[Node],
+        i: usize,
+        inp: &crate::el::InputSpec,
+        spec: &crate::el::TextSpec,
+        laid: &crate::text::TextLayout,
+    ) -> [f32; 2] {
         let n = &nodes[i];
-        let (inp, spec, laid) = (n.input.as_ref()?, n.text.as_ref()?, n.text_layout.as_ref()?);
-        if !inp.edit.focused { return None; }
         let layout = laid.view();
         let s = self.env.scale;
         let t = sticky::anchored_target(nodes, &self.scroll.scrolls, i, self.viewport);
         let y = t[1] + self.stack_row_dy(nodes, i);
         let tw = text_width(layout.full_width()) / s;
         let (x0, x1) = (t[0] + n.inset[0], t[2] - n.inset[2]);
+        let (y0, y1) = (y + n.inset[1], y + (t[3] - t[1]) - n.inset[3]);
         let mut x = text_x(spec, x0, x1, tw, layout.flow());
         if inp.single_line && let Some(l) = laid.single() {
             let prev = self.edit.single_line_scroll(&n.path);
             x -= single_line_offset(prev, inp, &spec.content, l, s, (x1 - x0) * s) / s;
         }
-        let bb = layout.caret(caret_index(&inp.edit, &spec.content), inp.edit.affinity, 1.5 * s);
-        let h = if bb.y1 > bb.y0 { (bb.y1 - bb.y0) as f32 / s } else { spec.style.line_px() };
-        Some([x + bb.x0 as f32 / s, y + n.inset[1] + bb.y0 as f32 / s, 1.5, h])
+        [x, text_y(spec, y0, y1, text_height(spec, layout, s) / s)]
     }
 
-    /// After an edit, scrolls the focused field's nearest scroll viewport on each axis just far
-    /// enough to show the caret line, as a browser does for a textarea, leaving the viewport's
-    /// `El::scroll_margin` like CSS `scroll-padding`.
+    /// Node `i`'s caret line `[x, y, w, h]` in window points at its laid-out place, after
+    /// scrolling and sticky shifts, if it is a focused text field.
+    pub(in crate::runtime) fn caret_rect(&self, nodes: &[Node], i: usize) -> Option<[f32; 4]> {
+        let n = &nodes[i];
+        let (inp, spec, laid) = (n.input.as_ref()?, n.text.as_ref()?, n.text_layout.as_ref()?);
+        if !inp.edit.focused { return None; }
+        let [x, y] = self.field_text_origin(nodes, i, inp, spec, laid);
+        let s = self.env.scale;
+        let bb = laid.view().caret(caret_index(&inp.edit, &spec.content), inp.edit.affinity, 1.5 * s);
+        let h = if bb.y1 > bb.y0 { (bb.y1 - bb.y0) as f32 / s } else { spec.style.line_px() };
+        Some([x + bb.x0 as f32 / s, y + bb.y0 as f32 / s, 1.5, h])
+    }
+
+    /// After an edit (or focus gain with `El::reveal_caret_on_focus(true)`), scrolls the focused
+    /// field's enclosing scroll viewports on each axis just far enough to show the caret line, as
+    /// a browser does for a textarea, leaving each viewport's `El::scroll_margin` like CSS
+    /// `scroll-padding`.
     pub(in crate::runtime) fn follow_caret(&mut self, app: &mut dyn AppDriver) {
+        if self.focused_index().is_none()
+            && let Some(path) = self.kbd.focus.owned().filter(|p| self.commit.virtual_inputs.contains_key(p))
+        {
+            self.reveal_row(app, &ScrollReveal::into_view(None, path), true);
+            self.step_scroll(0.0);
+        }
         let Some(i) = self.focused_index() else { return };
-        let Some(r) = self.caret_rect(&self.tree.nodes, i) else { return };
+        if self.caret_rect(&self.tree.nodes, i).is_none() { return; }
         let mut scrolled = false;
         for horizontal in [false, true] {
-            let Some(v) = std::iter::successors(Some(i), |&p| self.tree.nodes[p].parent.filter(|_| self.tree.nodes[p].above.is_none()))
-                .skip(1)
-                .find(|&p| self.tree.nodes[p].scroll.is_some() && self.tree.nodes[p].scroll_axes.has(horizontal)) else { continue };
-            let a = usize::from(!horizontal);
-            let start = scroll_offsets(&self.scroll.scrolls, &self.tree.nodes, v).fold(self.tree.nodes[v].target[a], |p, o| p - o[a]);
-            let view = f64::from(self.tree.nodes[v].target[a + 2] - self.tree.nodes[v].target[a]);
-            let (at, len) = (f64::from(r[a] - start), f64::from(r[a + 2]));
-            let margin = f64::from(self.tree.nodes[v].scroll_edges.margin);
-            let delta = scroll_edge::reveal(0.0, at, len, view, margin);
-            if delta == 0.0 { continue; }
-            let stick = self.tree.nodes[v].scroll.is_some_and(|s| s.stick_bottom);
-            let Some(st) = self.scroll.scrolls.get_mut(&self.tree.nodes[v].id) else { continue };
-            if horizontal {
-                st.x.offset = (st.x.offset + st.x.toward(-delta)).clamp(0.0, st.x.max);
-                st.x.motion = XMotion::Rest;
-            } else {
-                st.offset = (st.offset + delta).clamp(0.0, st.max);
-                st.land(stick);
-                scrolled = true;
+            let mut cur = Some(i);
+            while let Some(v) = cur.and_then(|p| self.tree.nodes[p].parent.filter(|_| self.tree.nodes[p].above.is_none())) {
+                cur = Some(v);
+                if !(self.tree.nodes[v].scroll.is_some() && self.tree.nodes[v].scroll_axes.has(horizontal)) {
+                    continue;
+                }
+                let Some(r) = self.caret_rect(&self.tree.nodes, i) else { return };
+                let a = usize::from(!horizontal);
+                let start = scroll_offsets(&self.scroll.scrolls, &self.tree.nodes, v).fold(self.tree.nodes[v].target[a], |p, o| p - o[a]);
+                let view = f64::from(self.tree.nodes[v].target[a + 2] - self.tree.nodes[v].target[a]);
+                let (at, len) = (f64::from(r[a] - start), f64::from(r[a + 2]));
+                let margin = f64::from(self.tree.nodes[v].scroll_edges.margin);
+                let delta = scroll_edge::reveal(0.0, at, len, view, margin);
+                if delta == 0.0 { continue; }
+                let stick = self.tree.nodes[v].scroll.is_some_and(|s| s.stick_bottom);
+                let Some(st) = self.scroll.scrolls.get_mut(&self.tree.nodes[v].id) else { continue };
+                let moved = if horizontal {
+                    let before = st.x.offset;
+                    st.x.offset = (st.x.offset + st.x.toward(-delta)).clamp(0.0, st.x.max);
+                    st.x.motion = XMotion::Rest;
+                    (st.x.offset - before).abs() > 1e-6
+                } else {
+                    let before = st.offset;
+                    st.offset = (st.offset + delta).clamp(0.0, st.max);
+                    st.land(stick);
+                    let m = (st.offset - before).abs() > 1e-6;
+                    scrolled |= m;
+                    m
+                };
+                st.moved();
+                if moved { st.note_source(crate::ScrollSource::Programmatic); }
             }
-            st.moved();
         }
         if scrolled && self.virtual_window_changed() {
-            self.commit(app, &Tx::default());
+            self.commit_virtual_scroll(app, &Tx::default());
             self.step_scroll(0.0);
+        }
+    }
+
+    /// Promotes a pending `El::on_input_key` snapshot into `caret_follow` when the committed tree's
+    /// focused field is still the same field and its text or caret changed.
+    pub(in crate::runtime) fn resolve_caret_follow(&mut self) {
+        let Some(check) = self.edit.caret_follow_check.take() else { return };
+        if let Some(path) = self.kbd.focus.path()
+            && let Some(input) = self.focused_input()
+            && check.changed(path, &input.edit)
+        {
+            self.edit.caret_follow = true;
         }
     }
 
@@ -249,3 +334,7 @@ impl RuntimeCore {
 #[cfg(test)]
 #[path = "caret_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "focus_caret_tests.rs"]
+mod focus_tests;

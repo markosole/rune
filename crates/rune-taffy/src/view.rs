@@ -8,20 +8,58 @@ use taffy::compute::{
 };
 use taffy::geometry::{Point, Rect, Size};
 use taffy::style::{
-    AlignSelf, BoxGenerationMode, BoxSizing, Contain, CoreStyle, Dimension, Direction, Display, ExpandedDimension,
-    ExpandedLengthPercentageAuto, FlexboxItemStyle, LengthPercentage, LengthPercentageAuto, Overflow, Position, Style,
+    AlignSelf, AvailableSpace, BoxGenerationMode, BoxSizing, Contain, CoreStyle, Dimension, Direction, Display,
+    ExpandedDimension, ExpandedLengthPercentageAuto, FlexDirection, FlexboxItemStyle, LengthPercentage, LengthPercentageAuto,
+    Overflow, Position, Style,
 };
 use taffy::tree::{
     DetailedLayoutInfo, Layout, LayoutBlockContainer, LayoutContainingBlock, LayoutFlexboxContainer,
-    LayoutGridContainer, LayoutInput, LayoutOutput, LayoutPartialTree, NodeId, RunMode, TraversePartialTree,
-    TraverseTree,
+    LayoutGridContainer, LayoutInput, LayoutOutput, LayoutPartialTree, NodeId, RequestedAxis, RunMode, SizingMode,
+    TraversePartialTree, TraverseTree,
 };
 use taffy::{BlockContext, CacheTree, DetailedGridInfo};
 
+use crate::aspect::{
+    AspectStyle, ContainerCtx, FlexAspectOverride, GridChildStyle, container_aspect_override,
+    flex_child_aspect_override, grid_child_aspect_override,
+};
 use crate::store::{BoxLayout, LayoutStore, RetainedSlot, SlotChildIter};
 use crate::style::CompactStyle;
 
 const NONE_DETAIL: DetailedLayoutInfo = DetailedLayoutInfo::None;
+
+/// Available border-box width to clamp an auto-width flex row against under CSS fit-content sizing.
+///
+/// Upstream Taffy 0.15's `determine_container_main_size` returns a single line's sum of flex bases
+/// under `AvailableSpace::Definite(avail)` without clamping to `min(max-content, max(min-content, avail))`,
+/// so non-stretched row items in columns (`align-items: flex-start` / `center` / `end`) expand to
+/// their unwrapped width instead of shrinking their flexible children.
+#[inline]
+fn fit_content_row_limit(style: &CompactStyle, inputs: &LayoutInput) -> Option<f32> {
+    if !matches!(style.flex_direction(), FlexDirection::Row | FlexDirection::RowReverse) || inputs.known_dimensions.width.is_some() {
+        return None;
+    }
+    let AvailableSpace::Definite(avail_w) = inputs.available_space.width else {
+        return None;
+    };
+    if inputs.sizing_mode == SizingMode::InherentSize {
+        match style.size().width.expand() {
+            ExpandedDimension::Auto | ExpandedDimension::FitContent => {}
+            ExpandedDimension::Percent(_) if inputs.parent_size.width.is_none() => {}
+            _ => return None,
+        }
+        let height_definite = inputs.known_dimensions.height.is_some()
+            || match style.size().height.expand() {
+                ExpandedDimension::Length(_) => true,
+                ExpandedDimension::Percent(_) => inputs.parent_size.height.is_some(),
+                _ => false,
+            };
+        if style.aspect_ratio().is_some() && height_definite {
+            return None;
+        }
+    }
+    Some(avail_w)
+}
 
 #[inline(always)]
 fn round_dim(d: Dimension) -> Dimension {
@@ -43,6 +81,7 @@ fn round_lpa(d: LengthPercentageAuto) -> LengthPercentageAuto {
 pub(crate) struct FlexChildStyle<'a> {
     style: &'a CompactStyle,
     round_height: bool,
+    aspect: Option<FlexAspectOverride>,
 }
 
 impl CoreStyle for FlexChildStyle<'_> {
@@ -69,6 +108,9 @@ impl CoreStyle for FlexChildStyle<'_> {
     fn inset(&self) -> Rect<LengthPercentageAuto> { self.style.inset() }
     #[inline(always)]
     fn size(&self) -> Size<Dimension> {
+        if let Some(a) = self.aspect {
+            return a.size;
+        }
         let mut s = self.style.size();
         if self.round_height {
             s.height = round_dim(s.height);
@@ -77,6 +119,9 @@ impl CoreStyle for FlexChildStyle<'_> {
     }
     #[inline(always)]
     fn min_size(&self) -> Size<LengthPercentageAuto> {
+        if let Some(a) = self.aspect {
+            return a.min_size;
+        }
         let mut s = self.style.min_size();
         if self.round_height {
             s.height = round_lpa(s.height);
@@ -92,7 +137,12 @@ impl CoreStyle for FlexChildStyle<'_> {
         s
     }
     #[inline(always)]
-    fn aspect_ratio(&self) -> Option<f32> { self.style.aspect_ratio() }
+    fn aspect_ratio(&self) -> Option<f32> {
+        match self.aspect {
+            Some(a) => a.aspect_ratio,
+            None => self.style.aspect_ratio(),
+        }
+    }
     #[inline(always)]
     fn margin(&self) -> Rect<LengthPercentageAuto> { self.style.margin() }
     #[inline(always)]
@@ -106,6 +156,9 @@ impl CoreStyle for FlexChildStyle<'_> {
 impl FlexboxItemStyle for FlexChildStyle<'_> {
     #[inline(always)]
     fn flex_basis(&self) -> Dimension {
+        if let Some(a) = self.aspect {
+            return a.flex_basis;
+        }
         let b = self.style.flex_basis();
         if self.round_height { round_dim(b) } else { b }
     }
@@ -124,6 +177,7 @@ where
     pub(crate) store: &'s mut LayoutStore,
     pub(crate) measure_leaf: F,
     pub(crate) in_whole_rows_col: bool,
+    pub(crate) container_ctx: Option<ContainerCtx>,
 }
 
 impl<F> LayoutStoreView<'_, F>
@@ -141,6 +195,19 @@ where
     }
 
     #[inline(always)]
+    fn container_style(&self, node_id: NodeId) -> AspectStyle<'_> {
+        let style = &self.slot(node_id).style;
+        let aspect = if style.aspect_ratio().is_some() {
+            self.container_ctx
+                .filter(|ctx| ctx.node_id == node_id)
+                .and_then(|ctx| container_aspect_override(style, ctx.parent_size, ctx.known_dimensions, ctx.sizing_mode))
+        } else {
+            None
+        };
+        AspectStyle { style, aspect }
+    }
+
+    #[inline(always)]
     fn compute_child_layout_inner(
         &mut self,
         node_id: NodeId,
@@ -148,10 +215,12 @@ where
         block_ctx: Option<&mut BlockContext<'_>>,
     ) -> LayoutOutput {
         let round_for_parent = core::mem::replace(&mut self.in_whole_rows_col, false);
+        let prev_ctx = self.container_ctx.take();
         if inputs.run_mode == RunMode::PerformHiddenLayout {
             self.slot_mut(node_id).box_layout = BoxLayout::ZERO;
             let out = compute_hidden_layout(self, node_id);
             self.in_whole_rows_col = round_for_parent;
+            self.container_ctx = prev_ctx;
             return out;
         }
 
@@ -160,23 +229,63 @@ where
             let s = &view.store.slots[idx];
             let (display_mode, has_children, whole_col) =
                 (s.style.display(), s.child_len() != 0, s.style.whole_rows_column());
+            let fit_row_avail = (display_mode == Display::Flex && has_children)
+                .then(|| fit_content_row_limit(&s.style, &inputs))
+                .flatten();
 
             match (display_mode, has_children) {
                 (Display::None, _) => compute_hidden_layout(view, node_id),
                 (Display::Block | Display::FlowRoot | Display::Flex | Display::Grid, true) => {
                     crate::stack::maybe_grow(|| {
+                        view.container_ctx = Some(ContainerCtx::new(node_id, &inputs));
                         let mut output = match display_mode {
                             Display::Block => compute_block_layout(view, node_id, inputs, block_ctx),
                             Display::FlowRoot => compute_block_layout(view, node_id, inputs, None),
                             Display::Flex => {
                                 view.in_whole_rows_col = whole_col;
-                                let r = compute_flexbox_layout(view, node_id, inputs);
+                                let mut r = compute_flexbox_layout(view, node_id, inputs);
+                                if let Some(avail_w) = fit_row_avail && r.size.width > avail_w {
+                                    let min_inputs = LayoutInput {
+                                        run_mode: RunMode::ComputeSize,
+                                        axis: RequestedAxis::Horizontal,
+                                        available_space: Size {
+                                            width: AvailableSpace::MinContent,
+                                            height: inputs.available_space.height,
+                                        },
+                                        ..inputs
+                                    };
+                                    view.container_ctx = Some(ContainerCtx::new(node_id, &min_inputs));
+                                    let min_w = compute_flexbox_layout(view, node_id, min_inputs).size.width;
+                                    let clamped_w = r.size.width.min(avail_w.max(min_w));
+                                    if clamped_w < r.size.width {
+                                        if inputs.run_mode == RunMode::ComputeSize
+                                            && inputs.axis == RequestedAxis::Horizontal
+                                        {
+                                            r = LayoutOutput::from_outer_size(Size { width: clamped_w, height: 0.0 });
+                                        } else {
+                                            let clamped_inputs = LayoutInput {
+                                                known_dimensions: Size {
+                                                    width: Some(clamped_w),
+                                                    height: inputs.known_dimensions.height,
+                                                },
+                                                known_dimensions_are_definite: Size {
+                                                    width: true,
+                                                    height: inputs.known_dimensions_are_definite.height,
+                                                },
+                                                ..inputs
+                                            };
+                                            view.container_ctx = Some(ContainerCtx::new(node_id, &clamped_inputs));
+                                            r = compute_flexbox_layout(view, node_id, clamped_inputs);
+                                        }
+                                    }
+                                }
                                 view.in_whole_rows_col = false;
                                 r
                             }
                             Display::Grid => compute_grid_layout(view, node_id, inputs),
                             Display::None => unreachable!(),
                         };
+                        view.container_ctx = None;
                         if inputs.run_mode == RunMode::PerformLayout {
                             compute_oof_layout(view, node_id, &mut output);
                         }
@@ -191,6 +300,7 @@ where
             }
         });
         self.in_whole_rows_col = round_for_parent;
+        self.container_ctx = prev_ctx;
         if round_for_parent && (inputs.run_mode == RunMode::ComputeSize || inputs.known_dimensions.height.is_none_or(|h| h == h.floor())) {
             out.size.height = (out.size.height + 0.5).floor();
         }
@@ -317,7 +427,7 @@ where
     F: FnMut(LayoutInput, Option<usize>, &CompactStyle) -> LayoutOutput,
 {
     type BlockContainerStyle<'a>
-        = &'a CompactStyle
+        = AspectStyle<'a>
     where
         Self: 'a;
     type BlockItemStyle<'a>
@@ -327,7 +437,7 @@ where
 
     #[inline(always)]
     fn get_block_container_style(&self, node_id: NodeId) -> Self::BlockContainerStyle<'_> {
-        &self.slot(node_id).style
+        self.container_style(node_id)
     }
 
     #[inline(always)]
@@ -351,7 +461,7 @@ where
     F: FnMut(LayoutInput, Option<usize>, &CompactStyle) -> LayoutOutput,
 {
     type FlexboxContainerStyle<'a>
-        = &'a CompactStyle
+        = AspectStyle<'a>
     where
         Self: 'a;
     type FlexboxItemStyle<'a>
@@ -361,14 +471,22 @@ where
 
     #[inline(always)]
     fn get_flexbox_container_style(&self, node_id: NodeId) -> Self::FlexboxContainerStyle<'_> {
-        &self.slot(node_id).style
+        self.container_style(node_id)
     }
 
     #[inline(always)]
     fn get_flexbox_child_style(&self, child_node_id: NodeId) -> Self::FlexboxItemStyle<'_> {
         let style = &self.slot(child_node_id).style;
         let round_height = self.in_whole_rows_col && !style.position().is_out_of_flow() && style.display() != Display::None;
-        FlexChildStyle { style, round_height }
+        let aspect = if style.aspect_ratio().is_some() {
+            self.container_ctx.and_then(|ctx| {
+                let parent_style = &self.slot(ctx.node_id).style;
+                flex_child_aspect_override(parent_style, ctx, style, round_height)
+            })
+        } else {
+            None
+        };
+        FlexChildStyle { style, round_height, aspect }
     }
 }
 
@@ -377,22 +495,24 @@ where
     F: FnMut(LayoutInput, Option<usize>, &CompactStyle) -> LayoutOutput,
 {
     type GridContainerStyle<'a>
-        = &'a CompactStyle
+        = AspectStyle<'a>
     where
         Self: 'a;
     type GridItemStyle<'a>
-        = &'a CompactStyle
+        = GridChildStyle<'a>
     where
         Self: 'a;
 
     #[inline(always)]
     fn get_grid_container_style(&self, node_id: NodeId) -> Self::GridContainerStyle<'_> {
-        &self.slot(node_id).style
+        self.container_style(node_id)
     }
 
     #[inline(always)]
     fn get_grid_child_style(&self, child_node_id: NodeId) -> Self::GridItemStyle<'_> {
-        &self.slot(child_node_id).style
+        let style = &self.slot(child_node_id).style;
+        let aspect = if style.aspect_ratio().is_some() { grid_child_aspect_override(style) } else { None };
+        GridChildStyle { style, aspect }
     }
 
     #[inline(always)]

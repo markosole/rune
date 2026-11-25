@@ -1,4 +1,4 @@
-use super::{by_display, by_name, by_pci, dev_numbers, pci_address, pci_ids, power_rank, shows};
+use super::{by_display, by_name, by_pci, dev_numbers, driver_name, pci_address, pci_ids, power_rank, shows};
 use std::path::Path;
 
 fn adapter(name: &str, backend: wgpu::Backend, pci: &str) -> wgpu::AdapterInfo {
@@ -25,6 +25,17 @@ fn drm_device_links_give_their_pci_address() {
     assert_eq!(pci_address(Path::new("../../../0000:C5:00.0")).as_deref(), Some("0000:c5:00.0"));
     assert_eq!(pci_address(Path::new("../../../simple-framebuffer.0")), None);
     assert_eq!(pci_address(Path::new("../../../fd4ab000.gpu")), None);
+}
+
+#[test]
+fn drm_driver_links_give_their_kernel_driver_name() {
+    assert_eq!(driver_name(Path::new("../../../../bus/pci/drivers/i915")).as_deref(), Some("i915"));
+    assert_eq!(driver_name(Path::new("../../../../bus/pci/drivers/xe")).as_deref(), Some("xe"));
+    assert_eq!(driver_name(Path::new("../../../../bus/pci/drivers/amdgpu")).as_deref(), Some("amdgpu"));
+    assert_eq!(driver_name(Path::new("../../../../bus/platform/drivers/panthor")).as_deref(), Some("panthor"));
+    assert_eq!(driver_name(Path::new("../../../../bus/virtio/drivers/virtio_gpu")).as_deref(), Some("virtio_gpu"));
+    assert_eq!(driver_name(Path::new("")), None);
+    assert_eq!(driver_name(Path::new("/")), None);
 }
 
 #[test]
@@ -104,4 +115,36 @@ fn the_gpu_driving_the_primary_display_is_picked() {
     assert_eq!(by_display(&[(0x8086, 0x56a0)], &adapters), None, "no adapter drives it");
     let cant_present = [(adapters[0].0.clone(), false), adapters[1].clone()];
     assert_eq!(by_display(&[(0x10de, 0x2c05)], &cant_present), None);
+}
+
+#[test]
+fn adapter_name_pins_fallback_policy() {
+    use crate::fallback::Policy;
+    assert_eq!(super::policy_for_adapter_name(None), Policy::Automatic);
+    assert_eq!(super::policy_for_adapter_name(Some("AMD Radeon(TM) Graphics")), Policy::Pinned);
+    assert_eq!(super::policy_for_adapter_name(Some("Microsoft Basic Render Driver")), Policy::Pinned);
+}
+
+#[test]
+fn skip_test_without_gpu_skips_only_missing_adapter_when_opted_in() {
+    assert!(crate::is_missing_adapter_error("no GPU adapter: No suitable graphics adapter found"));
+    assert!(!crate::is_missing_adapter_error(r#"no GPU adapter matches WGPU_ADAPTER_NAME="foo""#));
+    assert!(!crate::is_missing_adapter_error("no GPU device: OutOfMemory"));
+    assert!(!crate::is_missing_adapter_error("GPU rejected Rune's shader"));
+
+    assert!(crate::skip_test_without_gpu_with(true, "no GPU adapter: No suitable graphics adapter found"));
+
+    let panicked = std::panic::catch_unwind(|| {
+        crate::skip_test_without_gpu_with(false, "no GPU adapter: No suitable graphics adapter found")
+    });
+    assert!(panicked.is_err(), "missing adapter must fail when RUNE_ALLOW_NO_GPU is unset");
+
+    for error in [
+        r#"no GPU adapter matches WGPU_ADAPTER_NAME="foo""#,
+        "no GPU device: OutOfMemory",
+        "GPU rejected Rune's shader",
+    ] {
+        let panicked = std::panic::catch_unwind(|| crate::skip_test_without_gpu_with(true, error));
+        assert!(panicked.is_err(), "real GPU error must not be skipped even with opt-in: {error}");
+    }
 }

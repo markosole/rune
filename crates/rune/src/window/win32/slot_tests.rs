@@ -1,7 +1,7 @@
 #![allow(unsafe_code)]
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-use windows_sys::Win32::System::Threading::{CreateEventW, CreateSemaphoreW, ReleaseSemaphore, SetEvent};
+use windows_sys::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
+use windows_sys::Win32::System::Threading::{CreateEventW, CreateSemaphoreW, GetCurrentProcess, ReleaseSemaphore, SetEvent};
 
 use super::{Slot, Take};
 
@@ -110,4 +110,40 @@ fn synchronous_resize_claims_each_generation_without_banking_permits() {
     assert_eq!(take(&mut slot, 32, Some(ready.0)), Take::Draw, "an acquire retry reuses the same permit");
     slot.presented();
     assert_eq!(take(&mut slot, 32, Some(ready.0)), Take::Later, "no spare permits may admit a burst");
+}
+
+#[test]
+fn in_place_reconfigure_keeps_its_wait_across_dxgi_handle_replacement() {
+    // SAFETY: both anonymous semaphore handles belong to this test and close on drop.
+    let semaphore = Event(unsafe { CreateSemaphoreW(std::ptr::null(), 0, 64, std::ptr::null()) });
+    assert!(!semaphore.0.is_null());
+    let mut duplicate = Event(std::ptr::null_mut());
+    let process = unsafe { GetCurrentProcess() };
+    assert_ne!(unsafe {
+        DuplicateHandle(process, semaphore.0, process, &mut duplicate.0, 0, 0, DUPLICATE_SAME_ACCESS)
+    }, 0);
+    let (send, receive) = std::sync::mpsc::channel();
+    let mut slot = Slot::default();
+    assert_eq!(slot.take(1, Some(semaphore.0), Some(move || { let _ = send.send(()); })), Take::Later);
+    slot.reconfigured(true);
+    assert_eq!(take(&mut slot, 2, Some(duplicate.0)), Take::Later);
+    assert_ne!(unsafe { ReleaseSemaphore(semaphore.0, 1, std::ptr::null_mut()) }, 0);
+    receive.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+    assert!(slot.came_back());
+    assert_eq!(take(&mut slot, 2, Some(duplicate.0)), Take::Draw);
+    slot.presented();
+    assert_eq!(take(&mut slot, 2, Some(duplicate.0)), Take::Later);
+    slot.reconfigured(false);
+    assert!(!slot.waiting());
+}
+
+#[test]
+fn ordinary_draw_drains_surplus_permits() {
+    // SAFETY: the test owns this anonymous semaphore.
+    let semaphore = Event(unsafe { CreateSemaphoreW(std::ptr::null(), 5, 64, std::ptr::null()) });
+    assert!(!semaphore.0.is_null());
+    let mut slot = Slot::default();
+    assert_eq!(take(&mut slot, 1, Some(semaphore.0)), Take::Draw);
+    slot.presented();
+    assert_eq!(take(&mut slot, 1, Some(semaphore.0)), Take::Later);
 }

@@ -32,7 +32,7 @@ pub(crate) struct FirstClick {
 }
 
 /// A press the pointer holds on element `path`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct Held {
     pub(crate) path: String,
     /// The `Phase::Down` its drags carry on from.
@@ -42,7 +42,7 @@ pub(crate) struct Held {
     pub(crate) at: (f32, f32),
     pub(crate) down_at: f64,
     pub(crate) hit: Hit,
-    /// It travelled past the click slop: it isn't a click of a double press.
+    /// It travelled past the click slop: it isn't a click of a double press, nor a press on an element that drags.
     pub(crate) moved: bool,
     /// It's the second press of a double press.
     pub(crate) second: bool,
@@ -56,21 +56,48 @@ pub(crate) struct Held {
     /// runs nothing.
     pub(crate) pressed_on_down: bool,
     pub(crate) touch: bool,
+    /// The `on_drag` handler that began this drag, kept so a cancel still reaches it if the
+    /// element leaves the tree or stops dragging.
+    pub(crate) drag_handler: Option<crate::el::DragFn>,
+}
+
+impl std::fmt::Debug for Held {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Held")
+            .field("path", &self.path)
+            .field("drag", &self.drag)
+            .field("button", &self.button)
+            .field("at", &self.at)
+            .field("down_at", &self.down_at)
+            .field("hit", &self.hit)
+            .field("moved", &self.moved)
+            .field("second", &self.second)
+            .field("drag_out", &self.drag_out)
+            .field("left", &self.left)
+            .field("link", &self.link)
+            .field("pressed_on_down", &self.pressed_on_down)
+            .field("touch", &self.touch)
+            .field("drag_handler", &self.drag_handler.is_some())
+            .finish()
+    }
 }
 
 impl Held {
     /// A press that just went down at `at`, inside its element and still.
     pub(crate) fn new(path: String, drag: Drag, button: PointerButton, at: (f32, f32), down_at: f64, second: bool, drag_out: Option<f32>) -> Self {
-        Self { path, drag, button, at, down_at, hit: Hit::Inside, moved: false, second, drag_out, left: false, link: None, pressed_on_down: false, touch: false }
+        Self { path, drag, button, at, down_at, hit: Hit::Inside, moved: false, second, drag_out, left: false, link: None, pressed_on_down: false, touch: false, drag_handler: None }
     }
 
-    pub(crate) fn inside(&self) -> bool { self.hit == Hit::Inside }
+    pub(crate) fn inside(&self) -> bool { self.hit == Hit::Inside && !self.left }
 
     /// Began on link `link` of its text.
     pub(crate) fn on_link(self, link: Option<usize>) -> Self { Self { link, ..self } }
 
     /// Ran its element's `on_press` as it went down.
     pub(crate) fn pressed_on_down(self, pressed_on_down: bool) -> Self { Self { pressed_on_down, ..self } }
+
+    /// Started an `on_drag` gesture on `drag_handler`.
+    pub(crate) fn drag_handler(self, drag_handler: Option<crate::el::DragFn>) -> Self { Self { drag_handler, ..self } }
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +170,13 @@ pub(crate) enum Secondary {
     #[default]
     Up,
     Held { path: String, link: Option<usize>, left: bool },
+    /// An outside secondary press dismissed (or was swallowed by) an active modal; release does
+    /// nothing, and on web `secondary_claim()` returns `"app"` so the browser's own context menu
+    /// stays closed.
+    Dismissed,
+    /// On Windows, an outside secondary press dismissed a `click_outside` menu modal and will
+    /// repost to what lies under it once the dismissal commits and rebuilds hit-testing.
+    DismissRepost { modal: String, outer: Option<String>, down: (f32, f32), left: bool },
 }
 
 /// The middle or secondary button held where the primary isn't: the element it shows pressed
@@ -174,11 +208,15 @@ impl Secondary {
     pub(crate) fn path(&self) -> Option<&str> {
         match self {
             Self::Held { path, .. } => Some(path),
-            Self::Up => None,
+            Self::Up | Self::Dismissed | Self::DismissRepost { .. } => None,
         }
     }
 
     pub(crate) fn is_held(&self) -> bool { matches!(self, Self::Held { .. }) }
+
+    pub(crate) fn is_captured(&self) -> bool {
+        matches!(self, Self::Held { .. } | Self::DismissRepost { .. })
+    }
 }
 
 /// Pointer position, button capture, hover/tooltip tracking, touch, autoscroll, file drops and OS
@@ -191,6 +229,9 @@ pub(in crate::runtime) struct PointerState {
     pub(in crate::runtime) hover_paused: bool,
     /// The host starts OS drags, so `drag_out` elements start one (headless tools act as one).
     pub(in crate::runtime) os_drag: bool,
+    /// Distinct bits for currently held named mouse buttons (Primary..Forward), for
+    /// `PointerEvent::pressing` and `El::on_any_press` chord suppression.
+    buttons_down: u8,
     pub(in crate::runtime) hovered: Option<String>,
     /// Elements with `on_hover_change` that the pointer is inside.
     pub(in crate::runtime) hover_within: Vec<String>,
@@ -207,6 +248,8 @@ pub(in crate::runtime) struct PointerState {
     pub(in crate::runtime) hover_delays: crate::runtime::hover_delay::HoverDelays,
     /// `on_hover_change` handlers of elements that left the tree, owed their queued leave.
     hover_gone: Vec<(String, crate::el::WindowFocusFn)>,
+    /// `on_drag` handlers of cancelled drags, kept so the queued cancelled `Up` still reaches them.
+    drag_gone: Vec<(String, crate::el::DragFn)>,
     /// The presses counted into `Drag::clicks`.
     press_clicks: crate::runtime::press_run::PressRun,
     /// The held press's drag repeat (`Tx::drag_repeat_after`).
@@ -225,6 +268,8 @@ pub(in crate::runtime) struct PointerState {
     pub(in crate::runtime) drag_ends: crate::drag_out::DragEnds,
     /// Drag-outs whose `on_drag_start` ran and whose `on_drag_end` hasn't yet.
     pub(in crate::runtime) drags_open: usize,
+    /// Currently held `PointerButton::Other(n)` ids (empty unless an extra button is held).
+    other_buttons_down: Vec<u16>,
 }
 
 impl PointerState {
@@ -245,16 +290,69 @@ impl PointerState {
             hovered: None,
             hover_within: Vec::new(),
             hover_gone: Vec::new(),
+            drag_gone: Vec::new(),
             hover_delays: Default::default(),
             hover_paused: false,
             hover_hold: Default::default(),
             help: Default::default(),
             file_drag: Default::default(),
             os_drag: true,
+            buttons_down: 0,
             drag_out_request: None,
             drag_ends: Default::default(),
             drags_open: 0,
+            other_buttons_down: Vec::new(),
         }
+    }
+
+    const BTN_PRIMARY: u8 = 1 << 0;
+    const BTN_SECONDARY: u8 = 1 << 1;
+    const BTN_MIDDLE: u8 = 1 << 2;
+    const BTN_BACK: u8 = 1 << 3;
+    const BTN_FORWARD: u8 = 1 << 4;
+
+    #[inline]
+    const fn button_bit(button: PointerButton) -> u8 {
+        match button {
+            PointerButton::Primary => Self::BTN_PRIMARY,
+            PointerButton::Secondary => Self::BTN_SECONDARY,
+            PointerButton::Middle => Self::BTN_MIDDLE,
+            PointerButton::Back => Self::BTN_BACK,
+            PointerButton::Forward => Self::BTN_FORWARD,
+            PointerButton::Other(_) => 0,
+        }
+    }
+
+    /// Whether any mouse button is currently held down anywhere in the window.
+    #[inline]
+    pub(in crate::runtime) fn any_button_down(&self) -> bool {
+        self.buttons_down != 0 || !self.other_buttons_down.is_empty()
+    }
+
+    #[inline]
+    pub(in crate::runtime) fn note_button_down(&mut self, button: PointerButton) {
+        if let PointerButton::Other(id) = button {
+            if !self.other_buttons_down.contains(&id) {
+                self.other_buttons_down.push(id);
+            }
+        } else {
+            self.buttons_down |= Self::button_bit(button);
+        }
+    }
+
+    #[inline]
+    pub(in crate::runtime) fn note_button_up(&mut self, button: PointerButton) {
+        if let PointerButton::Other(id) = button {
+            self.other_buttons_down.retain(|&b| b != id);
+        } else {
+            self.buttons_down &= !Self::button_bit(button);
+        }
+    }
+
+    #[inline]
+    pub(in crate::runtime) fn clear_buttons_down(&mut self) {
+        self.buttons_down = 0;
+        self.other_buttons_down.clear();
     }
 
     #[inline]
@@ -268,7 +366,7 @@ impl PointerState {
     /// waits for the release.
     #[inline]
     pub(in crate::runtime) fn captured(&self) -> bool {
-        self.press.is_held() || self.secondary.is_held() || self.tint.path().is_some()
+        self.press.is_held() || self.secondary.is_captured() || self.tint.path().is_some()
     }
 
     #[inline]
@@ -285,11 +383,21 @@ impl PointerState {
     #[inline]
     pub(in crate::runtime) fn hold_press(&mut self, held: Held) { self.press.hold(held); }
 
+    /// Whether the pointer left the window while a press holds capture.
+    #[inline]
+    pub(in crate::runtime) fn left(&self) -> bool {
+        self.press.held().is_some_and(|h| h.left)
+            || matches!(self.secondary, Secondary::Held { left: true, .. } | Secondary::DismissRepost { left: true, .. })
+    }
+
     /// The pointer left the window (`true`) or came back (`false`) while a press holds it.
     #[inline]
     pub(super) fn set_left(&mut self, out: bool) {
         if let Some(held) = self.press.held_mut() { held.left = out; }
-        if let Secondary::Held { left, .. } = &mut self.secondary { *left = out; }
+        match &mut self.secondary {
+            Secondary::Held { left, .. } | Secondary::DismissRepost { left, .. } => *left = out,
+            Secondary::Up | Secondary::Dismissed => {}
+        }
     }
 
     /// The host moved its window by `(dx, dy)` points under a still pointer.
@@ -297,6 +405,7 @@ impl PointerState {
     pub(in crate::runtime) fn window_moved(&mut self, dx: f32, dy: f32) {
         if let Some((x, y)) = self.pos { self.pos = Some((x - dx, y - dy)); }
         if let Some(held) = self.press.held_mut() { held.at = (held.at.0 - dx, held.at.1 - dy); }
+        if let Secondary::DismissRepost { down, .. } = &mut self.secondary { *down = (down.0 - dx, down.1 - dy); }
     }
 
     /// The button is up, so the held press can no longer start a drag-out; it stays a press.
@@ -350,6 +459,29 @@ impl PointerState {
     }
 
     #[inline]
+    pub(super) fn push_drag_gone(&mut self, path: String, f: crate::el::DragFn) {
+        self.drag_gone.push((path, f));
+    }
+
+    #[inline]
+    pub(super) fn take_drag_gone(&mut self, path: &str) -> Option<crate::el::DragFn> {
+        self.drag_gone.iter().position(|g| g.0 == path).map(|i| self.drag_gone.remove(i).1)
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    #[inline]
+    pub(super) fn clear_drag_gone(&mut self) {
+        self.drag_gone.clear();
+    }
+
+    /// Follows a held press whose path shifted across an unkeyed ancestor's sibling change.
+    pub(in crate::runtime) fn rebind_press_path(&mut self, next: &str) {
+        let Some(held) = self.press.held_mut() else { return };
+        let old = std::mem::replace(&mut held.path, next.to_owned());
+        self.press_repeat.rebind(&old, next);
+    }
+
+    #[inline]
     pub(super) fn secondary_held(&self) -> bool { self.secondary.is_held() }
 
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -370,8 +502,10 @@ impl PointerState {
     pub(in crate::runtime) fn clear_for_stage(&mut self) {
         self.press = Press::default();
         self.secondary = Secondary::Up;
+        self.clear_buttons_down();
         self.hovered = None;
         self.hover_gone.clear();
+        self.drag_gone.clear();
         self.hover_within.clear();
         self.hover_delays.clear();
         self.forget_drop_targets();
@@ -398,7 +532,7 @@ impl PointerState {
         &mut self.touch.scroll
     }
 
-    #[cfg(test)]
+    #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
     #[inline]
     pub(in crate::runtime) fn touch_scroll(&self) -> Option<crate::runtime::scroll_touch::TouchScroll> {
         self.touch.scroll

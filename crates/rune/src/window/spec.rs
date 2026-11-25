@@ -31,6 +31,61 @@ impl PlaceRequest {
     }
 }
 
+/// Which edge or corner of a window an interactive pointer resize drags
+/// ([`El::window_resize`](crate::El::window_resize),
+/// [`Tx::drag_resize_window`](crate::Tx::drag_resize_window)).
+///
+/// Maps directly to `winit::window::ResizeDirection` (Win32 sizing borders, X11
+/// `_NET_WM_MOVERESIZE`, Wayland `xdg_toplevel.resize`).
+///
+/// ```
+/// use rune::{ResizeEdge, el};
+///
+/// # let _ =
+/// el().pin(None, None, Some(0.0), Some(0.0))
+///     .size(12.0, 12.0)
+///     .window_resize(ResizeEdge::SouthEast)
+/// # ;
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ResizeEdge {
+    North,
+    South,
+    East,
+    West,
+    NorthEast,
+    NorthWest,
+    SouthEast,
+    SouthWest,
+}
+
+impl ResizeEdge {
+    /// The default hover cursor for a bare [`El::window_resize`](crate::El::window_resize) region.
+    pub(crate) const fn cursor(self) -> crate::el::Cursor {
+        match self {
+            ResizeEdge::North | ResizeEdge::South => crate::el::Cursor::ResizeNs,
+            ResizeEdge::East | ResizeEdge::West => crate::el::Cursor::ResizeEw,
+            ResizeEdge::NorthWest | ResizeEdge::SouthEast => crate::el::Cursor::ResizeNwse,
+            ResizeEdge::NorthEast | ResizeEdge::SouthWest => crate::el::Cursor::ResizeNesw,
+        }
+    }
+}
+
+impl From<ResizeEdge> for winit::window::ResizeDirection {
+    fn from(edge: ResizeEdge) -> Self {
+        match edge {
+            ResizeEdge::North => Self::North,
+            ResizeEdge::South => Self::South,
+            ResizeEdge::East => Self::East,
+            ResizeEdge::West => Self::West,
+            ResizeEdge::NorthEast => Self::NorthEast,
+            ResizeEdge::NorthWest => Self::NorthWest,
+            ResizeEdge::SouthEast => Self::SouthEast,
+            ResizeEdge::SouthWest => Self::SouthWest,
+        }
+    }
+}
+
 /// Process-level settings applied once, before constructing the native event loop.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RunOptions {
@@ -60,9 +115,43 @@ impl Display {
     pub fn native_bounds(&self) -> [f64; 4] {
         #[cfg(target_os = "macos")]
         if let Some(crate::NativeDisplayId::MacOS(id)) = self.native_id() { return crate::platform::macos::display_bounds(id); }
-        let divisor = if matches!(self.native_id(), Some(crate::NativeDisplayId::Wayland(_))) { self.scale } else { 1.0 };
-        [f64::from(self.position.0), f64::from(self.position.1), f64::from(self.size.0) / divisor, f64::from(self.size.1) / divisor]
+        native_bounds_for(self.native_id(), self.position, self.size, self.scale)
     }
+
+    /// Usable work area as `(origin, size)` in the same physical desktop-pixel coordinates as
+    /// [`position`](Self::position) and [`size`](Self::size).
+    ///
+    /// On Windows, this queries `GetMonitorInfoW`'s `rcWork` (excluding the taskbar and docked
+    /// app bars) for this display's `HMONITOR`, matching the region used by edge-placed
+    /// overlays. If the display is no longer available, or on other platforms and headless
+    /// virtual displays, this returns `(self.position, self.size)`.
+    ///
+    /// ```no_run
+    /// rune::run_windows(|displays| {
+    ///     for display in displays {
+    ///         let ((x, y), (w, h)) = display.work_area();
+    ///         let _ = (x, y, w, h);
+    ///     }
+    ///     Vec::<rune::AnyWindowSpec>::new()
+    /// });
+    /// ```
+    pub fn work_area(&self) -> ((i32, i32), (u32, u32)) {
+        #[cfg(target_os = "windows")]
+        if let Some(work) = self.id.as_ref().and_then(|id| crate::platform::win32::work_area(&id.0)) {
+            return work;
+        }
+        (self.position, self.size)
+    }
+}
+
+pub(crate) fn native_bounds_for(
+    native_id: Option<crate::NativeDisplayId>,
+    position: (i32, i32),
+    size: (u32, u32),
+    scale: f64,
+) -> [f64; 4] {
+    let divisor = if matches!(native_id, Some(crate::NativeDisplayId::Wayland(_))) { scale } else { 1.0 };
+    [f64::from(position.0), f64::from(position.1), f64::from(size.0) / divisor, f64::from(size.1) / divisor]
 }
 
 /// A window's minimum content size when neither `WindowOptions` nor `AppSpec` sets one.
@@ -71,6 +160,13 @@ pub(crate) const DEFAULT_MIN_SIZE: (f32, f32) = (420.0, 400.0);
 #[derive(Clone, Debug)]
 pub struct WindowOptions {
     pub transparent: bool,
+    /// A bare window without OS decorations: for HUDs, launchers, overlays and tray pop-ups.
+    /// On Windows, borderless windows stay bare with no outer resize borders or edge hit-test
+    /// interception so exact display bounds and edge controls are preserved; apps that draw a
+    /// custom titlebar and want OS resize edges, Aero Snap, and the system window menu
+    /// should use [`App::titlebar`](crate::App::titlebar) (with
+    /// [`Titlebar::controls(false)`](crate::Titlebar::controls) when drawing their own caption
+    /// buttons).
     pub borderless: bool,
     /// Clicks, and so hover, pass to whatever is below.
     pub click_through: bool,
@@ -87,6 +183,9 @@ pub struct WindowOptions {
     pub max_size: Option<(f32, f32)>,
     /// Whether the user can resize the window. Programmatic sizing is unaffected. A window
     /// that isn't resizable doesn't maximize either: its maximize (zoom) button is disabled.
+    /// On Windows, `borderless: true` windows stay bare and do not add edge resize borders;
+    /// use [`App::titlebar`](crate::App::titlebar) (or `Titlebar::new(h).controls(false)`) for
+    /// a custom-titlebar window with OS edge resizing.
     pub resizable: bool,
 }
 
@@ -113,7 +212,20 @@ impl WindowOptions {
     /// Optional AppKit settings without adding fields to existing WindowOptions literals.
     /// Ignored on other platforms.
     pub fn macos(self, native: MacWindowOptions) -> ConfiguredWindowOptions {
-        ConfiguredWindowOptions { options: self, native }
+        ConfiguredWindowOptions { options: self, native, windows: WindowsWindowOptions::default() }
+    }
+    /// Optional Win32 settings without adding fields to existing `WindowOptions` literals.
+    /// Ignored on other platforms.
+    ///
+    /// ```no_run
+    /// use rune::{WindowOptions, WindowsWindowOptions};
+    ///
+    /// let configured = WindowOptions { borderless: true, ..Default::default() }
+    ///     .windows(WindowsWindowOptions::default().undecorated_shadow(true));
+    /// let _ = configured;
+    /// ```
+    pub fn windows(self, windows: WindowsWindowOptions) -> ConfiguredWindowOptions {
+        ConfiguredWindowOptions { options: self, native: MacWindowOptions::default(), windows }
     }
     /// One transparent, borderless, topmost, click-through overlay covering this display.
     pub fn overlay(display: &Display) -> Self {
@@ -138,6 +250,17 @@ impl WindowOptions {
         if app_min.is_none() && self.min_size.is_none() { Some((DEFAULT_MIN_SIZE.0, 0.0)) } else { app_min }
     }
 
+    pub(crate) fn attributes_with_theme(
+        &self,
+        title: &str,
+        size: (f32, f32),
+        app_min: Option<(f32, f32)>,
+        visible: bool,
+        theme: Option<winit::window::Theme>,
+    ) -> winit::window::WindowAttributes {
+        self.attributes(title, size, app_min, visible).with_theme(theme)
+    }
+
     pub(crate) fn attributes(&self, title: &str, size: (f32, f32), app_min: Option<(f32, f32)>, visible: bool) -> winit::window::WindowAttributes {
         use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
         use winit::window::{Window, WindowButtons, WindowLevel};
@@ -156,8 +279,52 @@ impl WindowOptions {
         if let Some((w, h)) = self.max_size { attrs = attrs.with_max_inner_size(LogicalSize::new(w, h)); }
         if let Some((x, y)) = self.position { attrs = attrs.with_position(PhysicalPosition::new(x, y)); }
         if let Some((w, h)) = self.physical_size { attrs = attrs.with_inner_size(PhysicalSize::new(w, h)); }
+        #[cfg(target_os = "windows")]
+        if self.transparent && needs_no_redirection_bitmap(true, crate::render::Gpu::dx12_swapchain_kind()) {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            // DirectComposition draws transparent windows (`Gpu::instance`); without a redirection
+            // bitmap nothing beneath the swapchain paints opaque pixels behind translucent ones.
+            // Plain HWND swap chains (`DxgiFromHwnd`) are opaque-only and do not use DirectComposition.
+            attrs = attrs.with_no_redirection_bitmap(true);
+        }
         attrs
     }
+}
+
+/// Whether a Windows window should set `WS_EX_NOREDIRECTIONBITMAP`: only when the window is
+/// transparent and DirectComposition (`DxgiFromVisual`) is active.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) const fn needs_no_redirection_bitmap(
+    transparent: bool,
+    swapchain: wgpu::Dx12SwapchainKind,
+) -> bool {
+    transparent && matches!(swapchain, wgpu::Dx12SwapchainKind::DxgiFromVisual)
+}
+
+/// Colour space for a macOS window's presentation (`NSWindow.colorSpace` and its
+/// `CAMetalLayer.colorspace`).
+///
+/// Defaults to [`Self::Srgb`] so both the native Metal backend and the wgpu backend colour-manage
+/// sRGB colours on wide-gamut Mac displays, matching AppKit windows, browsers, Windows DXGI, and
+/// Linux Vulkan. Ignored on other platforms.
+///
+/// ```no_run
+/// use rune::{App, AppSpec, MacColorSpace, MacWindowOptions, el};
+///
+/// App::new(AppSpec::new("Raw", (640.0, 420.0), || (), |_, _| el()))
+///     .macos_window(MacWindowOptions::default().color_space(MacColorSpace::Unmanaged))
+///     .run();
+/// ```
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum MacColorSpace {
+    /// Colour-manage the window as sRGB (`NSColorSpace.sRGBColorSpace` and
+    /// `kCGColorSpaceSRGB`), matching AppKit windows and Rune's native Metal backend.
+    #[default]
+    Srgb,
+    /// Leave `NSWindow.colorSpace` unset (`nil`) and clear `CAMetalLayer.colorspace` so
+    /// framebuffer values reach the display unmodified.
+    Unmanaged,
 }
 
 /// AppKit properties for an ordinary window, reapplied on native recreation.
@@ -172,6 +339,12 @@ pub struct MacWindowOptions {
     pub(crate) launcher: bool,
     pub(crate) corner_radius: Option<f32>,
     pub(crate) corner_curve_circular: bool,
+    pub(crate) accepts_first_mouse: Option<bool>,
+    pub(crate) represented_file: Option<std::path::PathBuf>,
+    pub(crate) title_from_file: bool,
+    pub(crate) document_edited: bool,
+    pub(crate) show_title: bool,
+    pub(crate) color_space: MacColorSpace,
 }
 
 impl MacWindowOptions {
@@ -199,6 +372,311 @@ impl MacWindowOptions {
     pub fn corner_radius(mut self, radius: f32) -> Self { self.corner_radius = Some(radius.max(0.0)); self }
     /// Use a circular corner arc instead of the continuous curve for `corner_radius`.
     pub fn corner_curve_circular(mut self) -> Self { self.corner_curve_circular = true; self }
+    /// Sets `NSView.acceptsFirstMouse(for:)` through winit's `with_accepts_first_mouse` for all
+    /// macOS windows (bordered, full-size-content, borderless, and non-activating panels).
+    /// Pass `false` so clicking an inactive window activates it without delivering that click to
+    /// the view. Omitted keeps winit's default (`true`). Retained across native recreation and
+    /// ignored on other platforms.
+    ///
+    /// ```no_run
+    /// use rune::{App, AppSpec, MacWindowOptions, el};
+    ///
+    /// App::new(AppSpec::new("Review", (640.0, 420.0), || (), |_, _| el()))
+    ///     .macos_window(MacWindowOptions::default().accepts_first_mouse(false))
+    ///     .run();
+    /// ```
+    pub fn accepts_first_mouse(mut self, enabled: bool) -> Self {
+        self.accepts_first_mouse = Some(enabled);
+        self
+    }
+    /// Sets the document path associated with this window (`NSWindow.representedURL`), showing
+    /// AppKit's titlebar proxy icon and path menu when the native title is visible. Constructed
+    /// from the path string with no filesystem `stat`. An empty path clears it. Update at
+    /// runtime with [`Tx::set_represented_file`](crate::Tx::set_represented_file). Retained across
+    /// native recreation and ignored on other platforms.
+    ///
+    /// ```no_run
+    /// use rune::{App, AppSpec, MacWindowOptions, el};
+    ///
+    /// App::new(AppSpec::new("Notes", (640.0, 420.0), || (), |_, _| el()))
+    ///     .macos_window(
+    ///         MacWindowOptions::default()
+    ///             .represented_file("/tmp/notes.md")
+    ///             .show_title(true),
+    ///     )
+    ///     .run();
+    /// ```
+    pub fn represented_file(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.represented_file = normalize_represented_file(Some(path.into()));
+        self
+    }
+    /// When `true`, derives the macOS window title from the represented file's final path
+    /// component on creation and on each [`Tx::set_represented_file`](crate::Tx::set_represented_file)
+    /// update (restoring the window's configured title when cleared). Default `false` leaves the
+    /// window title untouched. Ignored on other platforms.
+    ///
+    /// ```no_run
+    /// use rune::MacWindowOptions;
+    ///
+    /// let opts = MacWindowOptions::default()
+    ///     .represented_file("/tmp/notes.md")
+    ///     .title_from_file(true);
+    /// let _ = opts;
+    /// ```
+    pub fn title_from_file(mut self, enabled: bool) -> Self {
+        self.title_from_file = enabled;
+        self
+    }
+    /// Sets the window's initial unsaved-changes state (`NSWindow.documentEdited`), showing the
+    /// dot inside the macOS close button. Default `false`. Update at runtime with
+    /// [`Tx::set_document_edited`](crate::Tx::set_document_edited). Retained across native
+    /// recreation and ignored on other platforms.
+    ///
+    /// Following AppKit's default, marking a document as edited disables dragging its proxy icon
+    /// until `document_edited` is cleared.
+    ///
+    /// ```no_run
+    /// use rune::MacWindowOptions;
+    ///
+    /// let opts = MacWindowOptions::default()
+    ///     .represented_file("/tmp/notes.md")
+    ///     .document_edited(true);
+    /// let _ = opts;
+    /// ```
+    pub fn document_edited(mut self, edited: bool) -> Self {
+        self.document_edited = edited;
+        self
+    }
+    /// Keeps the native macOS window title (and therefore AppKit's document proxy icon) visible
+    /// when `Chrome::full_size_content` is enabled. Default `false` hides the title under a
+    /// transparent full-size-content titlebar, preserving existing behavior. Ignored for
+    /// borderless windows and on other platforms.
+    ///
+    /// ```no_run
+    /// use rune::MacWindowOptions;
+    ///
+    /// let opts = MacWindowOptions::default()
+    ///     .represented_file("/tmp/notes.md")
+    ///     .show_title(true);
+    /// let _ = opts;
+    /// ```
+    pub fn show_title(mut self, show: bool) -> Self {
+        self.show_title = show;
+        self
+    }
+    /// Sets how macOS colour-manages this window (`NSWindow.colorSpace` and its
+    /// `CAMetalLayer.colorspace`).
+    ///
+    /// Defaults to [`MacColorSpace::Srgb`], matching AppKit windows, browsers, and Rune's
+    /// native Metal backend on wide-gamut displays across both the Metal and wgpu backends.
+    /// Pass [`MacColorSpace::Unmanaged`] to leave `NSWindow.colorSpace` unset (`nil`) and
+    /// clear `CAMetalLayer.colorspace` so framebuffer values reach the display unmodified.
+    /// Retained across native recreation and GPU surface reattach; ignored on other platforms.
+    ///
+    /// ```no_run
+    /// use rune::{MacColorSpace, MacWindowOptions};
+    ///
+    /// let opts = MacWindowOptions::default().color_space(MacColorSpace::Unmanaged);
+    /// let _ = opts;
+    /// ```
+    pub fn color_space(mut self, color_space: MacColorSpace) -> Self {
+        self.color_space = color_space;
+        self
+    }
+
+    /// Returns a copy with portable `exclude_from_capture` taking precedence when set, falling
+    /// back to `self.exclude_from_capture` when unset.
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+    pub(crate) fn with_portable_exclude(&self, portable: Option<bool>) -> Self {
+        let mut next = self.clone();
+        if let Some(exclude) = portable {
+            next.exclude_from_capture = Some(exclude);
+        }
+        next
+    }
+
+    /// Returns a copy with runtime document state (`Tx::set_represented_file`,
+    /// `Tx::set_document_edited`) overlaid when latched, preserving creation-time defaults when
+    /// unset.
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+    pub(crate) fn with_runtime_document(
+        &self,
+        represented_file: Option<&Option<std::path::PathBuf>>,
+        document_edited: Option<&bool>,
+    ) -> Self {
+        let mut next = self.clone();
+        if let Some(path) = represented_file {
+            next.represented_file = normalize_represented_file(path.clone());
+        }
+        if let Some(&edited) = document_edited {
+            next.document_edited = edited;
+        }
+        next
+    }
+
+    /// Applies macOS creation-time winit attributes (`accepts_first_mouse` for all windows, and
+    /// full-size-content titlebar visibility) without changing defaults when unset.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn apply_attributes(
+        &self,
+        mut attrs: winit::window::WindowAttributes,
+        borderless: bool,
+        full_size_content: bool,
+    ) -> winit::window::WindowAttributes {
+        use winit::platform::macos::WindowAttributesExtMacOS;
+        if let Some(accept) = self.accepts_first_mouse {
+            attrs = attrs.with_accepts_first_mouse(accept);
+        }
+        if !borderless && full_size_content {
+            attrs = attrs
+                .with_titlebar_transparent(true)
+                .with_title_hidden(!self.show_title)
+                .with_fullsize_content_view(true);
+        }
+        attrs
+    }
+}
+
+/// Normalizes a represented-file path so empty paths clear the represented file, matching AppKit's
+/// `NSWindow.representedFilename = ""` semantics.
+pub(crate) fn normalize_represented_file(
+    path: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    path.filter(|p| !p.as_os_str().is_empty())
+}
+
+/// Derives a window title from a represented file path without touching the filesystem.
+/// Returns the final path component when available, falling back to the full path string for
+/// root/dot paths, or `None` when empty.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) fn represented_file_title(path: &std::path::Path) -> Option<String> {
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    Some(
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned()),
+    )
+}
+
+/// Whether `path` explicitly indicates a directory via a trailing slash, avoiding filesystem
+/// `stat` calls when constructing `NSURL::fileURLWithPath_isDirectory`.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) fn represented_path_is_dir(path: &std::path::Path) -> bool {
+    path.to_string_lossy().ends_with('/')
+}
+
+/// Win32 properties for an ordinary window, reapplied on native recreation and ignored on other
+/// platforms. Omitted properties keep winit's defaults.
+///
+/// ```no_run
+/// use rune::{App, AppSpec, WindowOptions, WindowsWindowOptions, el};
+///
+/// let options = WindowOptions { borderless: true, always_on_top: true, ..Default::default() }
+///     .windows(
+///         WindowsWindowOptions::default()
+///             .exclude_from_capture(true)
+///             .no_activate(true)
+///             .tool_window(true)
+///             .undecorated_shadow(true),
+///     );
+/// App::new(AppSpec::new("Panel", (320.0, 200.0), || (), |_, _| el()))
+///     .configured_options(options)
+///     .run();
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WindowsWindowOptions {
+    pub(crate) exclude_from_capture: Option<bool>,
+    pub(crate) no_activate: bool,
+    pub(crate) tool_window: bool,
+    pub(crate) undecorated_shadow: Option<bool>,
+}
+
+impl WindowsWindowOptions {
+    /// Requests `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` (`true`) or `WDA_NONE`
+    /// (`false`) before the window shows. Unset leaves Windows' default affinity unchanged.
+    /// Portable [`App::exclude_from_capture`] and
+    /// [`WindowHandle::set_exclude_from_capture`](crate::WindowHandle::set_exclude_from_capture)
+    /// override this when set. Capture exclusion is native best effort, not a security boundary.
+    ///
+    /// ```no_run
+    /// use rune::WindowsWindowOptions;
+    ///
+    /// let opts = WindowsWindowOptions::default().exclude_from_capture(true);
+    /// let _ = opts;
+    /// ```
+    pub fn exclude_from_capture(mut self, exclude: bool) -> Self {
+        self.exclude_from_capture = Some(exclude);
+        self
+    }
+
+    /// Sets `WS_EX_NOACTIVATE` on the window and skips foreground activation on every reveal
+    /// (create, show, and open), so clicking or showing the window does not take focus from
+    /// another app. Reapplied after style-changing window operations and across recreation.
+    ///
+    /// ```no_run
+    /// use rune::WindowsWindowOptions;
+    ///
+    /// let opts = WindowsWindowOptions::default().no_activate(true);
+    /// let _ = opts;
+    /// ```
+    pub fn no_activate(mut self, enabled: bool) -> Self {
+        self.no_activate = enabled;
+        self
+    }
+
+    /// Sets `WS_EX_TOOLWINDOW` (and clears `WS_EX_APPWINDOW`) so the window stays off the
+    /// taskbar and Alt-Tab switcher. Reapplied after style-changing window operations and across
+    /// recreation.
+    ///
+    /// ```no_run
+    /// use rune::WindowsWindowOptions;
+    ///
+    /// let opts = WindowsWindowOptions::default().tool_window(true);
+    /// let _ = opts;
+    /// ```
+    pub fn tool_window(mut self, enabled: bool) -> Self {
+        self.tool_window = enabled;
+        self
+    }
+
+    /// Requests the system drop shadow on a borderless (`WindowOptions { borderless: true, .. }`)
+    /// window via winit's `with_undecorated_shadow`. Omitted keeps winit's default (`false`).
+    /// Retained across native recreation and ignored on non-Windows platforms.
+    ///
+    /// Client-area sizing stays unchanged; visible system borders and rounded corners depend on
+    /// the Windows version and window state (for example maximized or snapped), and Windows may
+    /// show a thin 1px top border line when enabled.
+    ///
+    /// ```no_run
+    /// use rune::{WindowOptions, WindowsWindowOptions};
+    ///
+    /// let opts = WindowOptions { borderless: true, ..Default::default() }
+    ///     .windows(WindowsWindowOptions::default().undecorated_shadow(true));
+    /// let _ = opts;
+    /// ```
+    pub fn undecorated_shadow(mut self, enabled: bool) -> Self {
+        self.undecorated_shadow = Some(enabled);
+        self
+    }
+
+    /// Effective capture exclusion, with portable `exclude_from_capture` taking precedence over
+    /// `self.exclude_from_capture` when set.
+    #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+    pub(crate) fn effective_exclude_from_capture(&self, portable: Option<bool>) -> Option<bool> {
+        portable.or(self.exclude_from_capture)
+    }
+
+    /// Applies Windows creation-time winit attributes without changing defaults when unset.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn apply_attributes(&self, mut attrs: winit::window::WindowAttributes) -> winit::window::WindowAttributes {
+        if let Some(shadow) = self.undecorated_shadow {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs = attrs.with_undecorated_shadow(shadow);
+        }
+        attrs
+    }
 }
 
 /// Ordinary options plus native builders, accepted by WindowSpec::configured_options.
@@ -206,10 +684,13 @@ impl MacWindowOptions {
 pub struct ConfiguredWindowOptions {
     pub(crate) options: WindowOptions,
     pub(crate) native: MacWindowOptions,
+    pub(crate) windows: WindowsWindowOptions,
 }
 
 impl From<WindowOptions> for ConfiguredWindowOptions {
-    fn from(options: WindowOptions) -> Self { Self { options, native: MacWindowOptions::default() } }
+    fn from(options: WindowOptions) -> Self {
+        Self { options, native: MacWindowOptions::default(), windows: WindowsWindowOptions::default() }
+    }
 }
 
 impl ConfiguredWindowOptions {
@@ -218,6 +699,22 @@ impl ConfiguredWindowOptions {
     /// launcher. Ignored on other platforms.
     pub fn macos(mut self, amend: impl FnOnce(MacWindowOptions) -> MacWindowOptions) -> Self {
         self.native = amend(self.native);
+        self
+    }
+
+    /// Amends the Win32 settings in place, keeping what a preset or prior `.macos(...)` call
+    /// already set. Ignored on other platforms.
+    ///
+    /// ```no_run
+    /// use rune::{MacWindowOptions, WindowOptions};
+    ///
+    /// let opts = WindowOptions { borderless: true, ..Default::default() }
+    ///     .macos(MacWindowOptions::default().shadow(true))
+    ///     .windows(|win| win.undecorated_shadow(true).tool_window(true));
+    /// let _ = opts;
+    /// ```
+    pub fn windows(mut self, amend: impl FnOnce(WindowsWindowOptions) -> WindowsWindowOptions) -> Self {
+        self.windows = amend(self.windows);
         self
     }
 }
@@ -275,6 +772,10 @@ impl<S: 'static> WindowSpec<S> {
         srgb_blend(enabled: bool);
         /// This window's font smoothing (`App::font_smoothing`).
         font_smoothing(mode: crate::FontSmoothing);
+        /// Maximum number of native `El::system_material` views this window may host at once
+        /// (default [`crate::MAX_NATIVE_MATERIALS`], clamped to 64), like
+        /// [`App::max_native_materials`].
+        max_native_materials(max: usize);
         /// Size this window's height to its content, like `App::fit_content_height`.
         fit_content_height();
         /// Ask a tiling window manager to float this window when it opens, like `App::float_on_open`.
@@ -287,12 +788,82 @@ impl<S: 'static> WindowSpec<S> {
         maximized(maximized: bool);
         /// Open this window full screen, like `App::full_screen`.
         full_screen(full_screen: bool);
+        /// AppKit native window policy, like [`App::macos_window`]. Ignored on other platforms.
+        ///
+        /// ```no_run
+        /// use rune::{AppSpec, MacWindowOptions, WindowSpec, el};
+        ///
+        /// let spec = WindowSpec::new("doc", AppSpec::new("Notes", (480.0, 360.0), || (), |_, _| el()))
+        ///     .macos_window(MacWindowOptions::default().accepts_first_mouse(false).show_title(true));
+        /// let _ = spec;
+        /// ```
+        macos_window(options: crate::MacWindowOptions);
+        /// Win32 native window policy, like `App::windows_window`. Ignored on other platforms.
+        ///
+        /// ```no_run
+        /// use rune::{AppSpec, WindowSpec, WindowsWindowOptions, el};
+        ///
+        /// let spec = WindowSpec::new("panel", AppSpec::new("Panel", (300.0, 200.0), || (), |_, _| el()))
+        ///     .windows_window(WindowsWindowOptions::default().tool_window(true));
+        /// let _ = spec;
+        /// ```
+        windows_window(options: crate::WindowsWindowOptions);
+        /// Exclude this window from screen captures on Windows and macOS, like `App::exclude_from_capture`.
+        ///
+        /// ```no_run
+        /// use rune::{AppSpec, WindowSpec, el};
+        ///
+        /// let spec = WindowSpec::new("notes", AppSpec::new("Notes", (480.0, 360.0), || (), |_, _| el()))
+        ///     .exclude_from_capture(true);
+        /// let _ = spec;
+        /// ```
+        exclude_from_capture(exclude: bool);
+        /// Preferred native light or dark chrome for this window, like [`App::color_scheme`].
+        ///
+        /// ```no_run
+        /// use rune::{AppSpec, ColorScheme, WindowSpec, el};
+        ///
+        /// let spec = WindowSpec::new("notes", AppSpec::new("Notes", (480.0, 360.0), || (), |_, _| el()))
+        ///     .color_scheme(ColorScheme::Dark);
+        /// let _ = spec;
+        /// ```
+        color_scheme(scheme: crate::ColorScheme);
         /// Send `Key::Modifier` presses and releases to this window, like `App::modifier_keys`.
         modifier_keys();
+        /// Deliver hardware media transport keys ([`Key::Media`](crate::Key::Media)) to this window, like [`App::media_keys`](crate::App::media_keys).
+        ///
+        /// ```no_run
+        /// use rune::{AppSpec, WindowSpec, el};
+        ///
+        /// let spec = WindowSpec::new("player", AppSpec::new("Player", (480.0, 320.0), || (), |_, _| el()))
+        ///     .media_keys();
+        /// let _ = spec;
+        /// ```
+        media_keys();
         /// Tab visits every focusable control in this window, like `App::tab_visits_controls`.
         tab_visits_controls(on: bool);
         /// Release this window's GPU device and renderer when it closes, like `App::release_gpu_when_closed`.
         release_gpu_when_closed();
+        /// Configure CPU-first startup and handover for this window, like [`App::cpu_first`].
+        ///
+        /// ```no_run
+        /// use rune::{AppSpec, CpuFirst, WindowSpec, el};
+        ///
+        /// let spec = WindowSpec::new("plan", AppSpec::new("Plan", (960.0, 640.0), || (), |_, _| el()))
+        ///     .cpu_first(CpuFirst::Only);
+        /// let _ = spec;
+        /// ```
+        cpu_first(mode: crate::CpuFirst);
+        /// Name the effect pipelines this window compiles ahead of their first use, like [`App::prewarm_effects`].
+        ///
+        /// ```no_run
+        /// use rune::{AppSpec, PrewarmEffects, WindowSpec, el};
+        ///
+        /// let spec = WindowSpec::new("notes", AppSpec::new("Notes", (480.0, 360.0), || (), |_, _| el()))
+        ///     .prewarm_effects(PrewarmEffects::BACKDROP_BLUR);
+        /// let _ = spec;
+        /// ```
+        prewarm_effects(effects: impl Into<crate::PrewarmEffects>);
         on_focus(f: fn(&mut S, bool, &mut crate::Tx));
         on_modifiers(f: fn(&mut S, crate::Mods, &mut crate::Tx));
         /// This window going off screen and back, like `App::on_visibility`.
@@ -301,6 +872,21 @@ impl<S: 'static> WindowSpec<S> {
         on_rest(f: fn(&mut S, &mut crate::Tx) -> bool);
         /// This window's editor's input method events, like `App::on_ime`.
         on_ime(f: fn(&mut S, &crate::Ime, &mut crate::Tx) -> bool);
+        /// Fallback handler for text-field menus when native pop-ups are unavailable, like `App::on_field_menu`.
+        on_field_menu(f: fn(&mut S, crate::FieldMenuRequest, &mut crate::Tx));
+        /// Intercepts a native close request before hiding or closing this window, like
+        /// [`App::on_close_request`].
+        ///
+        /// ```no_run
+        /// use rune::{AppSpec, CloseResponse, WindowSpec, el};
+        ///
+        /// let spec = WindowSpec::new("draft", AppSpec::new("Draft", (480.0, 320.0), || true, |_, _| el()))
+        ///     .on_close_request(|dirty, _| {
+        ///         if *dirty { CloseResponse::Defer } else { CloseResponse::Close }
+        ///     });
+        /// let _ = spec;
+        /// ```
+        on_close_request(f: fn(&mut S, &mut crate::Tx) -> crate::CloseResponse);
         /// Runs whenever this window closes, like `App::on_close`.
         on_close(f: fn(&mut S, &mut crate::Tx));
         /// Runs in this window when the app starts to quit, like `App::on_quit`.
@@ -311,16 +897,54 @@ impl<S: 'static> WindowSpec<S> {
         on_reopen(f: fn(&mut S, bool, &mut crate::Tx) -> bool);
         /// Receives links opened with the app, like `App::on_open_url`.
         on_open_url(f: fn(&mut S, &str, &mut crate::Tx));
+        /// Receives files opened with the app, like [`App::on_open_files`].
+        ///
+        /// ```no_run
+        /// use std::path::PathBuf;
+        /// use rune::{AppSpec, WindowSpec, el};
+        ///
+        /// let spec = WindowSpec::new("viewer", AppSpec::new("Viewer", (640.0, 420.0), Vec::<PathBuf>::new, |_, _| el()))
+        ///     .on_open_files(|opened, paths, _| opened.extend(paths.iter().cloned()));
+        /// let _ = spec;
+        /// ```
+        on_open_files(f: fn(&mut S, &[std::path::PathBuf], &mut crate::Tx));
         /// Runs on the UI thread each time the native window is created, like `App::on_window`.
         on_window(f: impl FnMut(&crate::WindowHandle) + 'static);
         /// Called on the event thread after the first frame is ready, once per native creation.
         on_ready(f: impl FnMut(&crate::WindowHandle) + 'static);
+        /// Runs once on the UI thread immediately before the event loop drops windows and closes
+        /// the native display connection, like [`App::on_display_close`].
+        ///
+        /// ```no_run
+        /// use rune::{AppSpec, WindowSpec, el};
+        ///
+        /// let spec = WindowSpec::new("main", AppSpec::new("Display", (320.0, 200.0), || (), |_, _| el()))
+        ///     .on_display_close(|| {});
+        /// let _ = spec;
+        /// ```
+        on_display_close(f: impl FnOnce() + 'static);
         /// Reports each of this window's frames, like `App::on_frame_encoded`. A spec made with
         /// `WindowSpec::from_app` keeps its app's hook unless this replaces it; windows `App::window`
         /// adds have their own.
         on_frame_encoded(f: impl FnMut(&crate::FrameEncoded) + 'static);
+        /// Reports when each drawn frame of this window actually reached the screen, like
+        /// [`App::on_frame_presented`]. A spec made with [`WindowSpec::from_app`] keeps its app's
+        /// hook unless this replaces it; windows [`App::window`] adds have their own.
+        ///
+        /// ```no_run
+        /// use rune::{AppSpec, WindowSpec, el};
+        ///
+        /// let spec = WindowSpec::new("main", AppSpec::new("Timing", (320.0, 200.0), || (), |_, _| el()))
+        ///     .on_frame_presented(|p| {
+        ///         let _ = (p.seq(), p.presented_at());
+        ///     });
+        /// let _ = spec;
+        /// ```
+        on_frame_presented(f: impl FnMut(&crate::FramePresented) + 'static);
         /// Runs on the UI thread after each drawn frame of this window with its runtime, like `App::on_frame_drawn`.
         on_frame_drawn(f: impl FnMut(&crate::Runtime<S>) + 'static);
+        /// Keep this window's layout reads across launches, like `App::layout_seed`.
+        layout_seed(seed: Option<crate::LayoutSeed>, keep: impl FnMut(crate::LayoutSeed) + 'static);
         /// Draw every frame of this window through `compositor`, like `App::compositor`.
         compositor(compositor: impl crate::compose::Compositor<S>);
         /// This window's own counters for native trace summaries, like `App::dev_stats`.
@@ -336,12 +960,14 @@ impl<S: 'static> WindowSpec<S> {
     pub fn options(mut self, options: WindowOptions) -> Self {
         self.options = options;
         self.app.macos_window = MacWindowOptions::default();
+        self.app.windows_window = WindowsWindowOptions::default();
         self
     }
     pub fn configured_options(mut self, options: ConfiguredWindowOptions) -> Self {
-        let ConfiguredWindowOptions { options, native } = options;
+        let ConfiguredWindowOptions { options, native, windows } = options;
         self.options = options;
         self.app.macos_window = native;
+        self.app.windows_window = windows;
         self
     }
     pub fn state(mut self, state: S) -> Self { self.app = self.app.init(move || state); self }
@@ -403,7 +1029,7 @@ pub struct WindowPlacement {
     pub display: Option<((i32, i32), (u32, u32))>,
 }
 
-/// How a window's first open shows it (`App::maximized`, `App::full_screen`).
+/// How a window opens or reopens (`App::maximized`, `App::full_screen`, and state captured before hiding).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum OpenAs {
     #[default]
@@ -457,7 +1083,7 @@ impl AnyWindowSpec {
     pub(crate) fn resolve_args(&mut self, inherited: crate::tooling::Args) -> crate::tooling::Args { self.0.resolve_args(inherited) }
 
     /// Render this window headless; `scale` converts a physical size option to points.
-    pub(crate) fn headless(self, args: crate::tooling::Args, scale: f32) { self.0.headless(args, scale) }
+    pub(crate) fn headless(self, args: crate::tooling::Args, scale: f32) -> Result<(), crate::tooling::StartError> { self.0.headless(args, scale) }
 
     /// This window as one member of a `--desktop` composite; `selected` takes `--scene`.
     pub(crate) fn desktop(self, args: &crate::tooling::Args, selected: bool, scale: f32) -> Box<dyn crate::desktop::Member> {
@@ -477,7 +1103,7 @@ trait ErasedWindow {
     fn key(&self) -> &str;
     fn take_windows(&mut self) -> Vec<AnyWindowSpec>;
     fn resolve_args(&mut self, inherited: crate::tooling::Args) -> crate::tooling::Args;
-    fn headless(self: Box<Self>, args: crate::tooling::Args, scale: f32);
+    fn headless(self: Box<Self>, args: crate::tooling::Args, scale: f32) -> Result<(), crate::tooling::StartError>;
     fn desktop(self: Box<Self>, args: &crate::tooling::Args, selected: bool, scale: f32) -> Box<dyn crate::desktop::Member>;
     fn start(self: Box<Self>, inherited: crate::tooling::Args, cx: crate::window::Start<'_>) -> Option<Box<dyn crate::window::AnyHost>>;
 }
@@ -496,12 +1122,12 @@ impl<S: 'static> ErasedWindow for Erased<S> {
     // bodies (never called then: `run` refuses a headless run first) keep headless rendering
     // out of a release app.
     #[cfg(not(any(feature = "tooling", debug_assertions)))]
-    fn headless(self: Box<Self>, _: crate::tooling::Args, _: f32) { unreachable!("{}", crate::tooling::WITHOUT_TOOLING) }
+    fn headless(self: Box<Self>, _: crate::tooling::Args, _: f32) -> Result<(), crate::tooling::StartError> { unreachable!("{}", crate::tooling::WITHOUT_TOOLING) }
     #[cfg(not(any(feature = "tooling", debug_assertions)))]
     fn desktop(self: Box<Self>, _: &crate::tooling::Args, _: bool, _: f32) -> Box<dyn crate::desktop::Member> { unreachable!("{}", crate::tooling::WITHOUT_TOOLING) }
     #[cfg(any(feature = "tooling", debug_assertions))]
-    fn headless(self: Box<Self>, args: crate::tooling::Args, scale: f32) {
-        crate::tooling::headless_window_spec(self.spec.app, self.spec.options, args, scale);
+    fn headless(self: Box<Self>, args: crate::tooling::Args, scale: f32) -> Result<(), crate::tooling::StartError> {
+        crate::tooling::headless_window_spec(self.spec.app, self.spec.options, args, scale)
     }
     #[cfg(any(feature = "tooling", debug_assertions))]
     fn desktop(self: Box<Self>, args: &crate::tooling::Args, selected: bool, scale: f32) -> Box<dyn crate::desktop::Member> {

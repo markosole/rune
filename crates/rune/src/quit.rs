@@ -2,7 +2,8 @@
 //! window, the last window closing, macOS Quit (?Q, the Dock, logout and shutdown, which AppKit
 //! asks the app delegate about with `applicationShouldTerminate:`), and a Windows logoff or
 //! shutdown (`WM_QUERYENDSESSION`, then `WM_ENDSESSION`). Every open window's `App::on_quit`
-//! runs once when it starts, before any window closes for it, and [`quitting`] holds from then
+//! (and that of the last main window whose close ended the app) runs once when it starts, before
+//! any remaining window closes for it, and [`quitting`] holds from then
 //! on, so a window's `on_close` can tell the app ending from the user closing that one window.
 //!
 //! One machine ([`State`], [`step`]) holds where the quit is: running, quitting (the windows'
@@ -110,10 +111,12 @@ static ORDERLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 /// durable write, a trace) and the process ends at once. Windows, GPU devices, threads and memory
 /// aren't dropped: the OS takes them back, which on Windows skips tens to hundreds of milliseconds
 /// of destructors and graphics-driver `DllMain` detach, and a window is gone the moment its quit
-/// is done. Every app ends this way unless it calls [`orderly_exit`]; `fast_exit` only adds
-/// `last`. Nothing after the event loop returns runs, so whatever the app does there belongs in
-/// `last` or its quit hooks. Set it once, before the app runs; a later call does nothing. On the
-/// web the page's own lifetime applies instead.
+/// is done. Every normal quit ends this way unless the app calls [`orderly_exit`]; `fast_exit`
+/// only adds `last`. Startup window creation failures and lost display connections bypass fast
+/// exit so `try_run` returns the error and `run` prints it to stderr and exits 1. Nothing after
+/// a normal event loop exit runs, so whatever the app does there belongs in `last` or its quit
+/// hooks. Set it once, before the app runs; a later call does nothing. On the web the page's own
+/// lifetime applies instead.
 pub fn fast_exit(last: fn()) {
     FAST_EXIT.set(last).ok();
 }
@@ -121,6 +124,14 @@ pub fn fast_exit(last: fn()) {
 /// Tears the process down in order when the app quits instead of ending it at once (the default,
 /// [`fast_exit`]): windows, GPU devices and threads are dropped and `run` returns, for an app with
 /// work after `run` or destructors that must run. Call it before the app runs.
+///
+/// Windows, overlays and tray icons are hidden and removed before exit waits for any in-flight
+/// background GPU warm-up. Warm-up is cancelled as soon as the event loop begins exiting, and
+/// exit waits up to 10 seconds for those warm-up threads to finish so slow driver or shader
+/// startup under load drains cleanly and `run` returns. As a last resort against a driver call
+/// that is truly hung, if a warm-up thread has still not exited after 10 seconds, Rune logs to
+/// stderr and ends the process immediately (`_exit` on Unix, `TerminateProcess` on Windows)
+/// without running destructors under the stuck thread or returning from `run`.
 pub fn orderly_exit() {
     ORDERLY.store(true, std::sync::atomic::Ordering::Relaxed);
 }
@@ -157,10 +168,18 @@ pub(crate) fn end_fast(last: fn()) -> ! {
 /// Ends this process now with exit code 0 (3 when `RUNE_LOOP_CHECK=2` found a differing picture,
 /// `render::pixel_check`): no destructors, no `atexit`, no DLL detach.
 #[cfg(not(target_arch = "wasm32"))]
-#[allow(unsafe_code)]
 fn end_process() -> ! {
-    crate::marks::mark("quit.end");
     let code = if crate::render::loop_pixel_check_failed() { 3 } else { 0 };
+    end_process_with_code(code)
+}
+
+/// Ends this process immediately with `code`: no destructors, no `atexit`, no DLL detach.
+/// Used by fast exit, `exit_deadline`, and orderly/error exits whose GPU warm-up threads stayed
+/// wedged in a driver call past the bounded shutdown wait.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(unsafe_code)]
+pub(crate) fn end_process_with_code(code: i32) -> ! {
+    crate::marks::mark("quit.end");
     // A process ends once each of its threads has run to its end: an idle-priority one (D3D12's
     // shader threads) on a busy machine can hold it for seconds.
     #[cfg(target_os = "windows")]

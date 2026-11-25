@@ -39,6 +39,7 @@ pub(super) fn sub_link(sub: u64) -> Option<usize> { (sub >= LINK_BASE).then(|| (
 #[derive(Clone, PartialEq, Default)]
 struct Stamp {
     commits: u64,
+    live_texts: u64,
     scrolls: u64,
     text_fills: u64,
     text_settled: u64,
@@ -66,6 +67,9 @@ pub(crate) struct A11yTree {
     stamp: Option<Stamp>,
     /// The next update must hold the whole tree (activation, or the adapter asked again).
     full: bool,
+    /// First activation found the runtime out of date (or unbuilt), so one covered wake must
+    /// build the view once to make the initial tree current.
+    activation_build: bool,
     /// The last whole tree held back the announcer's words: an adapter raises no events for the
     /// tree it starts from, so words said as a reader attached (a request arriving as it starts)
     /// would never be spoken. The next update sends them as a change.
@@ -74,6 +78,66 @@ pub(crate) struct A11yTree {
     pub(crate) name: String,
     /// What the last update changed, beyond what AccessKit announces itself.
     changes: Changes,
+    /// Live roots hidden by an open modal or muted on return until their spoken content changes.
+    live_modal: HashMap<u64, ModalLive>,
+}
+
+/// A live region temporarily suppressed across a modal open/close cycle so platform adapters do
+/// not re-announce unchanged text when background nodes return to the tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModalLive {
+    /// Currently pruned behind an open modal; holds the spoken-content signature last sent.
+    Hidden(u64),
+    /// Returned unchanged after the modal closed; sent with `Live::Off` until its signature moves.
+    Muted(u64),
+}
+
+impl A11yTree {
+    pub(super) fn is_live_muted(&self, id: AkId) -> bool {
+        matches!(self.live_modal.get(&id.0), Some(ModalLive::Muted(_)))
+    }
+
+    fn sync_modal_live(&mut self, found: &Found, full: bool) {
+        if full {
+            self.live_modal.clear();
+            for &(id, sig) in &found.modal_hidden_live {
+                self.live_modal.insert(id, ModalLive::Hidden(sig));
+            }
+            return;
+        }
+        let mut keep = rustc_hash::FxHashSet::default();
+        for &(id, _) in &found.modal_hidden_live {
+            match self.live_modal.get(&id).copied() {
+                Some(ModalLive::Hidden(_)) => { keep.insert(id); }
+                Some(ModalLive::Muted(sig)) => {
+                    self.live_modal.insert(id, ModalLive::Hidden(sig));
+                    keep.insert(id);
+                }
+                None => {
+                    if let Some(prev_sig) = self.sent.get(&id).and_then(|s| s.live_sig) {
+                        self.live_modal.insert(id, ModalLive::Hidden(prev_sig));
+                        keep.insert(id);
+                    }
+                }
+            }
+        }
+        for s in &found.slots {
+            let id = s.id.0;
+            let Some(entry) = self.live_modal.get(&id).copied() else { continue };
+            let Some(cur_sig) = s.live_sig else { continue };
+            match entry {
+                ModalLive::Hidden(prev_sig) if cur_sig == prev_sig && !self.sent.contains_key(&id) => {
+                    self.live_modal.insert(id, ModalLive::Muted(prev_sig));
+                    keep.insert(id);
+                }
+                ModalLive::Muted(prev_sig) if cur_sig == prev_sig => {
+                    keep.insert(id);
+                }
+                _ => {}
+            }
+        }
+        self.live_modal.retain(|id, _| keep.contains(id));
+    }
 }
 
 /// What an update changed that AccessKit's platform adapters don't announce: nodes added,
@@ -88,6 +152,7 @@ pub(crate) struct Changes {
 struct Sent {
     print: u64,
     pass: u32,
+    live_sig: Option<u64>,
     node: AkNode,
 }
 
@@ -96,8 +161,10 @@ struct Sent {
 pub(super) struct Walk {
     /// Index into the walk's slots of the nearest ancestor in the tree (0: the root).
     slot: usize,
-    /// Left out with everything inside it.
+    /// Left out with everything inside it for a non-modal reason (hidden, exiting, secure, ...).
     gone: bool,
+    /// Left out solely because an open modal sits above it.
+    modal_gone: bool,
     /// How far the scroll viewports above carried it, x and y in points: added back so its
     /// bounds stay in its viewport's content space.
     pub(super) shift: [f32; 2],
@@ -106,6 +173,11 @@ pub(super) struct Walk {
     /// Vertical window-space clip band from clipping/scrolling ancestors, for a long field's
     /// drawn-line geometry.
     pub(super) clip_y: [f32; 2],
+    /// Inside a secure ancestor: descendants are omitted so a secure container never leaks its
+    /// children's text into the tree.
+    secure: bool,
+    /// Inside a live, enabled, allowed ancestor with `El::on_a11y_action`.
+    pub(super) delegated_a11y: bool,
 }
 
 /// A node the walk found: the element it is (`None` for the root), where it is, and its
@@ -116,8 +188,11 @@ struct Slot {
     walk: Walk,
     role: Role,
     print: u64,
-    /// A set size an item's `El::position_in_set` gave this container.
-    set_size: Option<usize>,
+    live_sig: Option<u64>,
+    /// A set size an item's `El::position_in_set` gave this container, paired with the item's
+    /// hierarchical level (`u32::MAX` when unset) so deeper items in a flat tree do not replace
+    /// the top level's size.
+    set_size: Option<(usize, u32)>,
 }
 
 /// What a walk found: every node, each node's element children in order, and the focus.
@@ -128,6 +203,8 @@ struct Found {
     focus: AkId,
     scrollers: Vec<(usize, Walk)>,
     long_fields: Vec<(usize, Walk, u64)>,
+    /// Live roots omitted solely because an open modal hides them: `(ak_id, live_sig)`.
+    modal_hidden_live: Vec<(u64, u64)>,
 }
 
 #[cfg(test)]
@@ -155,15 +232,37 @@ pub(super) fn rect(r: [f32; 4], shift: [f32; 2]) -> AkRect {
 
 impl RuntimeCore {
     /// An assistive client asked for this surface's tree: the next update holds all of it.
+    /// On the first activation while the last frame is out of date or unbuilt, record that one
+    /// covered wake must build the view once so the initial tree is current.
     pub(crate) fn a11y_activate(&mut self, name: &str) {
+        let first = self.host.a11y().is_none();
+        let stale = self.needs_commit() || self.commit.commits == 0;
         let tree = self.host.a11y_or_insert();
         tree.full = true;
         tree.stamp = None;
+        if first && stale { tree.activation_build = true; }
         name.clone_into(&mut tree.name);
+    }
+
+    /// Whether first activation still owes one view build while covered.
+    pub(crate) fn a11y_activation_build_pending(&self) -> bool {
+        self.host.a11y().is_some_and(|t| t.activation_build)
+    }
+
+    /// Clears the first-activation covered-build debt once a frame has committed.
+    pub(crate) fn clear_a11y_activation_build(&mut self) {
+        if let Some(tree) = self.host.a11y_mut() {
+            tree.activation_build = false;
+        }
     }
 
     /// Nobody listens any more: drop the tree and stop building it.
     pub(crate) fn a11y_deactivate(&mut self) { self.host.a11y_deactivate(); }
+
+    /// Whether live region `id` is temporarily muted after returning unchanged from behind a modal.
+    pub(super) fn a11y_live_muted(&self, id: AkId) -> bool {
+        self.host.a11y().is_some_and(|t| t.is_live_muted(id))
+    }
 
     /// What the last update changed that AccessKit doesn't announce.
     #[cfg_attr(not(all(feature = "accessibility", target_os = "windows")), allow(dead_code))]
@@ -184,12 +283,17 @@ impl RuntimeCore {
         let update = if scrolled_only {
             self.a11y_scrolled(stamp)?
         } else {
-            let found = self.a11y_walk();
-            let tree = self.host.a11y()?;
+            let mut found = self.a11y_walk();
+            let hold = self.host.a11y()?.full && self.host.announcement.recent();
+            let tree = self.host.a11y_mut()?;
             let full = tree.full;
-            let hold = full && self.host.announcement.recent();
             // Held words go out with the root, whose node carries the announcer.
             let held = tree.held;
+            tree.sync_modal_live(&found, full);
+            for s in &mut found.slots {
+                if tree.is_live_muted(s.id) { s.print = mix(s.print, 1); }
+            }
+            let tree = self.host.a11y()?;
             let changed: Vec<bool> = found.slots.iter().enumerate()
                 .map(|(k, s)| full || (held && k == 0) || tree.sent.get(&s.id.0).is_none_or(|old| old.print != s.print)).collect();
             let mut nodes = self.a11y_build(&found, &changed, &tree.name, hold);
@@ -228,10 +332,13 @@ impl RuntimeCore {
                     }
                     None => {
                         structure = true;
-                        tree.sent.insert(id.0, Sent { print, pass, node: node.clone() });
+                        tree.sent.insert(id.0, Sent { print, pass, live_sig: None, node: node.clone() });
                     }
                 }
                 out.push((id, node));
+            }
+            for s in &found.slots {
+                if let Some(old) = tree.sent.get_mut(&s.id.0) { old.live_sig = s.live_sig; }
             }
             // Lines and links of unchanged texts stay: mark them seen.
             for s in found.slots.iter().zip(&changed).filter(|(_, c)| !**c).map(|(s, _)| s) {
@@ -288,6 +395,8 @@ impl RuntimeCore {
             let Some(old) = tree.sent.get_mut(&id.0) else { continue };
             node.set_children(old.node.children().to_vec());
             if let Some(size) = old.node.size_of_set() { node.set_size_of_set(size); }
+            if let Some(rows) = old.node.row_count() { node.set_row_count(rows); }
+            if let Some(row) = old.node.row_index() { node.set_row_index(row); }
             if old.node != node {
                 moved = true;
                 changed.push((id, node.clone()));
@@ -328,7 +437,7 @@ impl RuntimeCore {
                     }
                     None => {
                         structure = true;
-                        tree.sent.insert(id.0, Sent { print: box_print, pass, node: node.clone() });
+                        tree.sent.insert(id.0, Sent { print: box_print, pass, live_sig: None, node: node.clone() });
                         changed.push((id, node));
                     }
                 }
@@ -353,6 +462,11 @@ impl RuntimeCore {
         let mut w = Walk { clip_y: [0.0, self.viewport.1], ..Walk::default() };
         for p in ancs.into_iter().rev() {
             let pn = &self.tree.nodes[p];
+            if !self.allowed(p) || self.subtree_exiting(p) {
+                w.delegated_a11y = false;
+            } else if !pn.a11y.disabled && pn.handlers.get().is_some_and(|h| h.on_a11y_action.is_some()) {
+                w.delegated_a11y = true;
+            }
             if pn.vis.clip.is_some() || pn.scroll.is_some() {
                 let pr = self.paint.drawn[p];
                 w.clip_y = [w.clip_y[0].max(pr[1]), w.clip_y[1].min(pr[1] + pr[3].max(0.0))];
@@ -406,6 +520,7 @@ impl RuntimeCore {
         let mut text_fills = 0u64;
         let mut text_settled = 0u64;
         for n in &self.tree.nodes {
+            if n.is_secure() { continue; }
             if let Some(tl) = &n.text_layout {
                 if n.input.is_some() {
                     text_fills = mix(text_fills, tl.address() as u64);
@@ -418,6 +533,7 @@ impl RuntimeCore {
         let focus = self.kbd.focus.path().map_or(0, hash_str) ^ self.link_focus().map_or(0, |k| k as u64 + 1) << 48;
         Stamp {
             commits: self.commit.commits,
+            live_texts: self.frame.live_text_gen,
             scrolls,
             text_fills,
             text_settled,
@@ -437,7 +553,7 @@ impl RuntimeCore {
     fn a11y_repeats_control(&self, i: usize, slot: &Slot, spoken: &mut rustc_hash::FxHashMap<usize, Option<String>>) -> bool {
         let Some(c) = slot.element.filter(|_| crate::a11y::roles::leaf_control(slot.role)) else { return false };
         let n = &self.tree.nodes[i];
-        if n.input.is_some() || self.can_focus(i) || n.handlers.get().is_some_and(|h| h.has_primary()) { return false; }
+        if n.is_secure() || n.input.is_some() || self.can_focus(i) || n.handlers.get().is_some_and(|h| h.has_primary()) { return false; }
         let Some(name) = spoken.entry(c).or_insert_with(|| self.a11y_control_words(c, slot.role)).as_deref() else { return false };
         match n.text.as_deref() {
             Some(t) => {
@@ -465,34 +581,30 @@ impl RuntimeCore {
         let n_nodes = self.tree.nodes.len();
         let mut slots = Vec::with_capacity(n_nodes / 2 + 2);
         let root_walk = Walk { clip_y: [0.0, self.viewport.1], ..Walk::default() };
-        slots.push(Slot { id: ROOT, element: None, walk: root_walk, role: Role::Window, print: 0, set_size: None });
+        slots.push(Slot { id: ROOT, element: None, walk: root_walk, role: Role::Window, print: 0, live_sig: None, set_size: None });
         let mut kids = Vec::with_capacity(n_nodes / 2 + 2);
         let mut walk = vec![root_walk; n_nodes];
         let mut scrollers = Vec::new();
         let mut long_fields = Vec::new();
+        let mut modal_hidden_live = Vec::new();
         let mut focus = ROOT;
         let focused = self.focused_index();
         let content = self.a11y_content_prints();
         let mut spoken = rustc_hash::FxHashMap::default();
-        // Behind an open modal the tree holds only the modal and what contains it.
-        let mut holds_modal = Vec::new();
-        let modal = self.active_modal().is_some();
-        if modal {
-            holds_modal = vec![false; n_nodes];
-            for i in (0..n_nodes).filter(|&i| self.modal_member(i)) {
-                let mut p = self.tree.nodes[i].parent;
-                while let Some(j) = p.filter(|&j| !holds_modal[j]) {
-                    holds_modal[j] = true;
-                    p = self.tree.nodes[j].parent;
-                }
-            }
-        }
+        // Behind an open modal the tree holds the modal, its ancestors, and (for an anchored
+        // popup modal such as a menu or listbox) its anchor trigger and enclosing modal context.
+        let modal_mask = self.a11y_modal_mask();
         for i in 0..n_nodes {
             let n = &self.tree.nodes[i];
             let up = n.parent.map_or(root_walk, |p| walk[p]);
-            let mut w = Walk { slot: up.slot, gone: up.gone, shift: up.shift, scrolled: up.scrolled, clip_y: up.clip_y };
+            let mut w = Walk { slot: up.slot, gone: up.gone || up.secure, modal_gone: up.modal_gone, shift: up.shift, scrolled: up.scrolled, clip_y: up.clip_y, secure: up.secure || n.is_secure(), delegated_a11y: up.delegated_a11y };
             if let Some(p) = n.parent {
                 let pn = &self.tree.nodes[p];
+                if !self.allowed(p) || self.subtree_exiting(p) {
+                    w.delegated_a11y = false;
+                } else if !pn.a11y.disabled && pn.handlers.get().is_some_and(|h| h.on_a11y_action.is_some()) {
+                    w.delegated_a11y = true;
+                }
                 if pn.vis.clip.is_some() || pn.scroll.is_some() {
                     let pr = self.paint.drawn[p];
                     w.clip_y = [w.clip_y[0].max(pr[1]), w.clip_y[1].min(pr[1] + pr[3].max(0.0))];
@@ -505,22 +617,52 @@ impl RuntimeCore {
             }
             if !w.gone {
                 w.gone = n.is_moved_stub() || n.a11y.hidden || n.vis.opacity <= 0.01 || self.is_exiting(n.id)
-                    || !self.scene.contains(n.id) || (modal && !self.modal_member(i) && !holds_modal[i]);
+                    || !self.scene.contains(n.id);
             }
-            let role = if w.gone { None } else { self.a11y_role(i) };
+            if !w.gone && !w.modal_gone {
+                w.modal_gone = modal_mask.as_ref().is_some_and(|m| !m.visible(i));
+            }
+            let content_print = content.get(i).copied().unwrap_or(0);
+            if w.modal_gone && !w.gone && let Some(sig) = self.a11y_live_sig(i, content_print) {
+                modal_hidden_live.push((element_id(n.id).0, sig));
+            }
+            let role = if w.gone || w.modal_gone { None } else { self.a11y_role(i) };
             if let Some(role) = role.filter(|_| !self.a11y_repeats_control(i, &slots[w.slot], &mut spoken)) {
                 let id = element_id(n.id);
-                let mut print = mix(self.a11y_print(i, role, &w), content.get(i).copied().unwrap_or(0));
-                if let Some(index) = self.a11y_index_in_list(i) { print = mix(print, index as u64 + 1); }
+                let live_sig = self.a11y_live_sig(i, content_print);
+                let mut print = mix(self.a11y_print(i, role, &w), content_print);
+                let parent_role = slots[w.slot].role;
+                let is_set_item = crate::a11y::roles::ordered_set_item_in(role, parent_role);
+                if let Some(list) = self.commit.virtuals.get(&n.path) {
+                    print = mix(print, list.keys.len() as u64 + 1);
+                }
+                if let Some(index) = self.a11y_index_in_list(i)
+                    && (is_set_item || (role == Role::Row && crate::a11y::roles::table_container(parent_role)))
+                {
+                    print = mix(print, index as u64 + 1);
+                }
+                if n.a11y.level.is_some()
+                    && is_set_item
+                    && let Some((_, size)) = n.a11y.more.as_ref().and_then(|m| m.set)
+                {
+                    print = mix(print, size as u64 + 1);
+                }
                 if n.scroll.is_some() && self.scroll.scrolls.contains_key(&n.id) { scrollers.push((i, w)); }
                 if self.a11y_uses_long_field(i) { long_fields.push((i, w, self.a11y_lines_box_print(i, &w))); }
-                if let Some((_, size)) = n.a11y.more.as_ref().and_then(|m| m.set) { slots[w.slot].set_size = Some(size); }
+                if let Some((_, size)) = n.a11y.more.as_ref().and_then(|m| m.set)
+                    && crate::a11y::roles::ordered_set(parent_role)
+                {
+                    let level = n.a11y.level.unwrap_or(u32::MAX);
+                    if slots[w.slot].set_size.is_none_or(|(_, cur)| level <= cur) {
+                        slots[w.slot].set_size = Some((size, level));
+                    }
+                }
                 kids.push((w.slot, id));
                 if focused == Some(i) {
                     focus = self.link_focus().filter(|&k| n.text.as_ref().is_some_and(|t| k < t.cold.links.len()))
                         .map_or(id, |k| link_id(n.id, k));
                 }
-                slots.push(Slot { id, element: Some(i), walk: w, role, print, set_size: None });
+                slots.push(Slot { id, element: Some(i), walk: w, role, print, live_sig, set_size: None });
                 w.slot = slots.len() - 1;
             }
             walk[i] = w;
@@ -535,9 +677,9 @@ impl RuntimeCore {
         let mut kid_prints = vec![0u64; slots.len()];
         for &(parent, id) in &kids { kid_prints[parent] = mix(kid_prints[parent], id.0); }
         for (k, s) in slots.iter_mut().enumerate() {
-            s.print = mix(mix(s.print, kid_prints[k]), s.set_size.map_or(0, |n| n as u64 + 1));
+            s.print = mix(mix(s.print, kid_prints[k]), s.set_size.map_or(0, |(n, _)| n as u64 + 1));
         }
-        Found { slots, kids, focus, scrollers, long_fields }
+        Found { slots, kids, focus, scrollers, long_fields, modal_hidden_live }
     }
 
     /// The nodes of `found` whose `changed` flag is set, built, with their lines and links:
@@ -573,16 +715,39 @@ impl RuntimeCore {
                 node.set_bounds(AkRect { x0: 0.0, y0: 0.0, x1: 1.0, y1: 1.0 });
                 kids.push(ANNOUNCER);
                 out.push((ANNOUNCER, node, s.print));
-                if let Some(size) = s.set_size { root.set_size_of_set(size); }
+                if let Some((size, _)) = s.set_size { root.set_size_of_set(size); }
                 root.set_children(kids);
                 out.push((ROOT, root, s.print));
                 continue;
             };
             let mut node = self.a11y_node(i, s.role, &s.walk);
-            if let Some(list) = self.commit.virtuals.get(&self.tree.nodes[i].path) { node.set_size_of_set(list.keys.len()); }
-            // An app's own place in the set wins over the virtual list's index.
-            if node.position_in_set().is_none() && let Some(index) = self.a11y_index_in_list(i) { node.set_position_in_set(index); }
-            if let Some(size) = s.set_size { node.set_size_of_set(size); }
+            let n = &self.tree.nodes[i];
+            let parent_role = found.slots[s.walk.slot].role;
+            let is_set_item = crate::a11y::roles::ordered_set_item_in(s.role, parent_role);
+            if let Some(list) = self.commit.virtuals.get(&n.path) {
+                if crate::a11y::roles::ordered_set(s.role) { node.set_size_of_set(list.keys.len()); }
+                if crate::a11y::roles::table_container(s.role) && node.row_count().is_none() {
+                    node.set_row_count(list.keys.len());
+                }
+            }
+            // An app's own place in the set or table wins over the virtual list's index.
+            if let Some(index) = self.a11y_index_in_list(i) {
+                if node.position_in_set().is_none() && is_set_item {
+                    node.set_position_in_set(index);
+                }
+                if s.role == Role::Row && node.row_index().is_none() && crate::a11y::roles::table_container(parent_role) {
+                    node.set_row_index(index);
+                }
+            }
+            // A levelled ordered-set item (a flat tree's treeitem or treegrid row) carries its own
+            // level's set size so adapters report per-level counts without synthetic groups.
+            if n.a11y.level.is_some()
+                && is_set_item
+                && let Some((_, size)) = n.a11y.more.as_ref().and_then(|m| m.set)
+            {
+                node.set_size_of_set(size);
+            }
+            if let Some((size, _)) = s.set_size { node.set_size_of_set(size); }
             // Its text's lines and links come first, then its element children.
             let mut text = vec![(s.id, node)];
             self.a11y_text_nodes(i, &s.walk, &mut text);

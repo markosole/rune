@@ -74,6 +74,7 @@ impl Renderer {
                     // Code inside a link reads as part of the link's label: it inherits the link's
                     // colour, underline and hover with no code-pill background or padding.
                     if in_link.is_none() {
+                        sp.color = s.inline_code_text;
                         sp = sp.bg(s.code_bg, s.inline_code_pad);
                     }
                     code.push(sp);
@@ -187,7 +188,10 @@ impl Renderer {
     pub(in crate::markdown) fn para(&self, inl: &Inline, map: Option<&SpanMap>, style: TextStyle, color: Color) -> El {
         // Lines keep their own 22.4 points, as a page's do, so a long list doesn't drift a
         // point per item.
-        let e = rich(inl.text.clone(), self.spans(inl, style)).font(style).color(color).exact_lines();
+        let mut e = rich(inl.text.clone(), self.spans(inl, style)).font(style).color(color).exact_lines();
+        if self.wrap_anywhere {
+            e = e.wrap_anywhere();
+        }
         let e = self.with_reveal(self.with_math(e, inl, style, color)).w_full();
         let e = bidi::directed(bidi::isolated(e, inl), bidi::inline_dir(inl));
         // A copy puts a blank line around a paragraph, one newline around a list item's first

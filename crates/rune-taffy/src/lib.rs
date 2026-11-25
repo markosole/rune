@@ -8,8 +8,13 @@
 // Every module except Windows' `SetThreadStackGuarantee` FFI in `stack` forbids `unsafe`.
 #![cfg_attr(not(windows), forbid(unsafe_code))]
 
+mod aspect;
+#[cfg(test)]
+mod aspect_tests;
 mod baseline_store;
 mod cache;
+#[cfg(test)]
+mod fit_content_tests;
 pub mod prelude;
 mod stack;
 mod store;
@@ -18,9 +23,12 @@ mod style;
 mod tests;
 mod view;
 
+pub use aspect::compute_leaf_layout;
 pub use baseline_store::BaselineLayoutStore;
 pub use baseline_store::baseline_storage_stats;
 pub use cache::CompactCache;
+#[doc(hidden)]
+pub use stack::maybe_grow;
 pub use stack::stack_grow_count;
 pub use store::BoxLayout;
 pub use store::LayoutStore;

@@ -116,15 +116,20 @@ impl InputWindow {
 impl Drop for InputWindow { fn drop(&mut self) { self.hide(); } }
 
 pub(crate) fn pointer_position() -> Option<(i32, i32)> {
-    let (connection, screen) = x11rb::connect(None).ok()?;
-    let root = connection.setup().roots.get(screen)?.root;
-    let p = connection.query_pointer(root).ok()?.reply().ok()?;
-    p.same_screen.then_some((i32::from(p.root_x), i32::from(p.root_y)))
+    super::query::with_connection(|q| {
+        super::query::classify_reply((|| -> Result<_, x11rb::errors::ReplyError> {
+            let p = q.connection.query_pointer(q.root)?.reply()?;
+            Ok(p.same_screen.then_some((i32::from(p.root_x), i32::from(p.root_y))))
+        })())
+    })
 }
 
 pub(crate) fn output_crtc(output: u32) -> Option<u32> {
     use x11rb::protocol::randr::ConnectionExt as _;
-    let (connection, _) = x11rb::connect(None).ok()?;
-    let crtc = connection.randr_get_output_info(output, x11rb::CURRENT_TIME).ok()?.reply().ok()?.crtc;
-    (crtc != 0).then_some(crtc)
+    super::query::with_connection(|q| {
+        super::query::classify_reply((|| -> Result<_, x11rb::errors::ReplyError> {
+            let crtc = q.connection.randr_get_output_info(output, x11rb::CURRENT_TIME)?.reply()?.crtc;
+            Ok((crtc != 0).then_some(crtc))
+        })())
+    })
 }

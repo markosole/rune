@@ -152,44 +152,55 @@ fn erf(x: f32) -> f32 {
     s - s / (r * r)
 }
 
-fn shadow_x(x: f32, y: f32, sigma: f32, corner: f32, half: [f32; 2]) -> f32 {
-    let delta = (half[1] - corner - y.abs()).min(0.0);
-    let curved = half[0] - corner + (corner * corner - delta * delta).max(0.0).sqrt();
+fn shadow_radii(i: &Instance, half: [f32; 2]) -> [f32; 4] {
+    let m = half[0].min(half[1]);
+    let raw = if i.uv[2] > 0.0 { [i.radii[0]; 4] } else { i.radii };
+    raw.map(|r| r.abs().min(m))
+}
+
+fn shadow_x(x: f32, y: f32, sigma: f32, radii: [f32; 4], half: [f32; 2]) -> f32 {
+    let [cl, cr] = if y > 0.0 { [radii[3], radii[2]] } else { [radii[0], radii[1]] };
+    let dl = (half[1] - cl - y.abs()).min(0.0);
+    let dr = (half[1] - cr - y.abs()).min(0.0);
+    let left = half[0] - cl + (cl * cl - dl * dl).max(0.0).sqrt();
+    let right = half[0] - cr + (cr * cr - dr * dr).max(0.0).sqrt();
     let k = 0.5f32.sqrt() / sigma;
-    (0.5 + 0.5 * erf((x + curved) * k)) - (0.5 + 0.5 * erf((x - curved) * k))
+    (0.5 + 0.5 * erf((x + left) * k)) - (0.5 + 0.5 * erf((x - right) * k))
 }
 
 /// shader.wgsl's `SHADOW_INSIDE`.
 pub(super) use shader_consts::SHADOW_INSIDE;
 
 /// `shadow`.
-fn shadow(p: [f32; 2], half: [f32; 2], sigma: f32, corner: f32) -> f32 {
+fn shadow(p: [f32; 2], half: [f32; 2], sigma: f32, radii: [f32; 4]) -> f32 {
+    let corner = radii[0].max(radii[1]).max(radii[2]).max(radii[3]);
     if p[0].abs() <= half[0] - shader_consts::SHADOW_INSIDE_SIGMA * sigma
         && p[1].abs() <= half[1] - corner - shader_consts::SHADOW_INSIDE_SIGMA * sigma
     {
         return SHADOW_INSIDE;
     }
     let (lo, hi) = (p[1] - half[1], p[1] + half[1]);
+    if !(lo <= hi) || !lo.is_finite() || !hi.is_finite() { return 0.0; }
     let start = (-shader_consts::SHADOW_WINDOW_SIGMA * sigma).clamp(lo, hi);
     let end = (shader_consts::SHADOW_WINDOW_SIGMA * sigma).clamp(lo, hi);
     let step = (end - start) / shader_consts::SHADOW_SAMPLES as f32;
     let mut y = start + step * 0.5;
     let mut v = 0.0;
     for _ in 0..shader_consts::SHADOW_SAMPLES {
-        v += shadow_x(p[0], p[1] - y, sigma, corner, half) * gaussian(y, sigma) * step;
+        v += shadow_x(p[0], p[1] - y, sigma, radii, half) * gaussian(y, sigma) * step;
         y += step;
     }
     v
 }
 
 /// `shadow` for one row of a `KIND_SHADOW`: what its four y samples take from the row alone
-/// (each sample's curved half width and Gaussian weight), so a pixel costs only its erf pairs.
-/// The arithmetic and its order are `shadow`'s.
+/// (each sample's left and right curved extents and Gaussian weight), so a pixel costs only its
+/// erf pairs. The arithmetic and its order are `shadow`'s.
 pub(super) struct ShadowRow {
     /// The row's centre relative to the shadow's centre.
     y: f32,
     py: f32,
-    samples: [(f32, f32); shader_consts::SHADOW_SAMPLES],
+    samples: [(f32, f32, f32); shader_consts::SHADOW_SAMPLES],
     step: f32,
     half: [f32; 2],
     sigma: f32,
@@ -202,9 +213,13 @@ pub(super) struct ShadowRow {
 
 impl ShadowRow {
     /// What a pixel's sum depends on besides its `x`: rows that share it share every column's.
-    pub(super) fn key(&self) -> [u32; shader_consts::SHADOW_SAMPLES * 2 + 1] {
-        let mut k = [self.step.to_bits(); shader_consts::SHADOW_SAMPLES * 2 + 1];
-        for (n, (c, g)) in self.samples.iter().enumerate() { k[n * 2] = c.to_bits(); k[n * 2 + 1] = g.to_bits(); }
+    pub(super) fn key(&self) -> [u32; shader_consts::SHADOW_SAMPLES * 3 + 1] {
+        let mut k = [self.step.to_bits(); shader_consts::SHADOW_SAMPLES * 3 + 1];
+        for (n, &(l, r, g)) in self.samples.iter().enumerate() {
+            k[n * 3] = l.to_bits();
+            k[n * 3 + 1] = r.to_bits();
+            k[n * 3 + 2] = g.to_bits();
+        }
         k
     }
 
@@ -226,10 +241,11 @@ impl ShadowRow {
 
     /// The erf sum at `x` (from the shadow's centre), outside the interior.
     pub(super) fn sum(&self, x: f32) -> f32 {
+        if self.step == 0.0 { return 0.0; }
         if x.abs() <= self.mid.0 { return self.mid.1; }
         let mut v = 0.0;
-        for &(curved, g) in &self.samples {
-            let sx = (0.5 + 0.5 * erf((x + curved) * self.k)) - (0.5 + 0.5 * erf((x - curved) * self.k));
+        for &(left, right, g) in &self.samples {
+            let sx = (0.5 + 0.5 * erf((x + left) * self.k)) - (0.5 + 0.5 * erf((x - right) * self.k));
             v += sx * g * self.step;
         }
         v
@@ -240,8 +256,12 @@ pub(super) fn shadow_row(i: &Instance, py: f32) -> ShadowRow {
     let half = [i.rect[2] * 0.5, i.rect[3] * 0.5];
     let y = py - (i.rect[1] + half[1]);
     let sigma = i.params[2].max(shader_consts::SHADOW_MIN_SIGMA);
-    let corner = i.radii[0].abs().min(half[0].min(half[1]));
+    let radii = shadow_radii(i, half);
+    let corner = radii[0].max(radii[1]).max(radii[2]).max(radii[3]);
     let (lo, hi) = (y - half[1], y + half[1]);
+    if !(lo <= hi) || !lo.is_finite() || !hi.is_finite() {
+        return ShadowRow { y, py, samples: [(0.0, 0.0, 0.0); shader_consts::SHADOW_SAMPLES], step: 0.0, half: [0.0, 0.0], sigma, corner: 0.0, k: 0.0, mid: (-1.0, 0.0) };
+    }
     let start = (-shader_consts::SHADOW_WINDOW_SIGMA * sigma).clamp(lo, hi);
     let end = (shader_consts::SHADOW_WINDOW_SIGMA * sigma).clamp(lo, hi);
     let step = (end - start) / shader_consts::SHADOW_SAMPLES as f32;
@@ -249,15 +269,20 @@ pub(super) fn shadow_row(i: &Instance, py: f32) -> ShadowRow {
     let samples = std::array::from_fn(|_| {
         let at = s;
         s += step;
-        let delta = (half[1] - corner - (y - at).abs()).min(0.0);
-        (half[0] - corner + (corner * corner - delta * delta).max(0.0).sqrt(), gaussian(at, sigma))
+        let ry = y - at;
+        let [cl, cr] = if ry > 0.0 { [radii[3], radii[2]] } else { [radii[0], radii[1]] };
+        let dl = (half[1] - cl - ry.abs()).min(0.0);
+        let dr = (half[1] - cr - ry.abs()).min(0.0);
+        let left = half[0] - cl + (cl * cl - dl * dl).max(0.0).sqrt();
+        let right = half[0] - cr + (cr * cr - dr * dr).max(0.0).sqrt();
+        (left, right, gaussian(at, sigma))
     });
     let k = 0.5f32.sqrt() / sigma;
-    // `erf` is exactly ±1 from 5.5 out; `(x ± curved) * k` must reach it for every sample.
-    let reach = samples.iter().map(|s| s.0).fold(f32::INFINITY, f32::min) - 5.5 / k;
+    // `erf` is exactly ±1 from 5.5 out; `(x + left) * k` and `(x - right) * k` must reach it for every sample.
+    let reach = samples.iter().map(|s| s.0.min(s.1)).fold(f32::INFINITY, f32::min) - 5.5 / k;
     let mut v = 0.0;
-    for &(_, g) in &samples { v += 1.0 * g * step; }
-    // Shrunk by a part in a million, so rounding in `x ± curved` can't land a pixel short of 5.5.
+    for &(_, _, g) in &samples { v += 1.0 * g * step; }
+    // Shrunk by a part in a million, so rounding in `x ± reach` can't land a pixel short of 5.5.
     let mid = (reach - reach.abs() * 1e-6 - 1e-3, v);
     ShadowRow { y, py, samples, step, half, sigma, corner, k, mid }
 }
@@ -279,6 +304,7 @@ fn segment(p: [f32; 2], a: [f32; 2], b: [f32; 2], hw: f32, round: bool) -> f32 {
     let weight = (hw * 2.0).min(1.0);
     let ab = [b[0] - a[0], b[1] - a[1]];
     let len = (ab[0] * ab[0] + ab[1] * ab[1]).sqrt();
+    if !len.is_finite() { return 0.0; }
     let ap = [p[0] - a[0], p[1] - a[1]];
     let d = if len < shader_consts::SEGMENT_MIN_LEN {
         if !round { return 0.0; }
@@ -448,8 +474,7 @@ pub(super) fn boxes(i: &Instance, kind: Kind, p: [f32; 2]) -> [f32; 4] {
         }
         Kind::Shadow => {
             let sigma = i.params[2].max(shader_consts::SHADOW_MIN_SIGMA);
-            let corner = i.radii[0].abs().min(half[0].min(half[1]));
-            let mut cov = shadow(q, half, sigma, corner);
+            let mut cov = shadow(q, half, sigma, shadow_radii(i, half));
             if i.uv[2] > 0.0 {
                 let hole = [i.uv[2] * 0.5, i.uv[3] * 0.5];
                 let at = [p[0] - (i.rect[0] + i.uv[0] + hole[0]), p[1] - (i.rect[1] + i.uv[1] + hole[1])];
@@ -464,7 +489,8 @@ pub(super) fn boxes(i: &Instance, kind: Kind, p: [f32; 2]) -> [f32; 4] {
             let lit = if i.params[2] < shader_consts::INSET_SHARP_SIGMA {
                 box_cov(qs, ih, i.radii.map(|r| (r.abs() - spread).max(0.0).copysign(r)))
             } else {
-                shadow(qs, ih, i.params[2], (i.radii[0].abs() - spread).min(ih[0].min(ih[1])).max(0.0))
+                let m = ih[0].min(ih[1]);
+                shadow(qs, ih, i.params[2], i.radii.map(|r| (r.abs() - spread).min(m).max(0.0)))
             };
             scale4(i.fill, box_cov(q, half, i.radii) * (1.0 - clamp01(lit)))
         }
@@ -534,7 +560,12 @@ pub(super) fn linear_row_outside(i: &Instance, py: f32, x0: f32, x1: f32) -> boo
 /// `image_texel` in an sRGB-blending frame: one texel of an `Rgba8UnormSrgb` image page,
 /// premultiplied in sRGB encoding. The page holds straight alpha unless `premultiplied`.
 pub(super) fn image_texel(page: &super::Image<'_>, t: [i32; 2], premultiplied: bool) -> [f32; 4] {
-    let at = (t[1] as usize * page.width as usize + t[0] as usize) * 4;
+    if t[0] < 0 || t[1] < 0 || t[0] as u32 >= page.width { return [0.0; 4]; }
+    let Some(at) = (t[1] as usize)
+        .checked_mul(page.width as usize)
+        .and_then(|row| row.checked_add(t[0] as usize))
+        .and_then(|px| px.checked_mul(4))
+    else { return [0.0; 4] };
     let Some(c) = page.data.get(at..at + 4) else { return [0.0; 4] };
     let a = c[3] as f32 / 255.0;
     if a <= 0.0 { return [0.0; 4]; }
@@ -560,19 +591,115 @@ fn srgb_tables() -> &'static ([f32; 256], [f32; 256]) {
     })
 }
 
-/// `KIND_IMAGE` at pixel centre `p`: bilinear, clamped to the image's own texels.
+/// Wraps integer texel index `k` into `[0, n)` (`n >= 1`), mirroring `shader.wgsl` `wrap_texel`.
+fn wrap_texel(k: i32, n: i32, mode: u32) -> i32 {
+    if mode == shader_consts::IMAGE_WRAP_REPEAT {
+        let mut m = k % n;
+        if m < 0 { m += n; }
+        return m;
+    }
+    if mode == shader_consts::IMAGE_WRAP_MIRROR {
+        let p = 2 * n;
+        let mut m = k % p;
+        if m < 0 { m += p; }
+        if m >= n { return p - 1 - m; }
+        return m;
+    }
+    k.clamp(0, n - 1)
+}
+
+/// `KIND_IMAGE` at pixel centre `p`: bilinear or nearest-neighbour, optionally alpha-tinted,
+/// clamped to the image's own texels or wrapped (`Extend`, `Repeat`, `Mirror`) against `i.border`.
 pub(super) fn image(i: &Instance, page: &super::Image<'_>, p: [f32; 2]) -> [f32; 4] {
+    if !(i.rect[2] > 0.0 && i.rect[3] > 0.0 && i.uv[2] > 0.0 && i.uv[3] > 0.0)
+        || !i.rect[2].is_finite() || !i.rect[3].is_finite()
+        || !i.uv[0].is_finite() || !i.uv[1].is_finite()
+        || !i.uv[2].is_finite() || !i.uv[3].is_finite()
+    {
+        return [0.0; 4];
+    }
     let half = [i.rect[2] * 0.5, i.rect[3] * 0.5];
     let d = sd_rounded([p[0] - i.rect[0] - half[0], p[1] - i.rect[1] - half[1]], half, i.radii);
-    let local = [(p[0] - i.rect[0]) * i.uv[2] / i.rect[2] - 0.5, (p[1] - i.rect[1]) * i.uv[3] / i.rect[3] - 0.5];
     let lo = [i.uv[0] as i32, i.uv[1] as i32];
-    let hi = [lo[0] + i.uv[2] as i32 - 1, lo[1] + i.uv[3] as i32 - 1];
-    let base = [local[0].floor(), local[1].floor()];
-    let f = [local[0] - base[0], local[1] - base[1]];
-    let t0 = [(lo[0] + base[0] as i32).clamp(lo[0], hi[0]), (lo[1] + base[1] as i32).clamp(lo[1], hi[1])];
-    let t1 = [(lo[0] + base[0] as i32 + 1).clamp(lo[0], hi[0]), (lo[1] + base[1] as i32 + 1).clamp(lo[1], hi[1])];
-    let pm = i.params[2] > shader_consts::FLAG_ON_THRESHOLD;
-    let top = mix4(image_texel(page, t0, pm), image_texel(page, [t1[0], t0[1]], pm), f[0]);
-    let bottom = mix4(image_texel(page, [t0[0], t1[1]], pm), image_texel(page, t1, pm), f[0]);
-    scale4(mix4(top, bottom, f[1]), i.fill[3] * clamp01(0.5 - d))
+    // A sub-texel crop (0 < uv < 1) spans less than one texel and samples `lo` without bleeding
+    // into neighbouring atlas slots.
+    let hi = [
+        lo[0].saturating_add((i.uv[2] as i32).saturating_sub(1).max(0)),
+        lo[1].saturating_add((i.uv[3] as i32).saturating_sub(1).max(0)),
+    ];
+    let flags = if i.params[2].is_finite() { (i.params[2].max(0.0) + 0.5) as u32 } else { 0 };
+    let pm = (flags & shader_consts::IMAGE_FLAG_PREMULTIPLIED) != 0;
+    let tinted = (flags & shader_consts::IMAGE_FLAG_TINT) != 0;
+    let nearest = (flags & shader_consts::IMAGE_FLAG_NEAREST) != 0;
+    let wrap = if i.params[3].is_finite() { (i.params[3].max(0.0) + 0.5) as u32 } else { 0 };
+    let c = if wrap <= 1 {
+        let uv_pos = [(p[0] - i.rect[0]) * i.uv[2] / i.rect[2], (p[1] - i.rect[1]) * i.uv[3] / i.rect[3]];
+        if !uv_pos[0].is_finite() || !uv_pos[1].is_finite() { return [0.0; 4]; }
+        if nearest {
+            let t = [
+                lo[0].saturating_add(uv_pos[0].floor() as i32).clamp(lo[0], hi[0]),
+                lo[1].saturating_add(uv_pos[1].floor() as i32).clamp(lo[1], hi[1]),
+            ];
+            image_texel(page, t, pm)
+        } else {
+            let local = [uv_pos[0] - 0.5, uv_pos[1] - 0.5];
+            let base = [local[0].floor(), local[1].floor()];
+            let f = [local[0] - base[0], local[1] - base[1]];
+            let bx = lo[0].saturating_add(base[0] as i32);
+            let by = lo[1].saturating_add(base[1] as i32);
+            let t0 = [bx.clamp(lo[0], hi[0]), by.clamp(lo[1], hi[1])];
+            let t1 = [bx.saturating_add(1).clamp(lo[0], hi[0]), by.saturating_add(1).clamp(lo[1], hi[1])];
+            let top = mix4(image_texel(page, t0, pm), image_texel(page, [t1[0], t0[1]], pm), f[0]);
+            let bottom = mix4(image_texel(page, [t0[0], t1[1]], pm), image_texel(page, t1, pm), f[0]);
+            mix4(top, bottom, f[1])
+        }
+    } else if i.border[2] > 0.0 && i.border[3] > 0.0 && i.border.iter().all(|v| v.is_finite()) {
+        let dim = [hi[0] - lo[0] + 1, hi[1] - lo[1] + 1];
+        let mut uv_pos = [(p[0] - i.border[0]) * i.uv[2] / i.border[2], (p[1] - i.border[1]) * i.uv[3] / i.border[3]];
+        if !uv_pos[0].is_finite() || !uv_pos[1].is_finite() { return [0.0; 4]; }
+        if wrap == shader_consts::IMAGE_WRAP_EXTEND {
+            uv_pos[0] = uv_pos[0].clamp(-1.0, dim[0] as f32 + 1.0);
+            uv_pos[1] = uv_pos[1].clamp(-1.0, dim[1] as f32 + 1.0);
+        } else {
+            let scale = if wrap == shader_consts::IMAGE_WRAP_MIRROR { 2.0 } else { 1.0 };
+            let period = [dim[0] as f32 * scale, dim[1] as f32 * scale];
+            if uv_pos[0].abs() > 1_048_576.0 {
+                uv_pos[0] -= period[0] * (uv_pos[0] / period[0]).floor();
+            }
+            if uv_pos[1].abs() > 1_048_576.0 {
+                uv_pos[1] -= period[1] * (uv_pos[1] / period[1]).floor();
+            }
+        }
+        if nearest {
+            let bx = uv_pos[0].floor() as i32;
+            let by = uv_pos[1].floor() as i32;
+            let t = [lo[0] + wrap_texel(bx, dim[0], wrap), lo[1] + wrap_texel(by, dim[1], wrap)];
+            image_texel(page, t, pm)
+        } else {
+            let local = [uv_pos[0] - 0.5, uv_pos[1] - 0.5];
+            let base = [local[0].floor(), local[1].floor()];
+            let f = [local[0] - base[0], local[1] - base[1]];
+            let bx = base[0] as i32;
+            let by = base[1] as i32;
+            let tx0 = lo[0] + wrap_texel(bx, dim[0], wrap);
+            let ty0 = lo[1] + wrap_texel(by, dim[1], wrap);
+            let tx1 = lo[0] + wrap_texel(bx.saturating_add(1), dim[0], wrap);
+            let ty1 = lo[1] + wrap_texel(by.saturating_add(1), dim[1], wrap);
+            let top = mix4(image_texel(page, [tx0, ty0], pm), image_texel(page, [tx1, ty0], pm), f[0]);
+            let bottom = mix4(image_texel(page, [tx0, ty1], pm), image_texel(page, [tx1, ty1], pm), f[0]);
+            mix4(top, bottom, f[1])
+        }
+    } else {
+        [0.0; 4]
+    };
+    let cov = clamp01(0.5 - d);
+    if tinted {
+        scale4(i.fill, c[3] * cov)
+    } else {
+        scale4(c, i.fill[3] * cov)
+    }
 }
+
+#[cfg(test)]
+#[path = "shade_tests.rs"]
+mod tests;

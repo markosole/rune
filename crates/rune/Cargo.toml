@@ -7,7 +7,7 @@ description = "GPU-rendered Rust UI framework (wgpu, winit) with keyed element t
 autotests = false
 
 [features]
-default = ["accessibility", "dbus", "embedded-fonts", "metal-backend", "ogg-audio", "svg", "rune-gpu/default", "rune-image/default", "rune-media/default", "rune-text/default"]
+default = ["accessibility", "dbus", "embedded-fonts", "hunspell", "metal-backend", "ogg-audio", "svg", "rune-gpu/default", "rune-image/default", "rune-media/default", "rune-text/default"]
 # Bundle Inter (Regular, Medium, SemiBold; on web also IBM Plex Mono) as the fonts text falls back
 # to when the app registers none. Disable when AppSpec::fonts supplies the app's own fonts to omit
 # the bytes (about 1.25 MB native).
@@ -15,10 +15,13 @@ embedded-fonts = ["rune-text/embedded-fonts"]
 # Fall back to WebGL2 on wasm32 when WebGPU is unavailable.
 webgl = ["wgpu/webgl"]
 # Agent tooling in release builds: `--snap`, `--tree`, `--script`, `--trace`, `--strip`, `--video`,
-# `--html`, `--desktop` and the other headless runs `run` takes from the command line (README, "Agent
-# tooling"). Debug builds always have it. Off, a release app links only its window (examples/hello:
-# 3,480,576 B less), and a headless argument makes `run` fail saying so; `rune::tooling::headless_run`
-# and the test helpers work either way.
+# `--html`, `--desktop`, `--native --trace` and the other dev flags `run` takes from the command line
+# (README, "Agent tooling"), plus auto-enabling interaction timing from a loopback
+# `OTEL_EXPORTER_OTLP_ENDPOINT`. Debug builds always have it. Off, a release app links only its
+# window (examples/hello: 3,480,576 B less), parses no Rune flags from the process command line
+# (every argument goes to `extra_args`), and ignores `OTEL_EXPORTER_OTLP_ENDPOINT` unless
+# `RUNE_PERF=1` is set; an explicit `App::args` headless run still fails saying so, and
+# `rune::tooling::headless_run` and the test helpers work either way.
 tooling = []
 # `--keys` and `--pointer` (keycaps and click ripples over headless frames and videos) in release builds.
 # They draw with a second `Runtime`, about 1.46 MB of an app's exe, so `tooling` leaves them out;
@@ -55,6 +58,12 @@ svg = ["rune-image/svg", "rune-text/svg"]
 # rav1d's assembly. Off, AVIF bytes resolve to `Image::error`. No effect on web, where the
 # browser decodes AVIF.
 avif = ["rune-image/avif"]
+# Linux: spell check text fields (`El::spellcheck`) against installed system Hunspell
+# dictionaries via `spellbook` (MPL-2.0) and `unicode-segmentation`. Off (for example with
+# `default-features = false` or a permissive-only licence policy), `spellbook` is not compiled on
+# Linux and `El::spellcheck` falls back to a no-op there. No effect on Windows (`ISpellChecker`),
+# macOS (`NSSpellChecker`), or web (which always enables `rune-spell/hunspell`).
+hunspell = ["rune-spell/hunspell"]
 # Linux desktop services over D-Bus (zbus over async-io): the desktop's light or dark preference
 # (the Settings portal), the system tray (`Tray`), global shortcuts on Wayland (the
 # GlobalShortcuts portal) and, with `native-file-dialog`, the FileChooser portal. Off, those
@@ -93,7 +102,7 @@ rune-gpu = { workspace = true }
 rune-image = { workspace = true }
 rune-media = { workspace = true }
 rune-motion = { workspace = true }
-rune-spell = { workspace = true }
+rune-spell = { workspace = true, default-features = false }
 rune-staging = { workspace = true }
 rune-taffy = { workspace = true }
 rune-text = { workspace = true }
@@ -128,6 +137,7 @@ arboard = { version = "3.6", default-features = false, features = ["wayland-data
 arboard = { version = "3.6", default-features = false, features = ["wayland-data-control", "image-data"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+rune-spell = { workspace = true, features = ["hunspell"] }
 wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
 js-sys = { workspace = true }
@@ -154,7 +164,7 @@ accesskit_macos = { version = "0.27.2", optional = true }
 # Names for the interaction watchdog's stack samples (`tooling::interaction::stack`).
 rustc-demangle = "0.1"
 objc2-foundation = { workspace = true, features = ["std", "NSArray", "NSAttributedString", "NSData", "NSDictionary", "NSEnumerator", "NSError", "NSGeometry", "NSObject", "NSRange", "NSValue", "NSProcessInfo", "NSString", "NSThread", "NSURL", "NSUserDefaults", "objc2-core-foundation"] }
-objc2-app-kit = { workspace = true, features = ["std", "bitflags", "objc2-core-foundation", "NSApplication", "NSButton", "NSCell", "NSControl", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSView", "NSWindow", "NSColor", "NSGraphics", "NSPanel", "NSScreen", "NSPasteboard", "NSPasteboardItem", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSGraphicsContext", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSAttributedString"] }
+objc2-app-kit = { workspace = true, features = ["std", "bitflags", "objc2-core-foundation", "NSApplication", "NSButton", "NSCell", "NSColorSpace", "NSControl", "NSEvent", "NSFont", "NSFontDescriptor", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSStatusBar", "NSStatusBarButton", "NSStatusItem", "NSView", "NSWindow", "NSColor", "NSGraphics", "NSPanel", "NSScreen", "NSPasteboard", "NSPasteboardItem", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSGraphicsContext", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSAttributedString"] }
 objc2-core-video = { workspace = true, features = ["std", "CVBase", "CVDisplayLink", "CVHostTime", "CVReturn", "objc2-core-graphics"] }
 objc2-core-graphics = { workspace = true, features = ["std", "CGColorSpace"] }
 
@@ -162,7 +172,7 @@ objc2-core-graphics = { workspace = true, features = ["std", "CGColorSpace"] }
 raw-window-handle = "0.6"
 wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-client = "0.31"
-wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 x11rb = { version = "0.13", features = ["shape", "xinput", "randr", "allow-unsafe-code", "dl-libxcb"] }
 xkbcommon = "0.9"
@@ -204,6 +214,8 @@ blake3 = { workspace = true }
 [dev-dependencies]
 # The HLSL wgpu generates, for the precompiled uber shader (`render/dxbc_tests.rs`).
 log = "0.4"
+# WebGL2 GLSL ES 3.00 shader translation check (`render/webgl_shader_tests.rs`).
+naga = { version = "~30.0.1", default-features = false, features = ["wgsl-in", "glsl-out"] }
 # Experimental swash oracle in `examples/text_quality.rs`.
 swash = { workspace = true }
 
@@ -251,6 +263,15 @@ name = "alloc"
 
 [[test]]
 name = "extra_args"
+
+[[test]]
+name = "add_font"
+
+[[test]]
+name = "emoji_family"
+
+[[test]]
+name = "installed_families"
 
 [[test]]
 name = "measure_scope"
@@ -333,6 +354,14 @@ harness = false
 
 [[test]]
 name = "help_macos"
+harness = false
+
+[[test]]
+name = "macos_callback_panic"
+harness = false
+
+[[test]]
+name = "tray_macos"
 harness = false
 
 [lints]
